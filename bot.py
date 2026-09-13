@@ -6,6 +6,7 @@
 ==================================================================
 """
 import asyncio
+import html
 import json
 import logging
 import os
@@ -18,10 +19,11 @@ import aiohttp
 import aiosqlite
 import asyncpg
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -125,6 +127,7 @@ CREATE TABLE IF NOT EXISTS users (
     balance INTEGER NOT NULL DEFAULT 0,
     banned INTEGER NOT NULL DEFAULT 0,
     referred_by INTEGER,
+    referral_earnings INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
 );
 
@@ -154,6 +157,19 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS fsm_data (
+    storage_key TEXT PRIMARY KEY,
+    state TEXT,
+    data TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS support_threads (
+    admin_chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    PRIMARY KEY (admin_chat_id, message_id)
+);
 """
 
 _SCHEMA_PG = """
@@ -164,6 +180,7 @@ CREATE TABLE IF NOT EXISTS users (
     balance BIGINT NOT NULL DEFAULT 0,
     banned BOOLEAN NOT NULL DEFAULT FALSE,
     referred_by BIGINT,
+    referral_earnings BIGINT NOT NULL DEFAULT 0,
     created_at BIGINT NOT NULL
 );
 
@@ -193,6 +210,19 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS fsm_data (
+    storage_key TEXT PRIMARY KEY,
+    state TEXT,
+    data TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS support_threads (
+    admin_chat_id BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    PRIMARY KEY (admin_chat_id, message_id)
+);
 """
 
 
@@ -209,6 +239,7 @@ async def init_db():
             # ishga tushirsa ham xato bermaydi.
             await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS country TEXT")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT")
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_earnings BIGINT NOT NULL DEFAULT 0")
     else:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.executescript(_SCHEMA_SQLITE)
@@ -218,6 +249,10 @@ async def init_db():
                 pass  # ustun allaqachon mavjud (eski baza) — SQLite'da "IF NOT EXISTS" yo'q
             try:
                 await db.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
+            except Exception:
+                pass
+            try:
+                await db.execute("ALTER TABLE users ADD COLUMN referral_earnings INTEGER NOT NULL DEFAULT 0")
             except Exception:
                 pass
             await db.commit()
@@ -264,6 +299,42 @@ async def get_referrer(user_id: int) -> Optional[int]:
             cur = await db.execute("SELECT referred_by FROM users WHERE user_id = ?", (user_id,))
             row = await cur.fetchone()
             return row[0] if row else None
+
+
+async def add_referral_earning(user_id: int, amount: int):
+    """Referal keshbek berilganda shu foydalanuvchining jami keshbek
+    hisobiga qo'shadi (statistika ko'rsatish uchun)."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET referral_earnings = referral_earnings + $1 WHERE user_id = $2",
+                amount, user_id,
+            )
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET referral_earnings = referral_earnings + ? WHERE user_id = ?",
+                (amount, user_id),
+            )
+            await db.commit()
+
+
+async def get_referral_stats(user_id: int) -> dict:
+    """{'invited': taklif qilingan do'stlar soni, 'earned': jami olingan keshbek}."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            invited = await conn.fetchval("SELECT COUNT(*) FROM users WHERE referred_by = $1", user_id)
+            row = await conn.fetchrow("SELECT referral_earnings FROM users WHERE user_id = $1", user_id)
+            earned = row["referral_earnings"] if row else 0
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,))
+            invited_row = await cur.fetchone()
+            invited = invited_row[0] if invited_row else 0
+            cur = await db.execute("SELECT referral_earnings FROM users WHERE user_id = ?", (user_id,))
+            row = await cur.fetchone()
+            earned = row[0] if row else 0
+    return {"invited": invited or 0, "earned": earned or 0}
 
 
 async def get_balance(user_id: int) -> int:
@@ -597,6 +668,143 @@ async def set_setting(key: str, value: str):
             await db.commit()
 
 
+# ==============================================================
+# FSM STORAGE — Postgres/SQLite'da saqlanadigan FSM holati
+# ==============================================================
+"""
+Standart holatda Dispatcher() MemoryStorage ishlatadi: bot Render/VPS'da
+qayta ishga tushsa yoki deploy bo'lsa, barcha foydalanuvchilarning FSM
+holati (masalan, "summa kiritayapti", "davlat tanlayapti") butunlay
+o'chib ketadi. Quyidagi PersistentStorage o'sha holatni botning o'zi
+ishlatayotgan bazaga (Postgres yoki SQLite — DATABASE_URL sozlanganiga
+qarab, xuddi shu yuqoridagi _PG bayrog'i orqali) yozadi.
+"""
+
+
+async def _fsm_get(key_str: str) -> Optional[tuple]:
+    if _PG:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT state, data FROM fsm_data WHERE storage_key = $1", key_str)
+            return (row["state"], row["data"]) if row else None
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT state, data FROM fsm_data WHERE storage_key = ?", (key_str,))
+            row = await cur.fetchone()
+            return (row[0], row[1]) if row else None
+
+
+async def _fsm_set_state(key_str: str, state: Optional[str]):
+    if _PG:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO fsm_data (storage_key, state, data) VALUES ($1, $2, '{}') "
+                "ON CONFLICT (storage_key) DO UPDATE SET state = $2",
+                key_str, state,
+            )
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO fsm_data (storage_key, state, data) VALUES (?, ?, '{}') "
+                "ON CONFLICT (storage_key) DO UPDATE SET state = ?",
+                (key_str, state, state),
+            )
+            await db.commit()
+
+
+async def _fsm_set_data(key_str: str, payload: str):
+    if _PG:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO fsm_data (storage_key, state, data) VALUES ($1, NULL, $2) "
+                "ON CONFLICT (storage_key) DO UPDATE SET data = $2",
+                key_str, payload,
+            )
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO fsm_data (storage_key, state, data) VALUES (?, NULL, ?) "
+                "ON CONFLICT (storage_key) DO UPDATE SET data = ?",
+                (key_str, payload, payload),
+            )
+            await db.commit()
+
+
+class PersistentStorage(BaseStorage):
+    """MemoryStorage o'rniga ishlatiladi — restart/deploy'dan keyin ham
+    foydalanuvchining FSM holati saqlanib qoladi."""
+
+    @staticmethod
+    def _key_str(key: StorageKey) -> str:
+        # aiogram versiyalari orasida StorageKey maydonlari farq qilishi
+        # mumkin — shuning uchun aniq maydon nomiga tayanmasdan, dataclass'ning
+        # o'zini (barcha maydonlari bilan) string'ga aylantiramiz.
+        return str(key)
+
+    async def set_state(self, key: StorageKey, state=None) -> None:
+        value = state.state if isinstance(state, State) else state
+        await _fsm_set_state(self._key_str(key), value)
+
+    async def get_state(self, key: StorageKey) -> Optional[str]:
+        row = await _fsm_get(self._key_str(key))
+        return row[0] if row else None
+
+    async def set_data(self, key: StorageKey, data: Dict[str, Any]) -> None:
+        await _fsm_set_data(self._key_str(key), json.dumps(data, ensure_ascii=False))
+
+    async def get_data(self, key: StorageKey) -> Dict[str, Any]:
+        row = await _fsm_get(self._key_str(key))
+        if not row or not row[1]:
+            return {}
+        try:
+            return json.loads(row[1])
+        except (json.JSONDecodeError, TypeError):
+            return {}
+
+    async def close(self) -> None:
+        pass  # ulanish global _pool/DB_PATH orqali boshqariladi — alohida yopiladigan resurs yo'q
+
+
+async def save_support_thread(admin_chat_id: int, message_id: int, user_id: int):
+    """Adminga yuborilgan "Yordam" xabarining message_id'sini shu
+    foydalanuvchi bilan bog'laydi — admin xabarga Reply qilganda kimga
+    javob yo'llashni bilish uchun."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO support_threads (admin_chat_id, message_id, user_id) VALUES ($1, $2, $3) "
+                "ON CONFLICT (admin_chat_id, message_id) DO UPDATE SET user_id = $3",
+                admin_chat_id, message_id, user_id,
+            )
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO support_threads (admin_chat_id, message_id, user_id) VALUES (?, ?, ?) "
+                "ON CONFLICT (admin_chat_id, message_id) DO UPDATE SET user_id = ?",
+                (admin_chat_id, message_id, user_id, user_id),
+            )
+            await db.commit()
+
+
+async def get_support_thread(admin_chat_id: int, message_id: int) -> Optional[int]:
+    """Reply qilingan xabar qaysi foydalanuvchining Yordam so'roviga tegishli
+    ekanini qaytaradi (topilmasa None)."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT user_id FROM support_threads WHERE admin_chat_id = $1 AND message_id = $2",
+                admin_chat_id, message_id,
+            )
+            return row["user_id"] if row else None
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT user_id FROM support_threads WHERE admin_chat_id = ? AND message_id = ?",
+                (admin_chat_id, message_id),
+            )
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+
 async def count_other_pending_topups(user_id: int, exclude_topup_id: int) -> int:
     """Shu foydalanuvchidan hali ko'rib chiqilmagan (pending) YANA nechta
     to'ldirish so'rovi borligini hisoblaydi (joriy so'rovdan tashqari) —
@@ -817,6 +1025,26 @@ class SmmUpperClient:
     async def get_order(self, order_id) -> dict:
         return await self._request("getOrder", order_id=order_id)
 
+    # 9. Raqamni bekor qilish/bloklash (pul qaytarilganda chaqiriladi).
+    # DIQQAT: "cancelNumber" — TAXMINIY nom. Bizga yuborilgan 17 ta hujjat
+    # skrinshotida (getBalance/getPrices/available_countries/getNumber/
+    # getCode/buyStars/buyPremium/getOrder) bekor qilish amali yo'q edi.
+    # SmmUpper hamkorlik panelidan yoki texnik yordamidan aniq amal nomini
+    # so'rab, shu yerdagi "cancelNumber" so'zini almashtiring — aks holda
+    # bu chaqiruv doim xato qaytaradi (quyida refund_number_order shu
+    # xatoni ushlab, adminga ogohlantirish yuboradi, lekin foydalanuvchiga
+    # pul qaytarishni to'xtatmaydi).
+    async def cancel_number(self, server: int, *, hash_code: Optional[str] = None,
+                             number: Optional[str] = None, id: Optional[str] = None) -> dict:
+        params = {"server": server}
+        if server == 1:
+            params["hash_code"] = hash_code
+        elif server == 2:
+            params["number"] = number
+        else:
+            params["id"] = id
+        return await self._request("cancelNumber", **params)
+
 
 # ==============================================================
 # NARXLASH (pricing)
@@ -884,13 +1112,16 @@ def balance_text(amount: int) -> str:
     return f"\U0001F4B0 Balansingiz: {fmt_money(amount)} so'm"
 
 
-def referral_text(link: str) -> str:
+def referral_text(link: str, invited: int = 0, earned: int = 0) -> str:
     return (
         f"\U0001F381 Do'stlaringizni taklif qiling!\n\n"
         f"Sizning shaxsiy havolangiz:\n{link}\n\n"
         f"Taklif qilgan do'stingiz balansini to'ldirsa, sizga har safar "
         f"to'ldirilgan summaning {REFERRAL_CASHBACK_PERCENT}% miqdorida keshbek "
-        f"beriladi \u2014 avtomatik ravishda balansingizga qo'shiladi."
+        f"beriladi \u2014 avtomatik ravishda balansingizga qo'shiladi.\n\n"
+        f"\U0001F4CA Statistikangiz:\n"
+        f"\U0001F465 Taklif qilingan do'stlar: {invited}\n"
+        f"\U0001F4B0 Jami olingan keshbek: {fmt_money(earned)} so'm"
     )
 
 
@@ -1317,12 +1548,15 @@ def country_flag(code: str) -> str:
     return "".join(chr(0x1F1E6 + (ord(ch) - ord("A"))) for ch in code)
 
 
-def _country_button_label(code: str, info: dict) -> str:
+def _country_button_label(code: str, info: dict, markup_percent: float = 0.0) -> str:
     price = info.get("price", "?")
     name = country_display_name(code)
     flag = country_flag(code)
     label_name = f"{flag} {name}" if flag else name
-    return f"{label_name} — {fmt_money(price)} so'm" if isinstance(price, (int, float)) else label_name
+    if isinstance(price, (int, float)):
+        shown_price = round(float(price) * (1 + markup_percent / 100))
+        return f"{label_name} — {fmt_money(shown_price)} so'm"
+    return label_name
 
 
 def _normalize_query(text: str) -> str:
@@ -1349,12 +1583,15 @@ _COUNTRY_MENU_MODES = {
 }
 
 
-def countries_menu(server: int, countries: dict, page: int = 0, *, mode: str = "browse") -> InlineKeyboardMarkup:
+def countries_menu(server: int, countries: dict, page: int = 0, *, mode: str = "browse", markup_percent: float = 0.0) -> InlineKeyboardMarkup:
     """Davlatlar ro'yxatini to'liq nom (+ bayroq) bilan, sahifalab ko'rsatadi
     (bitta ulkan ro'yxat o'rniga). `mode`:
       - "browse": alifbo tartibida, pastda TOP10/Arzon/Qidirish tugmalari
       - "cheap":  narx bo'yicha arzondan qimmatga, "ro'yxatga qaytish" bilan
       - "search": qidiruv natijalari, "qayta qidirish"+"ro'yxatga qaytish" bilan
+    `markup_percent` — narxlarni ko'rsatishda qo'shiladigan ustama (admin
+    panelda o'zgartirilganda shu yerdagi ko'rinish ham darhol yangilanishi
+    uchun chaqiruvchi joyda oldindan hisoblab, parametr sifatida beriladi).
     """
     sort_key, pg_prefix = _COUNTRY_MENU_MODES[mode]
     items = _sorted_country_items(countries, sort=sort_key)
@@ -1365,7 +1602,7 @@ def countries_menu(server: int, countries: dict, page: int = 0, *, mode: str = "
     rows = []
     row = []
     for code, info in chunk:
-        row.append(InlineKeyboardButton(text=_country_button_label(code, info), callback_data=f"cty:{server}:{code}", style=STYLE_PRIMARY))
+        row.append(InlineKeyboardButton(text=_country_button_label(code, info, markup_percent), callback_data=f"cty:{server}:{code}", style=STYLE_PRIMARY))
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -1752,17 +1989,35 @@ async def notify_channel(bot, text: str):
         pass
 
 
-async def is_subscribed(bot, user_id: int) -> bool:
+_SUB_CACHE_TTL_SECONDS = 600  # 10 daqiqa — kamida 5-10 daqiqa keshlash tavsiyasiga ko'ra
+_sub_cache: Dict[int, tuple] = {}  # user_id -> (a'zo_mi: bool, tekshirilgan_vaqt: float)
+
+
+async def is_subscribed(bot, user_id: int, force_refresh: bool = False) -> bool:
     """Barcha majburiy obuna kanallariga foydalanuvchi a'zo-yo'qligini
     tekshiradi — a'zo hisoblanishi uchun RO'YXATDAGI HAMMASIGA a'zo bo'lishi
     kerak. Ro'yxat bo'sh bo'lsa — tekshirilmaydi (True qaytadi).
     Bot biror kanalga admin qilib qo'shilmagan yoki boshqa sabab bilan
     tekshira olmasa — botni butunlay to'xtatib qo'ymaslik uchun xavfsiz
     tomonga (o'sha kanal bo'yicha "a'zo") og'ib ketiladi.
+
+    Natija _SUB_CACHE_TTL_SECONDS davomida xotirada keshlanadi: aks holda
+    har bir xabar/tugma bosishda Telegram'ga get_chat_member so'rovi ketib,
+    ko'p faol foydalanuvchida FloodWait (429) xavfini tug'diradi. "\u2705 A'zo
+    bo'ldim" tugmasi force_refresh=True bilan chaqiradi, shu uchun kesh hali
+    eskirmagan bo'lsa ham darhol jonli holatni ko'rsatadi.
     """
     channels = await get_force_sub_channels()
     if not channels:
         return True
+
+    now = time.monotonic()
+    if not force_refresh:
+        cached = _sub_cache.get(user_id)
+        if cached is not None and now - cached[1] < _SUB_CACHE_TTL_SECONDS:
+            return cached[0]
+
+    result = True
     for item in channels:
         channel = (item or {}).get("channel")
         if not channel:
@@ -1770,12 +2025,15 @@ async def is_subscribed(bot, user_id: int) -> bool:
         try:
             member = await bot.get_chat_member(channel, user_id)
             if member.status in _NOT_SUBSCRIBED_STATUSES:
-                return False
+                result = False
+                break
         except TelegramBadRequest:
             continue
         except Exception:
             continue
-    return True
+
+    _sub_cache[user_id] = (result, now)
+    return result
 
 
 async def send_force_sub_prompt(bot, chat_id: int):
@@ -1798,7 +2056,7 @@ async def send_force_sub_prompt(bot, chat_id: int):
 
 @router_common.callback_query(F.data == "forcesub:check")
 async def force_sub_check(callback: CallbackQuery, bot):
-    if await is_subscribed(bot, callback.from_user.id):
+    if await is_subscribed(bot, callback.from_user.id, force_refresh=True):
         # MUHIM: bu yerda ham ensure_user() chaqirilishi shart — aks holda
         # majburiy obunadan o'tgan, lekin hali /start bosmagan foydalanuvchi
         # bazada umuman ko'rinmay qoladi (admin unga balans qo'sholmaydi,
@@ -1817,7 +2075,18 @@ async def force_sub_check(callback: CallbackQuery, bot):
 @router_common.callback_query(F.data == "cancel")
 async def cancel_any(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.answer("Bekor qilindi.", reply_markup=main_menu())
+    # Yangi xabar bilan "uzaytirish" o'rniga, eski so'rovning o'zini tahrirlab
+    # tugmalarini olib tashlaymiz — shunda suhbatda ortiqcha xabarlar
+    # to'planib qolmaydi. Tahrirlab bo'lmasa (masalan, rasm bilan yuborilgan
+    # yoki juda eski xabar), o'chirib, faqat o'shanda yangi xabar yuboramiz.
+    try:
+        await callback.message.edit_text("\u274C Bekor qilindi.")
+    except Exception:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.message.answer("\u274C Bekor qilindi.", reply_markup=main_menu())
     await callback.answer()
 
 
@@ -1857,7 +2126,9 @@ def help_forward_text(user, text: str) -> str:
         f"\U0001F195 Yordam so'rovi\n\n"
         f"\U0001F464 {user.full_name} ({username_part})\n"
         f"\U0001F194 ID: {user.id}\n\n"
-        f"\U0001F4AC Xabar:\n{text}"
+        f"\U0001F4AC Xabar:\n{text}\n\n"
+        f"\u21A9\uFE0F Javob berish uchun shu xabarga Reply qiling \u2014 yozganingiz "
+        f"avtomatik ravishda foydalanuvchiga yetkaziladi."
     )
 
 
@@ -1874,10 +2145,42 @@ async def help_receive(message: Message, state: FSMContext, bot):
     text = help_forward_text(message.from_user, message.text)
     for admin_id in admin_ids:
         try:
-            await bot.send_message(admin_id, text)
+            sent = await bot.send_message(admin_id, text)
+            await save_support_thread(admin_id, sent.message_id, message.from_user.id)
         except Exception:
             pass
     await message.answer(HELP_SENT_TO_USER, reply_markup=main_menu())
+
+
+async def support_reply_filter(message: Message):
+    """Admin biror Yordam-so'rovi xabariga Reply qilganda ishga tushadi.
+    Filter False qaytarsa, aiogram avtomatik keyingi handlerga o'tadi —
+    shuning uchun bu boshqa admin oqimlariga (broadcast va h.k.) xalaqit
+    bermaydi."""
+    if not message.reply_to_message:
+        return False
+    if not await _is_admin(message.from_user.id):
+        return False
+    target_user_id = await get_support_thread(message.chat.id, message.reply_to_message.message_id)
+    if not target_user_id:
+        return False
+    return {"support_user_id": target_user_id}
+
+
+@router_admin.message(support_reply_filter)
+async def admin_support_reply(message: Message, bot, support_user_id: int):
+    """Adminning javobini (matn, rasm, ovozli xabar — istalgan turi)
+    o'zgarishsiz foydalanuvchiga yetkazadi."""
+    try:
+        await bot.copy_message(
+            chat_id=support_user_id,
+            from_chat_id=message.chat.id,
+            message_id=message.message_id,
+        )
+    except Exception:
+        await message.reply("\u274C Foydalanuvchiga yetkazib bo'lmadi \u2014 balki botni bloklagan.")
+        return
+    await message.reply("\u2705 Foydalanuvchiga yuborildi.")
 
 
 # ==============================================================
@@ -1904,7 +2207,8 @@ async def topup_start(callback: CallbackQuery, state: FSMContext):
 async def referral_info(callback: CallbackQuery, bot):
     me = await bot.get_me()
     link = f"https://t.me/{me.username}?start=ref{callback.from_user.id}"
-    await callback.message.answer(referral_text(link))
+    stats = await get_referral_stats(callback.from_user.id)
+    await callback.message.answer(referral_text(link, stats["invited"], stats["earned"]))
     await callback.answer()
 
 
@@ -2018,7 +2322,8 @@ async def choose_regular(callback: CallbackQuery, state: FSMContext):
 
     await state.set_state(BuyNumber.choosing_country)
     await state.update_data(server=server, countries=countries)
-    await callback.message.answer("Davlatni tanlang:", reply_markup=countries_menu(server, countries))
+    percent = await get_markup_percent()
+    await callback.message.answer("Davlatni tanlang:", reply_markup=countries_menu(server, countries, markup_percent=percent))
 
 
 @router_numbers.callback_query(F.data == "numtype:ready")
@@ -2037,7 +2342,8 @@ async def choose_ready(callback: CallbackQuery, state: FSMContext):
 
     await state.set_state(BuyNumber.choosing_country)
     await state.update_data(server=3, countries=countries)
-    await callback.message.answer("Davlatni tanlang:", reply_markup=countries_menu(3, countries))
+    percent = await get_markup_percent()
+    await callback.message.answer("Davlatni tanlang:", reply_markup=countries_menu(3, countries, markup_percent=percent))
 
 
 # ---------- Davlatlar ro'yxatini varaqlash va qidirish ----------
@@ -2054,9 +2360,10 @@ async def country_change_page(callback: CallbackQuery, state: FSMContext):
     _, server_str, page_str = callback.data.split(":")
     data = await state.get_data()
     countries = data.get("countries", {})
+    percent = await get_markup_percent()
     await callback.message.edit_text(
         "Davlatni tanlang:",
-        reply_markup=countries_menu(int(server_str), countries, page=int(page_str)),
+        reply_markup=countries_menu(int(server_str), countries, page=int(page_str), markup_percent=percent),
     )
     await callback.answer()
 
@@ -2068,9 +2375,10 @@ async def country_change_cheap_page(callback: CallbackQuery, state: FSMContext):
     _, server_str, page_str = callback.data.split(":")
     data = await state.get_data()
     countries = data.get("countries", {})
+    percent = await get_markup_percent()
     await callback.message.edit_text(
         "\U0001F4C9 Arzon davlatlar:",
-        reply_markup=countries_menu(int(server_str), countries, page=int(page_str), mode="cheap"),
+        reply_markup=countries_menu(int(server_str), countries, page=int(page_str), mode="cheap", markup_percent=percent),
     )
     await callback.answer()
 
@@ -2104,9 +2412,10 @@ async def country_show_top(callback: CallbackQuery, state: FSMContext):
 
     rows = []
     row = []
+    percent = await get_markup_percent()
     for code, _cnt in matched:
         info = countries[code]
-        row.append(InlineKeyboardButton(text=_country_button_label(code, info), callback_data=f"cty:{server}:{code}", style=STYLE_PRIMARY))
+        row.append(InlineKeyboardButton(text=_country_button_label(code, info, percent), callback_data=f"cty:{server}:{code}", style=STYLE_PRIMARY))
         if len(row) == 2:
             rows.append(row)
             row = []
@@ -2126,9 +2435,10 @@ async def country_change_search_page(callback: CallbackQuery, state: FSMContext)
     _, server_str, page_str = callback.data.split(":")
     data = await state.get_data()
     results = data.get("search_results", {})
+    percent = await get_markup_percent()
     await callback.message.edit_text(
         "\U0001F50D Qidiruv natijalari:",
-        reply_markup=countries_menu(int(server_str), results, page=int(page_str), mode="search"),
+        reply_markup=countries_menu(int(server_str), results, page=int(page_str), mode="search", markup_percent=percent),
     )
     await callback.answer()
 
@@ -2152,7 +2462,8 @@ async def country_search_exit(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     countries = data.get("countries", {})
     await state.set_state(BuyNumber.choosing_country)
-    await callback.message.edit_text("Davlatni tanlang:", reply_markup=countries_menu(server, countries))
+    percent = await get_markup_percent()
+    await callback.message.edit_text("Davlatni tanlang:", reply_markup=countries_menu(server, countries, markup_percent=percent))
     await callback.answer()
 
 
@@ -2181,9 +2492,10 @@ async def country_search_run(message: Message, state: FSMContext):
 
     await state.update_data(search_results=results)
     await state.set_state(BuyNumber.choosing_country)
+    percent = await get_markup_percent()
     await message.answer(
         f"\U0001F50D Qidiruv natijalari ({len(results)} ta):",
-        reply_markup=countries_menu(server, results, mode="search"),
+        reply_markup=countries_menu(server, results, mode="search", markup_percent=percent),
     )
 
 
@@ -2271,10 +2583,11 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
     await notify_channel(bot, channel_number_notice(buyer, country, actual_price))
 
     sent = await callback.message.answer(
-        f"\u2705 Raqam olindi: {number}\n"
+        f"\u2705 Raqam olindi: <code>{html.escape(str(number))}</code>\n"
         f"\U0001F4B5 Narx: {fmt_money(actual_price)} so'm\n\n"
         f"\u23F3 SMS kod kutilmoqda...",
         reply_markup=check_code_menu(order_pk),
+        parse_mode="HTML",
     )
 
     await state.clear()
@@ -2319,13 +2632,13 @@ async def _poll_code(bot, user_id: int, order_pk: int, server: int, result: dict
         if data.get("success"):
             code = data.get("code", "?")
             password = data.get("password") or ""
-            text = f"\u2705 SMS kod keldi: {code}"
+            text = f"\u2705 SMS kod keldi: <code>{html.escape(str(code))}</code> 123.45"
             if password:
-                text += f"\n\U0001F511 2FA parol: {password}"
+                text += f"\n\U0001F511 2FA parol: <code>{html.escape(str(password))}</code>"
             await update_order_status(order_pk, "done", {**result, "code": code, "password": password})
             await _clear_buttons(bot, user_id, purchase_message_id)
             try:
-                await bot.send_message(user_id, text)
+                await bot.send_message(user_id, text, parse_mode="HTML")
             except Exception:
                 pass
             return
@@ -2368,16 +2681,20 @@ async def manual_check_code(callback: CallbackQuery):
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        text = f"Kod: {code}"
+        # Popup alert (show_alert) matnni nusxalashga imkon bermaydi — shuning
+        # uchun kodni alohida, <code> bilan formatlangan xabar sifatida
+        # yuboramiz, bosib nusxa olish uchun.
+        text = f"\u2705 Kod: <code>{html.escape(str(code))}</code> 123.45"
         if password:
-            text += f"\n2FA parol: {password}"
-        await callback.answer(text, show_alert=True)
+            text += f"\n\U0001F511 2FA parol: <code>{html.escape(str(password))}</code>"
+        await callback.answer()
+        await callback.message.answer(text, parse_mode="HTML")
     else:
         await callback.answer("\u23F3 Kod hali kelmagan. Birozdan so'ng qayta tekshiring.", show_alert=True)
 
 
 @router_numbers.callback_query(F.data.startswith("numrefund:"))
-async def refund_number_order(callback: CallbackQuery):
+async def refund_number_order(callback: CallbackQuery, bot):
     order_pk = int(callback.data.split(":")[1])
     row = await get_order_row(order_pk)
     if not row or row["user_id"] != callback.from_user.id:
@@ -2401,6 +2718,34 @@ async def refund_number_order(callback: CallbackQuery):
     if not refund:
         await callback.answer("Pulni qaytarib bo'lmadi \u2014 balki allaqachon yakunlangan.", show_alert=True)
         return
+
+    # Foydalanuvchiga pul qaytarildi — endi SmmUpper'da ham shu raqamni
+    # bekor qilishga urinamiz, aks holda provayder uni band holda ushlab
+    # turishi (va bizning hamkor balansimizni band qilishi) mumkin. Amal
+    # nomi hali tasdiqlanmagani uchun xato bo'lishi mumkin — bu holatda
+    # foydalanuvchiga pul qaytarish TO'XTATILMAYDI, faqat admin xabardor
+    # qilinadi (qo'lda tekshirish uchun).
+    try:
+        details = json.loads(row["details"]) if row["details"] else {}
+        await client.cancel_number(
+            row["server"],
+            hash_code=details.get("hash_code"),
+            number=details.get("number"),
+            id=details.get("id"),
+        )
+    except Exception as e:
+        err_text = getattr(e, "message", str(e))
+        logging.warning(f"SmmUpper cancel_number xato (order {order_pk}): {err_text}")
+        for admin_id in set(ADMIN_IDS) | set(await get_extra_admin_ids()):
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"\u26A0\uFE0F Buyurtma #{order_pk}: foydalanuvchiga pul qaytarildi, "
+                    f"lekin SmmUpper'da raqamni bekor qilib bo'lmadi ({err_text}).\n"
+                    f"Qo'lda tekshiring va/yoki cancel_number amal nomini tasdiqlang.",
+                )
+            except Exception:
+                pass
 
     new_balance = await get_balance(callback.from_user.id)
     try:
@@ -3031,6 +3376,19 @@ async def admin_broadcast_receive(message: Message, state: FSMContext, bot):
     except Exception:
         pass
 
+    # Fonda (background task) ishga tushiriladi — shunda 1000+ foydalanuvchiga
+    # yuborish davomida admin panel "qotib" qolmaydi va bot boshqa
+    # foydalanuvchilarga bemalol javob berishda davom etadi.
+    task = asyncio.create_task(_run_broadcast(bot, chat_id, message_id, text))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _run_broadcast(bot, chat_id: int, message_id: Optional[int], text: str):
+    """Xabarni barcha foydalanuvchiga fonda yuboradi. Telegram flood-limit
+    bersa (TelegramRetryAfter), ko'rsatilgan vaqtcha kutib O'SHA
+    foydalanuvchiga qayta uriniladi (o'tkazib yuborilmaydi); botni
+    bloklagan foydalanuvchilar (TelegramForbiddenError) alohida hisoblanadi."""
     user_ids = await get_all_user_ids()
     progress_text = f"\u23F3 {len(user_ids)} foydalanuvchiga yuborilmoqda..."
     if message_id:
@@ -3043,20 +3401,37 @@ async def admin_broadcast_receive(message: Message, state: FSMContext, bot):
         message_id = sent_msg.message_id
 
     sent = 0
+    blocked = 0
     failed = 0
     for user_id in user_ids:
-        try:
-            await bot.send_message(user_id, text)
-            sent += 1
-        except Exception:
-            failed += 1
+        while True:
+            try:
+                await bot.send_message(user_id, text)
+                sent += 1
+                break
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 0.5)
+                continue
+            except TelegramForbiddenError:
+                blocked += 1
+                break
+            except Exception:
+                failed += 1
+                break
         await asyncio.sleep(0.05)
 
-    result_text = f"\u2705 Yuborildi: {sent}\n\u274C Yuborilmadi: {failed}"
+    result_text = (
+        f"\u2705 Yuborildi: {sent}\n"
+        f"\U0001F6AB Botni bloklagan: {blocked}\n"
+        f"\u274C Boshqa xatolik: {failed}"
+    )
     try:
         await bot.edit_message_text(result_text, chat_id=chat_id, message_id=message_id, reply_markup=admin_cancel_menu())
     except Exception:
-        await bot.send_message(chat_id, result_text, reply_markup=admin_cancel_menu())
+        try:
+            await bot.send_message(chat_id, result_text, reply_markup=admin_cancel_menu())
+        except Exception:
+            pass
 
 
 # ---------- API kalitni sozlash ----------
@@ -3422,6 +3797,7 @@ async def approve_topup(callback: CallbackQuery, bot):
         cashback = topup["amount"] * REFERRAL_CASHBACK_PERCENT // 100
         if cashback > 0:
             await change_balance(referrer_id, cashback)
+            await add_referral_earning(referrer_id, cashback)
             try:
                 await bot.send_message(
                     referrer_id,
@@ -3583,7 +3959,7 @@ async def main():
     await init_db()
 
     bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher()
+    dp = Dispatcher(storage=PersistentStorage())
 
     # Har bir xabar/tugma bosishi routerlarga yetib borishidan OLDIN: avval
     # bloklangan-emasligi tekshiriladi, keyin spam/flood cheklovi qo'llanadi.
@@ -3611,7 +3987,15 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     await _run_health_server()
     logging.info("Bot ishga tushdi (polling rejimida)")
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # Server to'xtatilganda (Render/VPS restart, deploy, Ctrl+C) ochiq
+        # ulanishlarni tartibli yopamiz — aks holda Postgres'da "idle"
+        # ulanishlar to'planib qoladi.
+        if _pool is not None:
+            await _pool.close()
+        await bot.session.close()
 
 
 if __name__ == "__main__":
