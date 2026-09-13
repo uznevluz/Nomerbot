@@ -19,7 +19,7 @@ import aiosqlite
 import asyncpg
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS users (
     full_name TEXT,
     balance INTEGER NOT NULL DEFAULT 0,
     banned INTEGER NOT NULL DEFAULT 0,
+    referred_by INTEGER,
     created_at INTEGER NOT NULL
 );
 
@@ -136,6 +137,7 @@ CREATE TABLE IF NOT EXISTS orders (
     status TEXT NOT NULL DEFAULT 'processing',   -- processing | done | refunded
     price INTEGER NOT NULL,
     details TEXT,                      -- JSON: SmmUpper javobi
+    country TEXT,                      -- ISO kod ('number' turidagi buyurtmalar uchun; TOP 10 statistikasi uchun
     created_at INTEGER NOT NULL
 );
 
@@ -161,6 +163,7 @@ CREATE TABLE IF NOT EXISTS users (
     full_name TEXT,
     balance BIGINT NOT NULL DEFAULT 0,
     banned BOOLEAN NOT NULL DEFAULT FALSE,
+    referred_by BIGINT,
     created_at BIGINT NOT NULL
 );
 
@@ -173,6 +176,7 @@ CREATE TABLE IF NOT EXISTS orders (
     status TEXT NOT NULL DEFAULT 'processing',
     price BIGINT NOT NULL,
     details TEXT,
+    country TEXT,
     created_at BIGINT NOT NULL
 );
 
@@ -198,19 +202,38 @@ async def init_db():
         _pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
         async with _pool.acquire() as conn:
             await conn.execute(_SCHEMA_PG)
+            # Eski (allaqachon ishlab turgan) bazalarda ham "country" ustuni
+            # paydo bo'lishi uchun — CREATE TABLE IF NOT EXISTS mavjud
+            # jadvalni o'zgartirmaydi. Postgres 9.6+ IF NOT EXISTS'ni
+            # qo'llab-quvvatlaydi, shu uchun bu amal xavfsiz va qayta-qayta
+            # ishga tushirsa ham xato bermaydi.
+            await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS country TEXT")
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT")
     else:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.executescript(_SCHEMA_SQLITE)
+            try:
+                await db.execute("ALTER TABLE orders ADD COLUMN country TEXT")
+            except Exception:
+                pass  # ustun allaqachon mavjud (eski baza) — SQLite'da "IF NOT EXISTS" yo'q
+            try:
+                await db.execute("ALTER TABLE users ADD COLUMN referred_by INTEGER")
+            except Exception:
+                pass
             await db.commit()
 
 
-async def ensure_user(user_id: int, username: Optional[str], full_name: Optional[str]):
+async def ensure_user(user_id: int, username: Optional[str], full_name: Optional[str], referred_by: Optional[int] = None):
+    """`referred_by` faqat foydalanuvchi ENDI birinchi marta yaratilayotganda
+    o'rnatiladi — INSERT OR IGNORE / ON CONFLICT DO NOTHING tufayli, agar u
+    allaqachon mavjud bo'lsa, bu qiymat e'tiborsiz qoldiriladi (referal
+    keyinchalik boshqacha /start bosilsa ham o'zgarmay qoladi)."""
     if _PG:
         async with _pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO users (user_id, username, full_name, balance, created_at) "
-                "VALUES ($1, $2, $3, 0, $4) ON CONFLICT (user_id) DO NOTHING",
-                user_id, username, full_name, int(time.time()),
+                "INSERT INTO users (user_id, username, full_name, balance, created_at, referred_by) "
+                "VALUES ($1, $2, $3, 0, $4, $5) ON CONFLICT (user_id) DO NOTHING",
+                user_id, username, full_name, int(time.time()), referred_by,
             )
             await conn.execute(
                 "UPDATE users SET username = $1, full_name = $2 WHERE user_id = $3",
@@ -219,15 +242,28 @@ async def ensure_user(user_id: int, username: Optional[str], full_name: Optional
     else:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute(
-                "INSERT OR IGNORE INTO users (user_id, username, full_name, balance, created_at) "
-                "VALUES (?, ?, ?, 0, ?)",
-                (user_id, username, full_name, int(time.time())),
+                "INSERT OR IGNORE INTO users (user_id, username, full_name, balance, created_at, referred_by) "
+                "VALUES (?, ?, ?, 0, ?, ?)",
+                (user_id, username, full_name, int(time.time()), referred_by),
             )
             await db.execute(
                 "UPDATE users SET username = ?, full_name = ? WHERE user_id = ?",
                 (username, full_name, user_id),
             )
             await db.commit()
+
+
+async def get_referrer(user_id: int) -> Optional[int]:
+    """Foydalanuvchini taklif qilgan kishining ID sini qaytaradi (bo'lmasa None)."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT referred_by FROM users WHERE user_id = $1", user_id)
+            return row["referred_by"] if row else None
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT referred_by FROM users WHERE user_id = ?", (user_id,))
+            row = await cur.fetchone()
+            return row[0] if row else None
 
 
 async def get_balance(user_id: int) -> int:
@@ -355,25 +391,53 @@ async def find_user(identifier: str) -> Optional[dict]:
 
 
 async def create_order(user_id: int, order_type: str, ref: Optional[str], server: Optional[int],
-                        price: int, details: dict, status: str = "processing") -> int:
+                        price: int, details: dict, status: str = "processing",
+                        country: Optional[str] = None) -> int:
     details_json = json.dumps(details, ensure_ascii=False)
     if _PG:
         async with _pool.acquire() as conn:
             row = await conn.fetchrow(
-                "INSERT INTO orders (user_id, order_type, ref, server, status, price, details, created_at) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
-                user_id, order_type, ref, server, status, price, details_json, int(time.time()),
+                "INSERT INTO orders (user_id, order_type, ref, server, status, price, details, country, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+                user_id, order_type, ref, server, status, price, details_json, country, int(time.time()),
             )
             return row["id"]
     else:
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
-                "INSERT INTO orders (user_id, order_type, ref, server, status, price, details, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (user_id, order_type, ref, server, status, price, details_json, int(time.time())),
+                "INSERT INTO orders (user_id, order_type, ref, server, status, price, details, country, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, order_type, ref, server, status, price, details_json, country, int(time.time())),
             )
             await db.commit()
             return cur.lastrowid
+
+
+async def top_countries(limit: int = 10) -> list:
+    """Eng ko'p buyurtma qilingan davlatlarni (kod, soni) juftliklari
+    ro'yxati sifatida, kamayish tartibida qaytaradi. Faqat "country"
+    ustuni saqlangan (ya'ni shu funksiya botga qo'shilgandan keyin
+    qilingan) 'number' turidagi va bekor qilinmagan buyurtmalar
+    hisobga olinadi."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT country, COUNT(*) AS cnt FROM orders "
+                "WHERE order_type = 'number' AND country IS NOT NULL AND status != 'refunded' "
+                "GROUP BY country ORDER BY cnt DESC LIMIT $1",
+                limit,
+            )
+            return [(r["country"], r["cnt"]) for r in rows]
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT country, COUNT(*) AS cnt FROM orders "
+                "WHERE order_type = 'number' AND country IS NOT NULL AND status != 'refunded' "
+                "GROUP BY country ORDER BY cnt DESC LIMIT ?",
+                (limit,),
+            )
+            rows = await cur.fetchall()
+            return [(r[0], r[1]) for r in rows]
 
 
 async def update_order_status(order_pk: int, status: str, details: Optional[dict] = None):
@@ -791,9 +855,7 @@ WELCOME = (
     "sotib olishingiz mumkin. Quyidagi menyudan tanlang \U0001F447"
 )
 
-MENU_TITLE = "Bosh menyu:"
-
-BTN_MENU = "\U0001F3E0 Menyu"
+BTN_HELP = "\U0001F195 Yordam"
 BTN_BALANCE = "\U0001F4B0 Balans"
 BTN_TOPUP = "\U0001F4B3 Balansni to'ldirish"
 BTN_NUMBER = "\U0001F4F1 Raqam sotib olish"
@@ -804,10 +866,12 @@ BTN_CANCEL = "\u274C Bekor qilish"
 BTN_CHECK_CODE = "\U0001F504 Kodni tekshirish"
 BTN_CONFIRM = "\u2705 Tasdiqlash"
 
+REFERRAL_CASHBACK_PERCENT = 1  # taklif qilingan do'st balans to'ldirsa, shu foizi taklif qilgan odamga keshbek sifatida qo'shiladi
+
 # Bosh menyudagi tugma matnlari — bular FSM holatida turgan "erkin matn"
 # handlerlar tomonidan "username" yoki "summa" deb noto'g'ri qabul qilinmasligi kerak.
 RESERVED_TEXTS = {
-    BTN_MENU, BTN_BALANCE, BTN_TOPUP, BTN_NUMBER,
+    BTN_HELP, BTN_BALANCE, BTN_TOPUP, BTN_NUMBER,
     BTN_STARS, BTN_PREMIUM, BTN_ORDERS, BTN_CANCEL,
 }
 
@@ -818,6 +882,16 @@ def fmt_money(amount) -> str:
 
 def balance_text(amount: int) -> str:
     return f"\U0001F4B0 Balansingiz: {fmt_money(amount)} so'm"
+
+
+def referral_text(link: str) -> str:
+    return (
+        f"\U0001F381 Do'stlaringizni taklif qiling!\n\n"
+        f"Sizning shaxsiy havolangiz:\n{link}\n\n"
+        f"Taklif qilgan do'stingiz balansini to'ldirsa, sizga har safar "
+        f"to'ldirilgan summaning {REFERRAL_CASHBACK_PERCENT}% miqdorida keshbek "
+        f"beriladi \u2014 avtomatik ravishda balansingizga qo'shiladi."
+    )
 
 
 def insufficient_balance(price: int, balance: int) -> str:
@@ -1017,10 +1091,9 @@ def card_saved(card_number: str, card_holder: str) -> str:
 
 
 ASK_FORCE_SUB_CHANNEL = (
-    "Majburiy obuna uchun kanalni yuboring.\n\n"
+    "Qo'shmoqchi bo'lgan majburiy obuna kanalini yuboring.\n\n"
     "\u2022 Ochiq kanal: @kanalim\n"
     "\u2022 Yopiq kanal: -100 bilan boshlanuvchi ID\n\n"
-    "O'chirib qo'yish uchun: 0\n\n"
     "\u26A0\uFE0F Botni shu kanalga oldindan ADMIN qilib (a'zolarni ko'rish huquqi "
     "bilan) qo'shib qo'ying."
 )
@@ -1030,20 +1103,6 @@ ASK_FORCE_SUB_URL = (
     "Ochiq kanal bo'lsa va @username'dan avtomatik hosil qilinishini xohlasangiz: -"
 )
 NOT_A_VALID_FORCE_SUB_CHANNEL = "\u274C Noto'g'ri format. @kanalim yoki -100... ko'rinishida yuboring."
-
-
-def current_force_sub_line(channel) -> str:
-    if not channel:
-        return "\U0001F510 Majburiy obuna: \u2014 (o'chiq)"
-    return f"\U0001F510 Majburiy obuna: {channel}"
-
-
-def force_sub_disabled_ok() -> str:
-    return "\u2705 Majburiy obuna o'chirildi."
-
-
-def force_sub_saved(channel, url) -> str:
-    return f"\u2705 Majburiy obuna sozlandi: {channel}\nHavola: {url or '(avtomatik)'}"
 
 
 ASK_REFUND_SECONDS = (
@@ -1061,23 +1120,8 @@ def refund_seconds_saved(seconds: int) -> str:
     return f"\u2705 Saqlandi: {seconds} soniya (~{seconds // 60} daqiqa)"
 
 
-ASK_TOGGLE_ADMIN = (
-    "Admin qilib qo'shmoqchi (yoki adminlikdan olib tashlamoqchi) bo'lgan "
-    "foydalanuvchi ID raqamini yuboring.\n\n"
-    "\u2139\uFE0F Agar u ro'yxatda bo'lmasa \u2014 qo'shiladi, bo'lsa \u2014 olib tashlanadi."
-)
-
-
-def current_extra_admins_line(ids: list) -> str:
-    if not ids:
-        return "\U0001F465 Qo'shimcha adminlar: \u2014 (yo'q)"
-    return "\U0001F465 Qo'shimcha adminlar: " + ", ".join(str(x) for x in ids)
-
-
-def admin_toggled(user_id: int, added: bool) -> str:
-    if added:
-        return f"\u2705 {user_id} endi admin. U ham /admin buyrug'i orqali panelga kira oladi."
-    return f"\u2705 {user_id} adminlikdan olib tashlandi."
+ASK_ADD_ADMIN_ID = "Admin qilib qo'shmoqchi bo'lgan foydalanuvchining ID raqamini yuboring:"
+ALREADY_ADMIN = "\u2139\uFE0F Bu foydalanuvchi allaqachon admin."
 
 
 _TYPE_LABEL_STATS = {
@@ -1128,9 +1172,9 @@ def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_ORDERS)],
-            [KeyboardButton(text=BTN_NUMBER)],
-            [KeyboardButton(text=BTN_STARS), KeyboardButton(text=BTN_PREMIUM)],
-            [KeyboardButton(text=BTN_MENU)],
+            [KeyboardButton(text=BTN_NUMBER, style=STYLE_PRIMARY)],
+            [KeyboardButton(text=BTN_STARS, style=STYLE_PRIMARY), KeyboardButton(text=BTN_PREMIUM, style=STYLE_PRIMARY)],
+            [KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
     )
@@ -1139,6 +1183,7 @@ def main_menu() -> ReplyKeyboardMarkup:
 def balance_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=BTN_TOPUP, callback_data="topup:start", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="\U0001F381 Do'stlarni taklif qilish", callback_data="referral:info", style=STYLE_PRIMARY)],
     ])
 
 
@@ -1156,18 +1201,198 @@ def number_type_menu() -> InlineKeyboardMarkup:
     ])
 
 
-def countries_menu(server: int, countries: dict) -> InlineKeyboardMarkup:
+NUMBER_PURCHASE_WARNING = (
+    "\u26A0\uFE0F DIQQAT! Muhim ogohlantirish\n\n"
+    "\u2139\uFE0F Raqam sotib olishdan avval o'qing:\n\n"
+    "1\uFE0F\u20E3 Raqam muzlashi yoki bloklanishi mumkin (Telegramning o'z "
+    "siyosati tufayli, bizdan emas).\n"
+    "\u274C Rasmiy Telegram ilovasidan foydalanmang\n"
+    "\u2705 Ishonchli, norasmiy ilovadan foydalaning\n"
+    "\u2764\uFE0F Maslahat: Telegraph\n\n"
+    "2\uFE0F\u20E3 Sarflangan pul QAYTARILMAYDI. \"Tasdiqlash\"ni bossangiz, "
+    "buyurtma darhol amalga oshadi.\n\n"
+    "3\uFE0F\u20E3 Kirish kodi va 2FA parol bexato keladi. Kod kelmasa \u2014 "
+    "aloqangizni almashtiring (Wi-Fi \u2194 mobil internet).\n\n"
+    "4\uFE0F\u20E3 Agar akkaunt spam cheklovida bo'lsa, @spambot orqali "
+    "soniyalar ichida ochiladi.\n\n"
+    "Rozimisiz?"
+)
+
+
+def number_warning_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=BTN_CONFIRM, callback_data="numwarn:confirm", style=STYLE_SUCCESS)],
+        [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
+    ])
+
+
+# ==============================================================
+# DAVLAT NOMLARI (ISO kod -> o'zbekcha nom)
+# ==============================================================
+# SmmUpper API davlatlarni faqat qisqa ISO kod bilan qaytaradi (KG, GE, AZ...).
+# Lug'atda topilmagan kod chiqib qolsa, kodning o'zi ko'rsatiladi — shuning
+# uchun yangi/kam uchraydigan kod qo'shilib qolsa ham bot xatosiz ishlayveradi.
+COUNTRY_NAMES: Dict[str, str] = {
+    "AD": "Andorra", "AE": "BAA", "AF": "Afg'oniston", "AG": "Antigua va Barbuda",
+    "AI": "Angilya", "AL": "Albaniya", "AM": "Armaniston", "AO": "Angola",
+    "AQ": "Antarktida", "AR": "Argentina", "AS": "Amerika Samoasi", "AT": "Avstriya",
+    "AU": "Avstraliya", "AW": "Aruba", "AX": "Oland orollari", "AZ": "Ozarbayjon",
+    "BA": "Bosniya va Gertsegovina", "BB": "Barbados", "BD": "Bangladesh", "BE": "Belgiya",
+    "BF": "Burkina-Faso", "BG": "Bolgariya", "BH": "Bahrayn", "BI": "Burundi",
+    "BJ": "Benin", "BL": "Sen-Bartelemi", "BM": "Bermuda orollari", "BN": "Bruney",
+    "BO": "Boliviya", "BQ": "Boneyr, Sint-Estatius va Saba", "BR": "Braziliya", "BS": "Bagama orollari",
+    "BT": "Butan", "BV": "Buve oroli", "BW": "Botsvana", "BY": "Belarus",
+    "BZ": "Beliz", "CA": "Kanada", "CC": "Kokos orollari", "CD": "Kongo DR",
+    "CF": "Markaziy Afrika Respublikasi", "CG": "Kongo", "CH": "Shveytsariya", "CI": "Kot-d'Ivuar",
+    "CK": "Kuk orollari", "CL": "Chili", "CM": "Kamerun", "CN": "Xitoy",
+    "CO": "Kolumbiya", "CR": "Kosta-Rika", "CU": "Kuba", "CV": "Kabo-Verde",
+    "CW": "Kurasao", "CX": "Rojdestvo oroli", "CY": "Kipr", "CZ": "Chexiya",
+    "DE": "Germaniya", "DJ": "Jibuti", "DK": "Daniya", "DM": "Dominika",
+    "DO": "Dominikan Respublikasi", "DZ": "Jazoir", "EC": "Ekvador", "EE": "Estoniya",
+    "EG": "Misr", "EH": "G'arbiy Sahro", "ER": "Eritreya", "ES": "Ispaniya",
+    "ET": "Efiopiya", "FI": "Finlyandiya", "FJ": "Fiji", "FK": "Folklend orollari",
+    "FM": "Mikroneziya", "FO": "Farer orollari", "FR": "Fransiya", "GA": "Gabon",
+    "GB": "Buyuk Britaniya", "GD": "Grenada", "GE": "Gruziya", "GF": "Frantsuz Gvianasi",
+    "GG": "Gernsi", "GH": "Gana", "GI": "Gibraltar", "GL": "Grenlandiya",
+    "GM": "Gambiya", "GN": "Gvineya", "GP": "Gvadelupa", "GQ": "Ekvatorial Gvineya",
+    "GR": "Gretsiya", "GS": "Janubiy Georgiya va Janubiy Sandvich orollari", "GT": "Gvatemala", "GU": "Guam",
+    "GW": "Gvineya-Bisau", "GY": "Gayana", "HK": "Gonkong", "HM": "Gerd va Makdonald orollari",
+    "HN": "Gonduras", "HR": "Xorvatiya", "HT": "Gaiti", "HU": "Vengriya",
+    "ID": "Indoneziya", "IE": "Irlandiya", "IL": "Isroil", "IM": "Men oroli",
+    "IN": "Hindiston", "IO": "Britaniyaning Hind okeanidagi hududi", "IQ": "Iroq", "IR": "Eron",
+    "IS": "Islandiya", "IT": "Italiya", "JE": "Jersi", "JM": "Yamayka",
+    "JO": "Iordaniya", "JP": "Yaponiya", "KE": "Keniya", "KG": "Qirg'iziston",
+    "KH": "Kambodja", "KI": "Kiribati", "KM": "Komor orollari", "KN": "Sent-Kits va Nevis",
+    "KP": "Shimoliy Koreya", "KR": "Janubiy Koreya", "KW": "Kuvayt", "KY": "Kayman orollari",
+    "KZ": "Qozog'iston", "LA": "Laos", "LB": "Livan", "LC": "Sent-Lyusiya",
+    "LI": "Lixtenshteyn", "LK": "Shri-Lanka", "LR": "Liberiya", "LS": "Lesoto",
+    "LT": "Litva", "LU": "Lyuksemburg", "LV": "Latviya", "LY": "Liviya",
+    "MA": "Marokash", "MC": "Monako", "MD": "Moldova", "ME": "Chernogoriya",
+    "MF": "Sen-Marten", "MG": "Madagaskar", "MH": "Marshall orollari", "MK": "Shimoliy Makedoniya",
+    "ML": "Mali", "MM": "Myanma", "MN": "Mongoliya", "MO": "Makao",
+    "MP": "Shimoliy Marian orollari", "MQ": "Martinika", "MR": "Mavritaniya", "MS": "Montserrat",
+    "MT": "Malta", "MU": "Mavrikiy", "MV": "Maldiv orollari", "MW": "Malavi",
+    "MX": "Meksika", "MY": "Malayziya", "MZ": "Mozambik", "NA": "Namibiya",
+    "NC": "Yangi Kaledoniya", "NE": "Niger", "NF": "Norfolk oroli", "NG": "Nigeriya",
+    "NI": "Nikaragua", "NL": "Niderlandiya", "NO": "Norvegiya", "NP": "Nepal",
+    "NR": "Nauru", "NU": "Niue", "NZ": "Yangi Zelandiya", "OM": "Ummon",
+    "PA": "Panama", "PE": "Peru", "PF": "Frantsuz Polineziyasi", "PG": "Papua-Yangi Gvineya",
+    "PH": "Filippin", "PK": "Pokiston", "PL": "Polsha", "PM": "Sen-Pyer va Mikelon",
+    "PN": "Pitkern orollari", "PR": "Puerto-Riko", "PS": "Falastin", "PT": "Portugaliya",
+    "PW": "Palau", "PY": "Paragvay", "QA": "Qatar", "RE": "Reyunion",
+    "RO": "Ruminiya", "RS": "Serbiya", "RU": "Rossiya", "RW": "Ruanda",
+    "SA": "Saudiya Arabistoni", "SB": "Solomon orollari", "SC": "Seyshel orollari", "SD": "Sudan",
+    "SE": "Shvetsiya", "SG": "Singapur", "SH": "Muqaddas Yelena oroli", "SI": "Sloveniya",
+    "SJ": "Svalbard va Yan-Mayen", "SK": "Slovakiya", "SL": "Serra-Leone", "SM": "San-Marino",
+    "SN": "Senegal", "SO": "Somali", "SR": "Surinam", "SS": "Janubiy Sudan",
+    "ST": "San-Tome va Prinsipi", "SV": "Salvador", "SX": "Sint-Marten", "SY": "Suriya",
+    "SZ": "Esvatini", "TC": "Turks va Kaykos orollari", "TD": "Chad", "TF": "Fransiyaning janubiy hududlari",
+    "TG": "Togo", "TH": "Tailand", "TJ": "Tojikiston", "TK": "Tokelau",
+    "TL": "Sharqiy Timor", "TM": "Turkmaniston", "TN": "Tunis", "TO": "Tonga",
+    "TR": "Turkiya", "TT": "Trinidad va Tobago", "TV": "Tuvalu", "TW": "Tayvan",
+    "TZ": "Tanzaniya", "UA": "Ukraina", "UG": "Uganda", "US": "AQSH",
+    "UY": "Urugvay", "UZ": "O'zbekiston", "VA": "Vatikan", "VC": "Sent-Vinsent va Grenadin",
+    "VE": "Venesuela", "VG": "Britaniya Virjin orollari", "VI": "AQSH Virjin orollari", "VN": "Vetnam",
+    "VU": "Vanuatu", "WF": "Uellis va Futuna", "WS": "Samoa", "XK": "Kosovo",
+    "YE": "Yaman", "YT": "Mayotta", "ZA": "JAR", "ZM": "Zambiya",
+    "ZW": "Zimbabve",
+}
+
+COUNTRIES_PAGE_SIZE = 20  # bitta sahifada nechta davlat (10 qator x 2 ustun)
+
+
+def country_display_name(code: str) -> str:
+    return COUNTRY_NAMES.get(code.upper(), code.upper())
+
+
+def country_flag(code: str) -> str:
+    """ISO kodni bayroq emojisiga aylantiradi (masalan 'KG' -> \U0001F1F0\U0001F1EC).
+    Unicode Regional Indicator Symbol'lardan foydalanadi. Faqat COUNTRY_NAMES
+    lug'atida bor (ya'ni nomi ham ma'lum) kodlar uchun bayroq qaytaradi —
+    aks holda bo'sh satr, chunki noma'lum/soxta kod uchun mazmunsiz "bayroq"
+    ko'rsatishning ma'nosi yo'q."""
+    code = code.upper()
+    if code not in COUNTRY_NAMES or len(code) != 2:
+        return ""
+    return "".join(chr(0x1F1E6 + (ord(ch) - ord("A"))) for ch in code)
+
+
+def _country_button_label(code: str, info: dict) -> str:
+    price = info.get("price", "?")
+    name = country_display_name(code)
+    flag = country_flag(code)
+    label_name = f"{flag} {name}" if flag else name
+    return f"{label_name} — {fmt_money(price)} so'm" if isinstance(price, (int, float)) else label_name
+
+
+def _normalize_query(text: str) -> str:
+    """Qidiruvda apostrof turlari va katta/kichik harf farqini bekor qiladi."""
+    for ch in ("'", "\u2018", "\u2019", "\u02bb", "\u02bc", "`"):
+        text = text.replace(ch, "")
+    return text.lower().strip()
+
+
+def _sorted_country_items(countries: dict, sort: str = "name"):
+    if sort == "price":
+        def price_key(kv):
+            price = kv[1].get("price")
+            return price if isinstance(price, (int, float)) else float("inf")
+        return sorted(countries.items(), key=price_key)
+    return sorted(countries.items(), key=lambda kv: country_display_name(kv[0]))
+
+
+# davlatlar ro'yxatini qanday ko'rsatish rejimi -> (saralash turi, sahifalash prefiksi)
+_COUNTRY_MENU_MODES = {
+    "browse": ("name", "ctypg"),
+    "cheap": ("price", "ctycpg"),
+    "search": ("name", "ctyspg"),
+}
+
+
+def countries_menu(server: int, countries: dict, page: int = 0, *, mode: str = "browse") -> InlineKeyboardMarkup:
+    """Davlatlar ro'yxatini to'liq nom (+ bayroq) bilan, sahifalab ko'rsatadi
+    (bitta ulkan ro'yxat o'rniga). `mode`:
+      - "browse": alifbo tartibida, pastda TOP10/Arzon/Qidirish tugmalari
+      - "cheap":  narx bo'yicha arzondan qimmatga, "ro'yxatga qaytish" bilan
+      - "search": qidiruv natijalari, "qayta qidirish"+"ro'yxatga qaytish" bilan
+    """
+    sort_key, pg_prefix = _COUNTRY_MENU_MODES[mode]
+    items = _sorted_country_items(countries, sort=sort_key)
+    total_pages = max(1, (len(items) + COUNTRIES_PAGE_SIZE - 1) // COUNTRIES_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = items[page * COUNTRIES_PAGE_SIZE: page * COUNTRIES_PAGE_SIZE + COUNTRIES_PAGE_SIZE]
+
     rows = []
     row = []
-    for code, info in countries.items():
-        price = info.get("price", "?")
-        label = f"{code} — {fmt_money(price)} so'm" if isinstance(price, (int, float)) else str(code)
-        row.append(InlineKeyboardButton(text=label, callback_data=f"cty:{server}:{code}", style=STYLE_PRIMARY))
+    for code, info in chunk:
+        row.append(InlineKeyboardButton(text=_country_button_label(code, info), callback_data=f"cty:{server}:{code}", style=STYLE_PRIMARY))
         if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="\u25C0\uFE0F", callback_data=f"{pg_prefix}:{server}:{page - 1}", style=STYLE_PRIMARY))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="ctynoop", style=STYLE_PRIMARY))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="\u25B6\uFE0F", callback_data=f"{pg_prefix}:{server}:{page + 1}", style=STYLE_PRIMARY))
+        rows.append(nav)
+
+    if mode == "browse":
+        rows.append([
+            InlineKeyboardButton(text="\U0001F3C6 TOP 10 davlatlar", callback_data=f"ctytop:{server}", style=STYLE_PRIMARY),
+            InlineKeyboardButton(text="\U0001F4C9 Arzon davlatlar", callback_data=f"ctycpg:{server}:0", style=STYLE_PRIMARY),
+        ])
+        rows.append([InlineKeyboardButton(text="\U0001F50D Qidirish", callback_data=f"ctysearch:{server}", style=STYLE_PRIMARY)])
+    elif mode == "search":
+        rows.append([InlineKeyboardButton(text="\U0001F50D Qayta qidirish", callback_data=f"ctysearch:{server}", style=STYLE_PRIMARY)])
+        rows.append([InlineKeyboardButton(text="\U0001F519 Ro'yxatga qaytish", callback_data=f"ctyback:{server}", style=STYLE_PRIMARY)])
+    else:  # "cheap"
+        rows.append([InlineKeyboardButton(text="\U0001F519 Ro'yxatga qaytish", callback_data=f"ctyback:{server}", style=STYLE_PRIMARY)])
+
     rows.append([InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1210,22 +1435,21 @@ def check_code_menu(order_pk: int) -> InlineKeyboardMarkup:
 
 
 def admin_menu() -> InlineKeyboardMarkup:
+    """Asosiy admin panel — ixcham: bo'limlarga guruhlangan, har biri
+    bosilganda xabar tahrirlanib (edit) tegishli kichik menyuga o'tadi."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\U0001F50E Foydalanuvchi qidirish", callback_data="adm:find", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F4B0 Balans qo'shish/ayirish", callback_data="adm:balance", style=STYLE_PRIMARY)],
         [
-            InlineKeyboardButton(text="\U0001F6AB Bloklash", callback_data="adm:ban", style=STYLE_DANGER),
-            InlineKeyboardButton(text="\u2705 Blokdan chiqarish", callback_data="adm:unban", style=STYLE_SUCCESS),
+            InlineKeyboardButton(text="\U0001F465 Foydalanuvchilar", callback_data="adm:menu:users", style=STYLE_PRIMARY),
+            InlineKeyboardButton(text="\U0001F4CA Statistika", callback_data="adm:stats", style=STYLE_PRIMARY),
         ],
-        [InlineKeyboardButton(text="\U0001F4E2 Xabar yuborish (broadcast)", callback_data="adm:broadcast", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F511 API kalitni sozlash", callback_data="adm:apikey", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F4C8 Narx ustamasini sozlash (%)", callback_data="adm:markup", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F4E2 Xarid kanalini sozlash", callback_data="adm:channel", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F4B3 To'lov kartasini sozlash", callback_data="adm:card", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F510 Majburiy obunani sozlash", callback_data="adm:forcesub", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\u23F1 Pul qaytarish vaqtini sozlash", callback_data="adm:refundtime", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F465 Qo'shimcha adminlar", callback_data="adm:toggleadmin", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F4CA Statistika", callback_data="adm:stats", style=STYLE_PRIMARY)],
+        [
+            InlineKeyboardButton(text="\u2699\uFE0F Sozlamalar", callback_data="adm:menu:settings", style=STYLE_PRIMARY),
+            InlineKeyboardButton(text="\U0001F510 Majburiy obuna", callback_data="adm:forcesub", style=STYLE_PRIMARY),
+        ],
+        [
+            InlineKeyboardButton(text="\U0001F464 Adminlar", callback_data="adm:admins", style=STYLE_PRIMARY),
+            InlineKeyboardButton(text="\U0001F4E2 Xabar yuborish", callback_data="adm:broadcast", style=STYLE_PRIMARY),
+        ],
         [InlineKeyboardButton(text="\U0001F504 Yangilash", callback_data="adm:refresh", style=STYLE_PRIMARY)],
     ])
 
@@ -1236,10 +1460,93 @@ def admin_cancel_menu() -> InlineKeyboardMarkup:
     ])
 
 
-def force_sub_menu(channel_url: str) -> InlineKeyboardMarkup:
+def users_admin_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\U0001F50E Qidirish", callback_data="adm:find", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="\U0001F4B0 Balans qo'shish/ayirish", callback_data="adm:balance", style=STYLE_PRIMARY)],
+        [
+            InlineKeyboardButton(text="\U0001F6AB Bloklash", callback_data="adm:ban", style=STYLE_DANGER),
+            InlineKeyboardButton(text="\u2705 Blokdan chiqarish", callback_data="adm:unban", style=STYLE_SUCCESS),
+        ],
+        [InlineKeyboardButton(text="\u2B05\uFE0F Orqaga", callback_data="adm:refresh", style=STYLE_DANGER)],
+    ])
+
+
+def users_cancel_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\u2B05\uFE0F Foydalanuvchilar bo'limiga qaytish", callback_data="adm:menu:users", style=STYLE_DANGER)],
+    ])
+
+
+def settings_admin_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\U0001F511 API kalit", callback_data="adm:apikey", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="\U0001F4C8 Narx ustamasi (%)", callback_data="adm:markup", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="\U0001F4E2 Xarid kanali", callback_data="adm:channel", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="\U0001F4B3 To'lov kartasi", callback_data="adm:card", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="\u23F1 Pul qaytarish vaqti", callback_data="adm:refundtime", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="\u2B05\uFE0F Orqaga", callback_data="adm:refresh", style=STYLE_DANGER)],
+    ])
+
+
+def settings_cancel_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\u2B05\uFE0F Sozlamalarga qaytish", callback_data="adm:menu:settings", style=STYLE_DANGER)],
+    ])
+
+
+def forcesub_admin_menu(channels: list) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"\u274C {c.get('channel')}", callback_data=f"adm:fs:del:{i}", style=STYLE_DANGER)]
+        for i, c in enumerate(channels)
+    ]
+    rows.append([InlineKeyboardButton(text="\u2795 Kanal qo'shish", callback_data="adm:fs:add", style=STYLE_PRIMARY)])
+    rows.append([InlineKeyboardButton(text="\u2B05\uFE0F Orqaga", callback_data="adm:refresh", style=STYLE_DANGER)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def fs_cancel_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\u2B05\uFE0F Kanallar ro'yxatiga qaytish", callback_data="adm:forcesub", style=STYLE_DANGER)],
+    ])
+
+
+def admins_admin_menu(extra_ids: list) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"\u274C {uid}", callback_data=f"adm:adm:del:{uid}", style=STYLE_DANGER)]
+        for uid in extra_ids
+    ]
+    rows.append([InlineKeyboardButton(text="\u2795 Admin qo'shish", callback_data="adm:adm:add", style=STYLE_PRIMARY)])
+    rows.append([InlineKeyboardButton(text="\u2B05\uFE0F Orqaga", callback_data="adm:refresh", style=STYLE_DANGER)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admins_cancel_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\u2B05\uFE0F Adminlar ro'yxatiga qaytish", callback_data="adm:admins", style=STYLE_DANGER)],
+    ])
+
+
+USERS_MENU_TEXT = "\U0001F465 Foydalanuvchilar\n\nKerakli amalni tanlang:"
+
+
+def _is_valid_button_url(url: str) -> bool:
+    """Telegram inline tugmasi uchun url= faqat http(s):// yoki tg:// bilan
+    boshlanishi kerak — aks holda Telegram butun xabarni rad etadi (faqat
+    tugmani emas). Havola noto'g'ri formatda saqlanib qolgan bo'lsa ham,
+    shu tekshiruv orqasida majburiy-obuna xabari umuman yubormay qolib
+    ketmaydi."""
+    return bool(url) and url.startswith(("http://", "https://", "tg://"))
+
+
+def force_sub_menu(channels: list) -> InlineKeyboardMarkup:
     rows = []
-    if channel_url:
-        rows.append([InlineKeyboardButton(text="\U0001F4E2 Kanalga o'tish", url=channel_url)])
+    multiple = len(channels) > 1
+    for i, item in enumerate(channels, start=1):
+        url = (item or {}).get("url") or ""
+        if _is_valid_button_url(url):
+            label = f"\U0001F4E2 {i}-kanalga o'tish" if multiple else "\U0001F4E2 Kanalga o'tish"
+            rows.append([InlineKeyboardButton(text=label, url=url)])
     rows.append([InlineKeyboardButton(text="\u2705 A'zo bo'ldim", callback_data="forcesub:check", style=STYLE_SUCCESS)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1263,6 +1570,7 @@ class TopUp(StatesGroup):
 
 class BuyNumber(StatesGroup):
     choosing_country = State()
+    searching_country = State()
     confirming = State()
 
 
@@ -1276,6 +1584,10 @@ class BuyPremium(StatesGroup):
     months = State()
     username = State()
     confirming = State()
+
+
+class HelpRequest(StatesGroup):
+    message = State()
 
 
 class AdminPanel(StatesGroup):
@@ -1293,7 +1605,7 @@ class AdminPanel(StatesGroup):
     force_sub_channel = State()
     force_sub_url = State()
     refund_seconds = State()
-    toggle_admin = State()
+    add_admin_id = State()
 
 
 # ==============================================================
@@ -1306,6 +1618,7 @@ SETTINGS_KEY_CARD_NUMBER = "card_number"
 SETTINGS_KEY_CARD_HOLDER = "card_holder"
 SETTINGS_KEY_FORCE_SUB_CHANNEL = "force_sub_channel"
 SETTINGS_KEY_FORCE_SUB_URL = "force_sub_url"
+SETTINGS_KEY_FORCE_SUB_CHANNELS = "force_sub_channels_v2"  # JSON: [{"channel": ..., "url": ...}, ...]
 SETTINGS_KEY_REFUND_SECONDS = "refund_eligible_seconds"
 SETTINGS_KEY_EXTRA_ADMINS = "extra_admins"
 _NOT_SUBSCRIBED_STATUSES = {"left", "kicked"}
@@ -1346,19 +1659,47 @@ async def get_card_info():
     return card_number, card_holder
 
 
-async def get_force_sub_channel():
-    """Admin panel orqali bazaga saqlangan majburiy obuna kanali bo'lsa
-    o'shani, aks holda .env (FORCE_SUB_CHANNEL) dagisini qaytaradi.
-    Hech biri sozlanmagan bo'lsa (None, "") — majburiy obuna o'chiq."""
-    raw = await get_setting(SETTINGS_KEY_FORCE_SUB_CHANNEL, default=None)
-    channel = raw if raw is not None else FORCE_SUB_CHANNEL
+async def get_force_sub_channels() -> list:
+    """Majburiy obuna kanallari ro'yxatini qaytaradi — har bir element
+    {"channel": ..., "url": ...} ko'rinishida. Yangi (bir nechta kanalli)
+    formatda saqlangan bo'lsa o'shani o'qiydi; aks holda eski bitta-kanalli
+    sozlamadan (yoki .env'dan) bir martalik migratsiya qiladi — shunda
+    yangilanishdan keyin ilgari sozlangan kanal yo'qolib qolmaydi."""
+    raw = await get_setting(SETTINGS_KEY_FORCE_SUB_CHANNELS, default=None)
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return data
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-    url = await get_setting(SETTINGS_KEY_FORCE_SUB_URL, default=None)
-    if url is None:
-        url = FORCE_SUB_CHANNEL_URL
+    old_channel = await get_setting(SETTINGS_KEY_FORCE_SUB_CHANNEL, default=None)
+    channel = old_channel if old_channel is not None else FORCE_SUB_CHANNEL
+    if not channel:
+        return []
+    old_url = await get_setting(SETTINGS_KEY_FORCE_SUB_URL, default=None)
+    url = old_url if old_url is not None else FORCE_SUB_CHANNEL_URL
     if not url and channel.startswith("@"):
         url = f"https://t.me/{channel.lstrip('@')}"
-    return channel, url
+    return [{"channel": channel, "url": url}]
+
+
+async def set_force_sub_channels(channels: list):
+    await set_setting(SETTINGS_KEY_FORCE_SUB_CHANNELS, json.dumps(channels, ensure_ascii=False))
+
+
+async def add_force_sub_channel(channel: str, url: str):
+    channels = await get_force_sub_channels()
+    channels.append({"channel": channel, "url": url})
+    await set_force_sub_channels(channels)
+
+
+async def remove_force_sub_channel(index: int):
+    channels = await get_force_sub_channels()
+    if 0 <= index < len(channels):
+        channels.pop(index)
+        await set_force_sub_channels(channels)
 
 
 async def get_refund_eligible_seconds() -> int:
@@ -1378,18 +1719,22 @@ async def get_extra_admin_ids() -> list:
     return [int(x) for x in raw.split(",") if x.strip().isdigit()]
 
 
-async def toggle_extra_admin(user_id: int) -> bool:
-    """user_id ro'yxatda bo'lsa olib tashlaydi, bo'lmasa qo'shadi.
-    Qaytariladi: True — qo'shildi, False — olib tashlandi."""
+async def add_extra_admin(user_id: int) -> bool:
+    """Ro'yxatga qo'shadi. Qaytariladi: True — qo'shildi,
+    False — allaqachon ro'yxatda bor edi."""
+    ids = await get_extra_admin_ids()
+    if user_id in ids:
+        return False
+    ids.append(user_id)
+    await set_setting(SETTINGS_KEY_EXTRA_ADMINS, ",".join(str(x) for x in ids))
+    return True
+
+
+async def remove_extra_admin(user_id: int):
     ids = await get_extra_admin_ids()
     if user_id in ids:
         ids.remove(user_id)
-        added = False
-    else:
-        ids.append(user_id)
-        added = True
-    await set_setting(SETTINGS_KEY_EXTRA_ADMINS, ",".join(str(x) for x in ids))
-    return added
+        await set_setting(SETTINGS_KEY_EXTRA_ADMINS, ",".join(str(x) for x in ids))
 
 
 async def notify_channel(bot, text: str):
@@ -1408,33 +1753,47 @@ async def notify_channel(bot, text: str):
 
 
 async def is_subscribed(bot, user_id: int) -> bool:
-    """Majburiy obuna kanaliga foydalanuvchi a'zo-yo'qligini tekshiradi.
-    Kanal sozlanmagan bo'lsa — tekshirilmaydi (True qaytadi).
-    Bot kanalga admin qilib qo'shilmagan yoki boshqa sabab bilan tekshira
-    olmasa — botni butunlay to'xtatib qo'ymaslik uchun xavfsiz tomonga
-    (True, ya'ni "a'zo") og'ib ketiladi.
+    """Barcha majburiy obuna kanallariga foydalanuvchi a'zo-yo'qligini
+    tekshiradi — a'zo hisoblanishi uchun RO'YXATDAGI HAMMASIGA a'zo bo'lishi
+    kerak. Ro'yxat bo'sh bo'lsa — tekshirilmaydi (True qaytadi).
+    Bot biror kanalga admin qilib qo'shilmagan yoki boshqa sabab bilan
+    tekshira olmasa — botni butunlay to'xtatib qo'ymaslik uchun xavfsiz
+    tomonga (o'sha kanal bo'yicha "a'zo") og'ib ketiladi.
     """
-    channel, _ = await get_force_sub_channel()
-    if not channel:
+    channels = await get_force_sub_channels()
+    if not channels:
         return True
-    try:
-        member = await bot.get_chat_member(channel, user_id)
-        return member.status not in _NOT_SUBSCRIBED_STATUSES
-    except TelegramBadRequest:
-        return True
-    except Exception:
-        return True
+    for item in channels:
+        channel = (item or {}).get("channel")
+        if not channel:
+            continue
+        try:
+            member = await bot.get_chat_member(channel, user_id)
+            if member.status in _NOT_SUBSCRIBED_STATUSES:
+                return False
+        except TelegramBadRequest:
+            continue
+        except Exception:
+            continue
+    return True
 
 
 async def send_force_sub_prompt(bot, chat_id: int):
-    _, url = await get_force_sub_channel()
+    channels = await get_force_sub_channels()
     try:
         await bot.send_message(
             chat_id, FORCE_SUB_PROMPT,
-            reply_markup=force_sub_menu(url),
+            reply_markup=force_sub_menu(channels),
         )
     except Exception:
-        pass
+        # Havola bilan yuborish muvaffaqiyatsiz bo'lsa (masalan, kanal
+        # o'chirilgan/noto'g'ri bo'lsa ham) — kamida "A'zo bo'ldim"
+        # tugmasi bilan urinib ko'ramiz, aks holda foydalanuvchi hech
+        # qanday xabar olmay, botni "ishlamayapti" deb o'ylab qoladi.
+        try:
+            await bot.send_message(chat_id, FORCE_SUB_PROMPT, reply_markup=force_sub_menu([]))
+        except Exception:
+            pass
 
 
 @router_common.callback_query(F.data == "forcesub:check")
@@ -1469,16 +1828,56 @@ router_start = Router(name="start")
 
 
 @router_start.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
+async def cmd_start(message: Message, state: FSMContext, command: CommandObject):
     await state.clear()
-    await ensure_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
+
+    referred_by = None
+    payload = (command.args or "").strip()
+    if payload.startswith("ref"):
+        ref_id_str = payload[3:]
+        if ref_id_str.isdigit():
+            candidate = int(ref_id_str)
+            if candidate != message.from_user.id:
+                referred_by = candidate
+
+    await ensure_user(message.from_user.id, message.from_user.username, message.from_user.full_name, referred_by=referred_by)
     await message.answer(WELCOME, reply_markup=main_menu())
 
 
-@router_start.message(F.text == BTN_MENU)
-async def show_menu(message: Message, state: FSMContext):
+ASK_HELP_MESSAGE = (
+    "\U0001F195 Savolingiz yoki muammoingizni yozing \u2014 adminlarga yuboramiz.\n\n"
+    "Iloji boricha batafsil yozing (masalan, buyurtma raqami yoki skrinshot bilan)."
+)
+HELP_SENT_TO_USER = "\u2705 Xabaringiz adminlarga yuborildi. Tez orada javob berishadi."
+
+
+def help_forward_text(user, text: str) -> str:
+    username_part = f"@{user.username}" if user.username else "\u2014 (username yo'q)"
+    return (
+        f"\U0001F195 Yordam so'rovi\n\n"
+        f"\U0001F464 {user.full_name} ({username_part})\n"
+        f"\U0001F194 ID: {user.id}\n\n"
+        f"\U0001F4AC Xabar:\n{text}"
+    )
+
+
+@router_start.message(F.text == BTN_HELP)
+async def help_start(message: Message, state: FSMContext):
+    await state.set_state(HelpRequest.message)
+    await message.answer(ASK_HELP_MESSAGE, reply_markup=cancel_inline())
+
+
+@router_start.message(HelpRequest.message, is_free_text)
+async def help_receive(message: Message, state: FSMContext, bot):
     await state.clear()
-    await message.answer(MENU_TITLE, reply_markup=main_menu())
+    admin_ids = set(ADMIN_IDS) | set(await get_extra_admin_ids())
+    text = help_forward_text(message.from_user, message.text)
+    for admin_id in admin_ids:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            pass
+    await message.answer(HELP_SENT_TO_USER, reply_markup=main_menu())
 
 
 # ==============================================================
@@ -1498,6 +1897,14 @@ async def show_balance(message: Message, state: FSMContext):
 async def topup_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(TopUp.amount)
     await callback.message.answer(TOPUP_ASK_AMOUNT, reply_markup=cancel_inline())
+    await callback.answer()
+
+
+@router_balance.callback_query(F.data == "referral:info")
+async def referral_info(callback: CallbackQuery, bot):
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref{callback.from_user.id}"
+    await callback.message.answer(referral_text(link))
     await callback.answer()
 
 
@@ -1573,7 +1980,13 @@ _background_tasks: set = set()
 @router_numbers.message(F.text == BTN_NUMBER)
 async def start_number_flow(message: Message, state: FSMContext):
     await state.clear()
-    await message.answer("Qanday raqam kerak?", reply_markup=number_type_menu())
+    await message.answer(NUMBER_PURCHASE_WARNING, reply_markup=number_warning_menu())
+
+
+@router_numbers.callback_query(F.data == "numwarn:confirm")
+async def number_warning_confirmed(callback: CallbackQuery):
+    await callback.message.answer("Qanday raqam kerak?", reply_markup=number_type_menu())
+    await callback.answer()
 
 
 async def _fetch_countries_with_fallback(primary_server: int, fallback_server: Optional[int]):
@@ -1627,6 +2040,153 @@ async def choose_ready(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("Davlatni tanlang:", reply_markup=countries_menu(3, countries))
 
 
+# ---------- Davlatlar ro'yxatini varaqlash va qidirish ----------
+
+@router_numbers.callback_query(BuyNumber.choosing_country, F.data == "ctynoop")
+async def country_page_indicator(callback: CallbackQuery):
+    """Sahifa raqami ko'rsatkichi — bosilganda hech narsa qilmaydi,
+    faqat Telegram'ning "yuklanmoqda" aylanasini to'xtatadi."""
+    await callback.answer()
+
+
+@router_numbers.callback_query(BuyNumber.choosing_country, F.data.startswith("ctypg:"))
+async def country_change_page(callback: CallbackQuery, state: FSMContext):
+    _, server_str, page_str = callback.data.split(":")
+    data = await state.get_data()
+    countries = data.get("countries", {})
+    await callback.message.edit_text(
+        "Davlatni tanlang:",
+        reply_markup=countries_menu(int(server_str), countries, page=int(page_str)),
+    )
+    await callback.answer()
+
+
+@router_numbers.callback_query(BuyNumber.choosing_country, F.data.startswith("ctycpg:"))
+async def country_change_cheap_page(callback: CallbackQuery, state: FSMContext):
+    """Bitta handler ham 'Arzon davlatlar' tugmasini (page=0 bilan boshlanadi),
+    ham shu ro'yxat ichidagi keyingi/oldingi sahifalarni boshqaradi."""
+    _, server_str, page_str = callback.data.split(":")
+    data = await state.get_data()
+    countries = data.get("countries", {})
+    await callback.message.edit_text(
+        "\U0001F4C9 Arzon davlatlar:",
+        reply_markup=countries_menu(int(server_str), countries, page=int(page_str), mode="cheap"),
+    )
+    await callback.answer()
+
+
+@router_numbers.callback_query(BuyNumber.choosing_country, F.data.startswith("ctytop:"))
+async def country_show_top(callback: CallbackQuery, state: FSMContext):
+    """Buyurtmalar tarixidan eng ko'p sotib olingan 10 ta davlatni chiqaradi.
+    Eslatma: bu hisoblash faqat shu ustun qo'shilgandan keyingi (yangi)
+    buyurtmalarni sanaydi — eski buyurtmalarda davlat alohida saqlanmagan
+    edi, shuning uchun bot yangilangandan keyingi xaridlar asosida
+    to'planib boradi."""
+    server = int(callback.data.split(":")[1])
+    data = await state.get_data()
+    countries = data.get("countries", {})
+    top = await top_countries(10)
+    matched = [(code, cnt) for code, cnt in top if code in countries]
+
+    back_and_cancel = [
+        [InlineKeyboardButton(text="\U0001F519 Ro'yxatga qaytish", callback_data=f"ctyback:{server}", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
+    ]
+
+    if not matched:
+        await callback.message.edit_text(
+            "\U0001F3C6 Hozircha statistika yo'q. Birinchi xaridlardan so'ng "
+            "shu yerda eng ko'p sotib olingan davlatlar chiqadi.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=back_and_cancel),
+        )
+        await callback.answer()
+        return
+
+    rows = []
+    row = []
+    for code, _cnt in matched:
+        info = countries[code]
+        row.append(InlineKeyboardButton(text=_country_button_label(code, info), callback_data=f"cty:{server}:{code}", style=STYLE_PRIMARY))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.extend(back_and_cancel)
+
+    await callback.message.edit_text(
+        "\U0001F3C6 Eng ko'p sotib olingan davlatlar:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router_numbers.callback_query(BuyNumber.choosing_country, F.data.startswith("ctyspg:"))
+async def country_change_search_page(callback: CallbackQuery, state: FSMContext):
+    _, server_str, page_str = callback.data.split(":")
+    data = await state.get_data()
+    results = data.get("search_results", {})
+    await callback.message.edit_text(
+        "\U0001F50D Qidiruv natijalari:",
+        reply_markup=countries_menu(int(server_str), results, page=int(page_str), mode="search"),
+    )
+    await callback.answer()
+
+
+@router_numbers.callback_query(BuyNumber.choosing_country, F.data.startswith("ctysearch:"))
+async def country_search_prompt(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BuyNumber.searching_country)
+    await callback.message.answer(
+        "Davlat nomini yozing (masalan: turkiya):",
+        reply_markup=cancel_inline(),
+    )
+    await callback.answer()
+
+
+@router_numbers.callback_query(F.data.startswith("ctyback:"))
+async def country_search_exit(callback: CallbackQuery, state: FSMContext):
+    """Qidiruv natijalaridan to'liq ro'yxatga qaytish. Holatni har doim
+    (choosing_country'dan ham, searching_country'dan ham) qabul qiladi —
+    "hech narsa topilmadi" xabaridan keyin ham shu tugma ishlashi kerak."""
+    server = int(callback.data.split(":")[1])
+    data = await state.get_data()
+    countries = data.get("countries", {})
+    await state.set_state(BuyNumber.choosing_country)
+    await callback.message.edit_text("Davlatni tanlang:", reply_markup=countries_menu(server, countries))
+    await callback.answer()
+
+
+@router_numbers.message(BuyNumber.searching_country, is_free_text)
+async def country_search_run(message: Message, state: FSMContext):
+    data = await state.get_data()
+    server = data.get("server")
+    countries = data.get("countries", {})
+    query = _normalize_query(message.text)
+
+    results = {
+        code: info for code, info in countries.items()
+        if query in _normalize_query(country_display_name(code)) or query in code.lower()
+    }
+
+    if not results:
+        await message.answer(
+            "Hech narsa topilmadi. Boshqa nom bilan qayta urinib ko'ring, "
+            "yoki ro'yxatga qayting.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="\U0001F519 Ro'yxatga qaytish", callback_data=f"ctyback:{server}", style=STYLE_PRIMARY)],
+                [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
+            ]),
+        )
+        return  # holat searching_country'da qoladi — darhol qayta yozish mumkin
+
+    await state.update_data(search_results=results)
+    await state.set_state(BuyNumber.choosing_country)
+    await message.answer(
+        f"\U0001F50D Qidiruv natijalari ({len(results)} ta):",
+        reply_markup=countries_menu(server, results, mode="search"),
+    )
+
+
 @router_numbers.callback_query(BuyNumber.choosing_country, F.data.startswith("cty:"))
 async def choose_country(callback: CallbackQuery, state: FSMContext):
     _, server_str, country = callback.data.split(":")
@@ -1643,7 +2203,7 @@ async def choose_country(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BuyNumber.confirming)
 
     text = (
-        f"\U0001F30D Davlat: {country}\n"
+        f"\U0001F30D Davlat: {country_flag(country)} {country_display_name(country)}\n"
         f"\U0001F4B5 Narx: {fmt_money(price)} so'm\n"
         f"\U0001F4B0 Balansingiz: {fmt_money(balance)} so'm"
     )
@@ -1700,6 +2260,7 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
         price=actual_price,
         details=result,
         status="processing",
+        country=country,
     )
 
     number = result.get("number", "?")
@@ -2206,30 +2767,82 @@ def _mask_key(key: str) -> str:
     return key[:4] + "..." + key[-4:]
 
 
+async def _ask(callback: CallbackQuery, state: FSMContext, new_state, prompt: str, keyboard: InlineKeyboardMarkup):
+    """Panel xabarini (edit_text bilan) so'rov matniga aylantiradi va xabar
+    manzilini state'ga saqlaydi — keyingi qadamda (erkin matn kelganda)
+    aynan shu xabarni tahrirlab davom ettirish uchun. Shu tarzda butun
+    sozlash "suhbat"day bitta xabar ichida davom etadi, chatga ortiqcha
+    xabarlar to'planib qolmaydi."""
+    await state.update_data(panel_chat_id=callback.message.chat.id, panel_message_id=callback.message.message_id)
+    await state.set_state(new_state)
+    await callback.message.edit_text(prompt, reply_markup=keyboard)
+    await callback.answer()
+
+
+async def _panel_edit(bot, state: FSMContext, message: Message, text: str, keyboard: InlineKeyboardMarkup):
+    """Admin yuborgan erkin-matn xabarini o'chiradi va sozlash boshlangandagi
+    ASL panel xabarini shu natija bilan tahrirlaydi."""
+    data = await state.get_data()
+    chat_id = data.get("panel_chat_id")
+    message_id = data.get("panel_message_id")
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    if chat_id and message_id:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=keyboard)
+            return
+        except Exception:
+            pass
+    await bot.send_message(message.chat.id, text, reply_markup=keyboard)
+
+
 async def _panel_text() -> str:
     try:
         data = await client.get_balance()
         balance = data["result"]["balance"]
-        balance_line = f"SmmUpper hisobingizdagi balans: {fmt_money(balance)} so'm"
+        balance_line = f"\U0001F4B0 SmmUpper balans: {fmt_money(balance)} so'm"
     except (SmmUpperError, KeyError) as e:
-        balance_line = f"SmmUpper balansini olishda xatolik: {e}"
+        balance_line = f"\u26A0\uFE0F SmmUpper balansini olishda xatolik: {e}"
+    return f"{ADMIN_TITLE}\n\n{balance_line}\n\nKerakli bo'limni tanlang \U0001F447"
 
+
+async def _settings_text() -> str:
     current_key = await get_setting(SETTINGS_KEY_API_KEY, default=SMMUPPER_API_KEY)
     current_markup = await get_markup_percent()
     current_channel = await get_channel_id()
     card_number, card_holder = await get_card_info()
-    fs_channel, _ = await get_force_sub_channel()
     refund_seconds = await get_refund_eligible_seconds()
-    extra_admins = await get_extra_admin_ids()
     return (
-        f"{ADMIN_TITLE}\n\n{balance_line}\n"
+        f"\u2699\uFE0F Sozlamalar\n\n"
         f"{current_api_key_line(_mask_key(current_key))}\n"
         f"{current_markup_line(current_markup)}\n"
         f"{current_channel_line(current_channel)}\n"
         f"{current_card_line(card_number, card_holder)}\n"
-        f"{current_force_sub_line(fs_channel)}\n"
-        f"{current_refund_seconds_line(refund_seconds)}\n"
-        f"{current_extra_admins_line(extra_admins)}"
+        f"{current_refund_seconds_line(refund_seconds)}"
+    )
+
+
+def _forcesub_text(channels: list) -> str:
+    if not channels:
+        return "\U0001F510 Majburiy obuna\n\n\u2014 Hozircha kanal qo'shilmagan (majburiy obuna o'chiq)."
+    lines = "\n".join(f"\u2022 {c.get('channel')}" for c in channels)
+    return (
+        f"\U0001F510 Majburiy obuna\n\n"
+        f"Joriy kanallar ({len(channels)} ta):\n{lines}\n\n"
+        f"O'chirish uchun kanalni bosing."
+    )
+
+
+def _admins_text(extra_ids: list) -> str:
+    bootstrap_line = ", ".join(str(x) for x in ADMIN_IDS) if ADMIN_IDS else "\u2014"
+    extra_line = ", ".join(str(x) for x in extra_ids) if extra_ids else "\u2014 (yo'q)"
+    return (
+        f"\U0001F464 Adminlar\n\n"
+        f"\U0001F512 Asosiy (.env, o'chirib bo'lmaydi):\n{bootstrap_line}\n\n"
+        f"\u2795 Qo'shimcha adminlar:\n{extra_line}\n\n"
+        f"O'chirish uchun ID'ni bosing."
     )
 
 
@@ -2255,6 +2868,26 @@ async def admin_refresh(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@router_admin.callback_query(F.data == "adm:menu:users")
+async def admin_menu_users(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(USERS_MENU_TEXT, reply_markup=users_admin_menu())
+    await callback.answer()
+
+
+@router_admin.callback_query(F.data == "adm:menu:settings")
+async def admin_menu_settings(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(await _settings_text(), reply_markup=settings_admin_menu())
+    await callback.answer()
+
+
 # ---------- Foydalanuvchi qidirish ----------
 
 @router_admin.callback_query(F.data == "adm:find")
@@ -2262,21 +2895,19 @@ async def admin_find_start(callback: CallbackQuery, state: FSMContext):
     if not await _is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    await state.set_state(AdminPanel.find_user)
-    await callback.message.answer(ASK_FIND_USER, reply_markup=admin_cancel_menu())
-    await callback.answer()
+    await _ask(callback, state, AdminPanel.find_user, ASK_FIND_USER, users_cancel_menu())
 
 
 @router_admin.message(AdminPanel.find_user, is_free_text)
-async def admin_find_receive(message: Message, state: FSMContext):
+async def admin_find_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
     user = await find_user(message.text.strip())
-    await state.clear()
     if not user:
-        await message.answer("Foydalanuvchi topilmadi.", reply_markup=admin_cancel_menu())
-        return
-    await message.answer(admin_user_card(user), reply_markup=admin_cancel_menu())
+        await _panel_edit(bot, state, message, "Foydalanuvchi topilmadi.", users_cancel_menu())
+    else:
+        await _panel_edit(bot, state, message, admin_user_card(user), users_cancel_menu())
+    await state.clear()
 
 
 # ---------- Balans qo'shish/ayirish ----------
@@ -2286,22 +2917,20 @@ async def admin_balance_start(callback: CallbackQuery, state: FSMContext):
     if not await _is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    await state.set_state(AdminPanel.balance_id)
-    await callback.message.answer(ASK_BALANCE_ID, reply_markup=admin_cancel_menu())
-    await callback.answer()
+    await _ask(callback, state, AdminPanel.balance_id, ASK_BALANCE_ID, users_cancel_menu())
 
 
 @router_admin.message(AdminPanel.balance_id, is_free_text)
-async def admin_balance_id_receive(message: Message, state: FSMContext):
+async def admin_balance_id_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
     text = message.text.strip()
     if not text.isdigit():
-        await message.answer(NOT_A_VALID_ID, reply_markup=admin_cancel_menu())
+        await _panel_edit(bot, state, message, NOT_A_VALID_ID, users_cancel_menu())
         return
     await state.update_data(target_id=int(text))
     await state.set_state(AdminPanel.balance_amount)
-    await message.answer(ASK_BALANCE_AMOUNT, reply_markup=admin_cancel_menu())
+    await _panel_edit(bot, state, message, ASK_BALANCE_AMOUNT, users_cancel_menu())
 
 
 @router_admin.message(AdminPanel.balance_amount, is_free_text)
@@ -2310,20 +2939,21 @@ async def admin_balance_amount_receive(message: Message, state: FSMContext, bot)
         return
     text = message.text.strip()
     if not text.lstrip("-").isdigit():
-        await message.answer(NOT_A_VALID_AMOUNT, reply_markup=admin_cancel_menu())
+        await _panel_edit(bot, state, message, NOT_A_VALID_AMOUNT, users_cancel_menu())
         return
 
     data = await state.get_data()
     user_id = data["target_id"]
     amount = int(text)
-    await state.clear()
 
     await change_balance(user_id, amount)
     new_balance = await get_balance(user_id)
-    await message.answer(
+    await _panel_edit(
+        bot, state, message,
         f"\u2705 Bajarildi. {user_id} balansi endi: {fmt_money(new_balance)} so'm",
-        reply_markup=admin_cancel_menu(),
+        users_cancel_menu(),
     )
+    await state.clear()
     try:
         await bot.send_message(user_id, balance_adjusted_by_admin(amount, new_balance))
     except Exception:
@@ -2337,23 +2967,21 @@ async def admin_ban_start(callback: CallbackQuery, state: FSMContext):
     if not await _is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    await state.set_state(AdminPanel.ban_id)
-    await callback.message.answer(ASK_BAN_ID, reply_markup=admin_cancel_menu())
-    await callback.answer()
+    await _ask(callback, state, AdminPanel.ban_id, ASK_BAN_ID, users_cancel_menu())
 
 
 @router_admin.message(AdminPanel.ban_id, is_free_text)
-async def admin_ban_receive(message: Message, state: FSMContext):
+async def admin_ban_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
     text = message.text.strip()
     if not text.isdigit():
-        await message.answer(NOT_A_VALID_ID, reply_markup=admin_cancel_menu())
+        await _panel_edit(bot, state, message, NOT_A_VALID_ID, users_cancel_menu())
         return
-    await state.clear()
     user_id = int(text)
     await set_banned(user_id, True)
-    await message.answer(f"\U0001F6AB {user_id} bloklandi.", reply_markup=admin_cancel_menu())
+    await _panel_edit(bot, state, message, f"\U0001F6AB {user_id} bloklandi.", users_cancel_menu())
+    await state.clear()
 
 
 @router_admin.callback_query(F.data == "adm:unban")
@@ -2361,23 +2989,21 @@ async def admin_unban_start(callback: CallbackQuery, state: FSMContext):
     if not await _is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    await state.set_state(AdminPanel.unban_id)
-    await callback.message.answer(ASK_UNBAN_ID, reply_markup=admin_cancel_menu())
-    await callback.answer()
+    await _ask(callback, state, AdminPanel.unban_id, ASK_UNBAN_ID, users_cancel_menu())
 
 
 @router_admin.message(AdminPanel.unban_id, is_free_text)
-async def admin_unban_receive(message: Message, state: FSMContext):
+async def admin_unban_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
     text = message.text.strip()
     if not text.isdigit():
-        await message.answer(NOT_A_VALID_ID, reply_markup=admin_cancel_menu())
+        await _panel_edit(bot, state, message, NOT_A_VALID_ID, users_cancel_menu())
         return
-    await state.clear()
     user_id = int(text)
     await set_banned(user_id, False)
-    await message.answer(f"\u2705 {user_id} blokdan chiqarildi.", reply_markup=admin_cancel_menu())
+    await _panel_edit(bot, state, message, f"\u2705 {user_id} blokdan chiqarildi.", users_cancel_menu())
+    await state.clear()
 
 
 # ---------- Broadcast ----------
@@ -2387,9 +3013,7 @@ async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
     if not await _is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    await state.set_state(AdminPanel.broadcast_text)
-    await callback.message.answer(ASK_BROADCAST_TEXT, reply_markup=admin_cancel_menu())
-    await callback.answer()
+    await _ask(callback, state, AdminPanel.broadcast_text, ASK_BROADCAST_TEXT, admin_cancel_menu())
 
 
 @router_admin.message(AdminPanel.broadcast_text, is_free_text)
@@ -2397,10 +3021,26 @@ async def admin_broadcast_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
     text = message.text
+    data = await state.get_data()
+    chat_id = data.get("panel_chat_id", message.chat.id)
+    message_id = data.get("panel_message_id")
     await state.clear()
 
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
     user_ids = await get_all_user_ids()
-    await message.answer(f"\u23F3 {len(user_ids)} foydalanuvchiga yuborilmoqda...")
+    progress_text = f"\u23F3 {len(user_ids)} foydalanuvchiga yuborilmoqda..."
+    if message_id:
+        try:
+            await bot.edit_message_text(progress_text, chat_id=chat_id, message_id=message_id)
+        except Exception:
+            message_id = None
+    if not message_id:
+        sent_msg = await bot.send_message(chat_id, progress_text)
+        message_id = sent_msg.message_id
 
     sent = 0
     failed = 0
@@ -2412,10 +3052,11 @@ async def admin_broadcast_receive(message: Message, state: FSMContext, bot):
             failed += 1
         await asyncio.sleep(0.05)
 
-    await message.answer(
-        f"\u2705 Yuborildi: {sent}\n\u274C Yuborilmadi: {failed}",
-        reply_markup=admin_cancel_menu(),
-    )
+    result_text = f"\u2705 Yuborildi: {sent}\n\u274C Yuborilmadi: {failed}"
+    try:
+        await bot.edit_message_text(result_text, chat_id=chat_id, message_id=message_id, reply_markup=admin_cancel_menu())
+    except Exception:
+        await bot.send_message(chat_id, result_text, reply_markup=admin_cancel_menu())
 
 
 # ---------- API kalitni sozlash ----------
@@ -2426,24 +3067,23 @@ async def admin_apikey_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
     current_key = await get_setting(SETTINGS_KEY_API_KEY, default=SMMUPPER_API_KEY)
-    await state.set_state(AdminPanel.api_key)
-    await callback.message.answer(
+    await _ask(
+        callback, state, AdminPanel.api_key,
         f"{current_api_key_line(_mask_key(current_key))}\n\n{ASK_API_KEY}",
-        reply_markup=admin_cancel_menu(),
+        settings_cancel_menu(),
     )
-    await callback.answer()
 
 
 @router_admin.message(AdminPanel.api_key, is_free_text)
-async def admin_apikey_receive(message: Message, state: FSMContext):
+async def admin_apikey_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
     new_key = message.text.strip()
-    await state.clear()
 
     if not new_key or len(new_key) < 6:
-        await message.answer("\u274C Kalit juda qisqa ko'rinyapti, qaytadan tekshiring.",
-                              reply_markup=admin_cancel_menu())
+        await _panel_edit(bot, state, message,
+                           "\u274C Kalit juda qisqa ko'rinyapti, qaytadan tekshiring.",
+                           settings_cancel_menu())
         return
 
     await set_setting(SETTINGS_KEY_API_KEY, new_key)
@@ -2456,10 +3096,10 @@ async def admin_apikey_receive(message: Message, state: FSMContext):
     except (SmmUpperError, KeyError) as e:
         check_line = f"\u26A0\uFE0F Kalit saqlandi, lekin tekshirishda xatolik: {e}"
 
-    await message.answer(
-        api_key_saved(_mask_key(new_key)) + "\n\n" + check_line,
-        reply_markup=admin_cancel_menu(),
-    )
+    await _panel_edit(bot, state, message,
+                       api_key_saved(_mask_key(new_key)) + "\n\n" + check_line,
+                       settings_cancel_menu())
+    await state.clear()
 
 
 # ---------- Narx ustamasini sozlash ----------
@@ -2470,28 +3110,27 @@ async def admin_markup_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
     current = await get_markup_percent()
-    await state.set_state(AdminPanel.markup_percent)
-    await callback.message.answer(
+    await _ask(
+        callback, state, AdminPanel.markup_percent,
         f"{current_markup_line(current)}\n\n{ASK_MARKUP_PERCENT}",
-        reply_markup=admin_cancel_menu(),
+        settings_cancel_menu(),
     )
-    await callback.answer()
 
 
 @router_admin.message(AdminPanel.markup_percent, is_free_text)
-async def admin_markup_receive(message: Message, state: FSMContext):
+async def admin_markup_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
     text = message.text.strip().replace(",", ".")
     try:
         percent = float(text)
     except ValueError:
-        await message.answer(NOT_A_VALID_PERCENT, reply_markup=admin_cancel_menu())
+        await _panel_edit(bot, state, message, NOT_A_VALID_PERCENT, settings_cancel_menu())
         return
 
-    await state.clear()
     await set_setting(SETTINGS_KEY_MARKUP, str(percent))
-    await message.answer(markup_saved(percent), reply_markup=admin_cancel_menu())
+    await _panel_edit(bot, state, message, markup_saved(percent), settings_cancel_menu())
+    await state.clear()
 
 
 # ---------- Xarid kanalini sozlash ----------
@@ -2502,12 +3141,11 @@ async def admin_channel_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
     current = await get_channel_id()
-    await state.set_state(AdminPanel.channel_id)
-    await callback.message.answer(
+    await _ask(
+        callback, state, AdminPanel.channel_id,
         f"{current_channel_line(current)}\n\n{ASK_CHANNEL_ID}",
-        reply_markup=admin_cancel_menu(),
+        settings_cancel_menu(),
     )
-    await callback.answer()
 
 
 @router_admin.message(AdminPanel.channel_id, is_free_text)
@@ -2515,15 +3153,15 @@ async def admin_channel_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
     text = message.text.strip()
-    await state.clear()
 
     if text == "0":
         await set_setting(SETTINGS_KEY_CHANNEL_ID, "")
-        await message.answer(CHANNEL_DISABLED, reply_markup=admin_cancel_menu())
+        await _panel_edit(bot, state, message, CHANNEL_DISABLED, settings_cancel_menu())
+        await state.clear()
         return
 
     if not (text.startswith("@") or text.lstrip("-").isdigit()):
-        await message.answer(NOT_A_VALID_CHANNEL, reply_markup=admin_cancel_menu())
+        await _panel_edit(bot, state, message, NOT_A_VALID_CHANNEL, settings_cancel_menu())
         return
 
     await set_setting(SETTINGS_KEY_CHANNEL_ID, text)
@@ -2532,9 +3170,10 @@ async def admin_channel_receive(message: Message, state: FSMContext, bot):
     try:
         target = int(text) if text.lstrip("-").isdigit() else text
         await bot.send_message(target, "\u2705 Bot shu kanalga xarid xabarlarini yuboradi.")
-        await message.answer(channel_saved_ok(text), reply_markup=admin_cancel_menu())
+        await _panel_edit(bot, state, message, channel_saved_ok(text), settings_cancel_menu())
     except Exception as e:
-        await message.answer(channel_saved_warning(text, str(e)), reply_markup=admin_cancel_menu())
+        await _panel_edit(bot, state, message, channel_saved_warning(text, str(e)), settings_cancel_menu())
+    await state.clear()
 
 
 # ---------- To'lov kartasini sozlash ----------
@@ -2545,90 +3184,35 @@ async def admin_card_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
     card_number, card_holder = await get_card_info()
-    await state.set_state(AdminPanel.card_number)
-    await callback.message.answer(
+    await _ask(
+        callback, state, AdminPanel.card_number,
         f"{current_card_line(card_number, card_holder)}\n\n{ASK_CARD_NUMBER}",
-        reply_markup=admin_cancel_menu(),
+        settings_cancel_menu(),
     )
-    await callback.answer()
 
 
 @router_admin.message(AdminPanel.card_number, is_free_text)
-async def admin_card_number_receive(message: Message, state: FSMContext):
+async def admin_card_number_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
     card_number = message.text.strip()
     await state.update_data(card_number=card_number)
     await state.set_state(AdminPanel.card_holder)
-    await message.answer(ASK_CARD_HOLDER, reply_markup=admin_cancel_menu())
+    await _panel_edit(bot, state, message, ASK_CARD_HOLDER, settings_cancel_menu())
 
 
 @router_admin.message(AdminPanel.card_holder, is_free_text)
-async def admin_card_holder_receive(message: Message, state: FSMContext):
+async def admin_card_holder_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
     card_holder = message.text.strip()
     data = await state.get_data()
     card_number = data["card_number"]
-    await state.clear()
 
     await set_setting(SETTINGS_KEY_CARD_NUMBER, card_number)
     await set_setting(SETTINGS_KEY_CARD_HOLDER, card_holder)
-    await message.answer(card_saved(card_number, card_holder), reply_markup=admin_cancel_menu())
-
-
-# ---------- Majburiy obunani sozlash ----------
-
-@router_admin.callback_query(F.data == "adm:forcesub")
-async def admin_forcesub_start(callback: CallbackQuery, state: FSMContext):
-    if not await _is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
-        return
-    channel, _ = await get_force_sub_channel()
-    await state.set_state(AdminPanel.force_sub_channel)
-    await callback.message.answer(
-        f"{current_force_sub_line(channel)}\n\n{ASK_FORCE_SUB_CHANNEL}",
-        reply_markup=admin_cancel_menu(),
-    )
-    await callback.answer()
-
-
-@router_admin.message(AdminPanel.force_sub_channel, is_free_text)
-async def admin_forcesub_channel_receive(message: Message, state: FSMContext):
-    if not await _is_admin(message.from_user.id):
-        return
-    text = message.text.strip()
-
-    if text == "0":
-        await state.clear()
-        await set_setting(SETTINGS_KEY_FORCE_SUB_CHANNEL, "")
-        await set_setting(SETTINGS_KEY_FORCE_SUB_URL, "")
-        await message.answer(force_sub_disabled_ok(), reply_markup=admin_cancel_menu())
-        return
-
-    if not (text.startswith("@") or text.lstrip("-").isdigit()):
-        await message.answer(NOT_A_VALID_FORCE_SUB_CHANNEL, reply_markup=admin_cancel_menu())
-        return
-
-    await state.update_data(fs_channel=text)
-    await state.set_state(AdminPanel.force_sub_url)
-    await message.answer(ASK_FORCE_SUB_URL, reply_markup=admin_cancel_menu())
-
-
-@router_admin.message(AdminPanel.force_sub_url, is_free_text)
-async def admin_forcesub_url_receive(message: Message, state: FSMContext):
-    if not await _is_admin(message.from_user.id):
-        return
-    data = await state.get_data()
-    channel = data["fs_channel"]
-    url_text = message.text.strip()
-    url = "" if url_text == "-" else url_text
+    await _panel_edit(bot, state, message, card_saved(card_number, card_holder), settings_cancel_menu())
     await state.clear()
-
-    await set_setting(SETTINGS_KEY_FORCE_SUB_CHANNEL, channel)
-    await set_setting(SETTINGS_KEY_FORCE_SUB_URL, url)
-    _, resolved_url = await get_force_sub_channel()
-    await message.answer(force_sub_saved(channel, resolved_url), reply_markup=admin_cancel_menu())
 
 
 # ---------- Pul qaytarish vaqtini sozlash ----------
@@ -2639,66 +3223,153 @@ async def admin_refundtime_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
     current = await get_refund_eligible_seconds()
-    await state.set_state(AdminPanel.refund_seconds)
-    await callback.message.answer(
+    await _ask(
+        callback, state, AdminPanel.refund_seconds,
         f"{current_refund_seconds_line(current)}\n\n{ASK_REFUND_SECONDS}",
-        reply_markup=admin_cancel_menu(),
+        settings_cancel_menu(),
     )
-    await callback.answer()
 
 
 @router_admin.message(AdminPanel.refund_seconds, is_free_text)
-async def admin_refundtime_receive(message: Message, state: FSMContext):
+async def admin_refundtime_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
     text = message.text.strip()
     if not text.isdigit() or int(text) <= 0:
-        await message.answer(NOT_A_VALID_SECONDS, reply_markup=admin_cancel_menu())
+        await _panel_edit(bot, state, message, NOT_A_VALID_SECONDS, settings_cancel_menu())
         return
 
     seconds = int(text)
-    await state.clear()
     await set_setting(SETTINGS_KEY_REFUND_SECONDS, str(seconds))
-    await message.answer(refund_seconds_saved(seconds), reply_markup=admin_cancel_menu())
+    await _panel_edit(bot, state, message, refund_seconds_saved(seconds), settings_cancel_menu())
+    await state.clear()
 
 
-# ---------- Qo'shimcha adminlar ----------
+# ---------- Majburiy obuna kanallari (ro'yxat: qo'shish/o'chirish) ----------
 
-@router_admin.callback_query(F.data == "adm:toggleadmin")
-async def admin_toggleadmin_start(callback: CallbackQuery, state: FSMContext):
+@router_admin.callback_query(F.data == "adm:forcesub")
+async def admin_forcesub_list(callback: CallbackQuery, state: FSMContext):
     if not await _is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    ids = await get_extra_admin_ids()
-    await state.set_state(AdminPanel.toggle_admin)
-    await callback.message.answer(
-        f"{current_extra_admins_line(ids)}\n\n{ASK_TOGGLE_ADMIN}",
-        reply_markup=admin_cancel_menu(),
-    )
+    await state.clear()
+    channels = await get_force_sub_channels()
+    await callback.message.edit_text(_forcesub_text(channels), reply_markup=forcesub_admin_menu(channels))
     await callback.answer()
 
 
-@router_admin.message(AdminPanel.toggle_admin, is_free_text)
-async def admin_toggleadmin_receive(message: Message, state: FSMContext):
+@router_admin.callback_query(F.data == "adm:fs:add")
+async def admin_forcesub_add_start(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    await _ask(callback, state, AdminPanel.force_sub_channel, ASK_FORCE_SUB_CHANNEL, fs_cancel_menu())
+
+
+@router_admin.message(AdminPanel.force_sub_channel, is_free_text)
+async def admin_forcesub_channel_receive(message: Message, state: FSMContext, bot):
+    if not await _is_admin(message.from_user.id):
+        return
+    text = message.text.strip()
+
+    if not (text.startswith("@") or text.lstrip("-").isdigit()):
+        await _panel_edit(bot, state, message, NOT_A_VALID_FORCE_SUB_CHANNEL, fs_cancel_menu())
+        return
+
+    await state.update_data(fs_channel=text)
+    await state.set_state(AdminPanel.force_sub_url)
+    await _panel_edit(bot, state, message, ASK_FORCE_SUB_URL, fs_cancel_menu())
+
+
+@router_admin.message(AdminPanel.force_sub_url, is_free_text)
+async def admin_forcesub_url_receive(message: Message, state: FSMContext, bot):
+    if not await _is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    channel = data["fs_channel"]
+    url_text = message.text.strip()
+    url = "" if url_text == "-" else url_text
+    if not url and channel.startswith("@"):
+        url = f"https://t.me/{channel.lstrip('@')}"
+
+    await add_force_sub_channel(channel, url)
+    channels = await get_force_sub_channels()
+    await _panel_edit(bot, state, message, _forcesub_text(channels), forcesub_admin_menu(channels))
+    await state.clear()
+
+
+@router_admin.callback_query(F.data.startswith("adm:fs:del:"))
+async def admin_forcesub_delete(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    try:
+        index = int(callback.data.split(":")[3])
+    except (IndexError, ValueError):
+        await callback.answer()
+        return
+    await remove_force_sub_channel(index)
+    channels = await get_force_sub_channels()
+    await callback.message.edit_text(_forcesub_text(channels), reply_markup=forcesub_admin_menu(channels))
+    await callback.answer("O'chirildi.")
+
+
+# ---------- Adminlar (ro'yxat: qo'shish/o'chirish) ----------
+
+@router_admin.callback_query(F.data == "adm:admins")
+async def admin_admins_list(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    await state.clear()
+    ids = await get_extra_admin_ids()
+    await callback.message.edit_text(_admins_text(ids), reply_markup=admins_admin_menu(ids))
+    await callback.answer()
+
+
+@router_admin.callback_query(F.data == "adm:adm:add")
+async def admin_add_admin_start(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    await _ask(callback, state, AdminPanel.add_admin_id, ASK_ADD_ADMIN_ID, admins_cancel_menu())
+
+
+@router_admin.message(AdminPanel.add_admin_id, is_free_text)
+async def admin_add_admin_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
     text = message.text.strip()
     if not text.isdigit():
-        await message.answer(NOT_A_VALID_ID, reply_markup=admin_cancel_menu())
+        await _panel_edit(bot, state, message, NOT_A_VALID_ID, admins_cancel_menu())
         return
 
     user_id = int(text)
-    await state.clear()
-
     if user_id in ADMIN_IDS:
-        await message.answer(
-            f"\u2139\uFE0F {user_id} allaqachon asosiy (.env) admin \u2014 bu yerdan olib tashlab bo'lmaydi.",
-            reply_markup=admin_cancel_menu(),
-        )
+        await _panel_edit(bot, state, message, ALREADY_ADMIN, admins_cancel_menu())
+        await state.clear()
         return
 
-    added = await toggle_extra_admin(user_id)
-    await message.answer(admin_toggled(user_id, added), reply_markup=admin_cancel_menu())
+    await add_extra_admin(user_id)
+    ids = await get_extra_admin_ids()
+    await _panel_edit(bot, state, message, _admins_text(ids), admins_admin_menu(ids))
+    await state.clear()
+
+
+@router_admin.callback_query(F.data.startswith("adm:adm:del:"))
+async def admin_remove_admin(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    try:
+        user_id = int(callback.data.split(":")[3])
+    except (IndexError, ValueError):
+        await callback.answer()
+        return
+    await remove_extra_admin(user_id)
+    ids = await get_extra_admin_ids()
+    await callback.message.edit_text(_admins_text(ids), reply_markup=admins_admin_menu(ids))
+    await callback.answer("O'chirildi.")
 
 
 # ---------- Statistika ----------
@@ -2710,7 +3381,7 @@ async def admin_stats(callback: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     stats = await get_stats()
-    await callback.message.answer(stats_text(stats), reply_markup=admin_cancel_menu())
+    await callback.message.edit_text(stats_text(stats), reply_markup=admin_cancel_menu())
     await callback.answer()
 
 
@@ -2742,6 +3413,23 @@ async def approve_topup(callback: CallbackQuery, bot):
         )
     except Exception:
         pass
+
+    # Referal keshbek: to'ldirgan foydalanuvchini kimdir taklif qilgan bo'lsa,
+    # to'ldirilgan summaning REFERRAL_CASHBACK_PERCENT foizi o'sha kishiga
+    # avtomatik qo'shiladi.
+    referrer_id = await get_referrer(topup["user_id"])
+    if referrer_id:
+        cashback = topup["amount"] * REFERRAL_CASHBACK_PERCENT // 100
+        if cashback > 0:
+            await change_balance(referrer_id, cashback)
+            try:
+                await bot.send_message(
+                    referrer_id,
+                    f"\U0001F381 Taklif qilgan do'stingiz balansini to'ldirdi!\n"
+                    f"Sizga {fmt_money(cashback)} so'm keshbek qo'shildi.",
+                )
+            except Exception:
+                pass
 
     old_caption = callback.message.caption or ""
     await callback.message.edit_caption(caption=old_caption + "\n\n\u2705 TASDIQLANDI")
@@ -2814,11 +3502,11 @@ class ForceSubMiddleware(BaseMiddleware):
         if isinstance(event, CallbackQuery) and event.data == "forcesub:check":
             return await handler(event, data)
 
-        # Avval kanal sozlanganmi shuni tekshiramiz (bitta baza so'rovi) — bu
+        # Avval kanallar sozlanganmi shuni tekshiramiz (bitta baza so'rovi) — bu
         # ko'pchilik holatda (majburiy obuna o'chiq) darhol chiqib ketadi,
         # adminlikni tekshirish uchun QO'SHIMCHA baza so'rovi yubormaydi.
-        channel, _ = await get_force_sub_channel()
-        if not channel:
+        channels = await get_force_sub_channels()
+        if not channels:
             return await handler(event, data)
 
         if await _is_admin(user.id):
