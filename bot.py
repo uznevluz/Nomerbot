@@ -1850,6 +1850,16 @@ class AdminPanel(StatesGroup):
 # UMUMIY HANDLERLAR (handler_common)
 # ==============================================================
 router_common = Router(name="common")
+# MUHIM: router_admin ATAYIN shu yerda, boshqa routerlar bilan birga
+# e'lon qilinadi (garchi uning handlerlari faylning pastida, "ADMIN PANEL
+# HANDLER" bo'limida joylashgan bo'lsa ham). Sababi: pastroqda,
+# router_start bo'limi ichida (support_reply_filter uchun)
+# "@router_admin.message(...)" ishlatiladi — Python esa faylni yuqoridan
+# pastga o'qiganda, shu qatorga yetguncha "router_admin" nomi allaqachon
+# mavjud bo'lishi kerak. Aks holda xuddi shu joyda "NameError: name
+# 'router_admin' is not defined" xatosi bilan bot ISHGA TUSHISHNING O'ZIDA
+# qulab tushadi (Render logida aynan shu xato ko'ringan edi).
+router_admin = Router(name="admin")
 
 SETTINGS_KEY_CHANNEL_ID = "channel_id"
 SETTINGS_KEY_CARD_NUMBER = "card_number"
@@ -3121,7 +3131,8 @@ async def check_order(callback: CallbackQuery):
 # ==============================================================
 # ADMIN PANEL HANDLER (handler_admin)
 # ==============================================================
-router_admin = Router(name="admin")
+# (router_admin quyida emas, balki yuqorida, router_common bilan birga
+# e'lon qilingan — sababi shu bo'limning boshida izohlangan.)
 
 
 async def _is_admin(user_id: int) -> bool:
