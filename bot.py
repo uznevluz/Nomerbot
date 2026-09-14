@@ -2658,7 +2658,7 @@ async def _poll_code(bot, user_id: int, order_pk: int, server: int, result: dict
         if data.get("success"):
             code = data.get("code", "?")
             password = data.get("password") or ""
-            text = f"\u2705 SMS kod keldi: <code>{html.escape(str(code))}</code> 123.45"
+            text = f"\u2705 SMS kod keldi: <code>{html.escape(str(code))}</code>"
             if password:
                 text += f"\n\U0001F511 2FA parol: <code>{html.escape(str(password))}</code>"
             await update_order_status(order_pk, "done", {**result, "code": code, "password": password})
@@ -2710,7 +2710,7 @@ async def manual_check_code(callback: CallbackQuery):
         # Popup alert (show_alert) matnni nusxalashga imkon bermaydi — shuning
         # uchun kodni alohida, <code> bilan formatlangan xabar sifatida
         # yuboramiz, bosib nusxa olish uchun.
-        text = f"\u2705 Kod: <code>{html.escape(str(code))}</code> 123.45"
+        text = f"\u2705 Kod: <code>{html.escape(str(code))}</code>"
         if password:
             text += f"\n\U0001F511 2FA parol: <code>{html.escape(str(password))}</code>"
         await callback.answer()
