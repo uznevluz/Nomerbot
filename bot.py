@@ -26,6 +26,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.types import (
     CallbackQuery,
+    ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -2079,8 +2080,12 @@ async def cancel_any(callback: CallbackQuery, state: FSMContext):
     # tugmalarini olib tashlaymiz — shunda suhbatda ortiqcha xabarlar
     # to'planib qolmaydi. Tahrirlab bo'lmasa (masalan, rasm bilan yuborilgan
     # yoki juda eski xabar), o'chirib, faqat o'shanda yangi xabar yuboramiz.
+    # MUHIM: edit_text'da reply_markup ko'rsatilmasa, Telegram ESKI
+    # tugmalarni saqlab qoladi (o'chirmaydi) — shuning uchun bo'sh
+    # InlineKeyboardMarkup ANIQ berilishi shart, aks holda "Bekor qilindi"
+    # yozuvi ostida eski (endi ishlamaydigan) tugmalar osilib qolaveradi.
     try:
-        await callback.message.edit_text("\u274C Bekor qilindi.")
+        await callback.message.edit_text("\u274C Bekor qilindi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
     except Exception:
         try:
             await callback.message.delete()
@@ -2199,7 +2204,7 @@ async def show_balance(message: Message, state: FSMContext):
 @router_balance.callback_query(F.data == "topup:start")
 async def topup_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(TopUp.amount)
-    await callback.message.answer(TOPUP_ASK_AMOUNT, reply_markup=cancel_inline())
+    await callback.message.edit_text(TOPUP_ASK_AMOUNT, reply_markup=cancel_inline())
     await callback.answer()
 
 
@@ -2289,7 +2294,7 @@ async def start_number_flow(message: Message, state: FSMContext):
 
 @router_numbers.callback_query(F.data == "numwarn:confirm")
 async def number_warning_confirmed(callback: CallbackQuery):
-    await callback.message.answer("Qanday raqam kerak?", reply_markup=number_type_menu())
+    await callback.message.edit_text("Qanday raqam kerak?", reply_markup=number_type_menu())
     await callback.answer()
 
 
@@ -2317,13 +2322,16 @@ async def choose_regular(callback: CallbackQuery, state: FSMContext):
     await callback.answer("Davlatlar yuklanmoqda...")
     server, countries = await _fetch_countries_with_fallback(1, 2)
     if not countries:
-        await callback.message.answer("\u274C Hozircha mavjud davlat yo'q. Birozdan so'ng qayta urinib ko'ring.")
+        await callback.message.edit_text(
+            "\u274C Hozircha mavjud davlat yo'q. Birozdan so'ng qayta urinib ko'ring.",
+            reply_markup=cancel_inline(),
+        )
         return
 
     await state.set_state(BuyNumber.choosing_country)
     await state.update_data(server=server, countries=countries)
     percent = await get_markup_percent()
-    await callback.message.answer("Davlatni tanlang:", reply_markup=countries_menu(server, countries, markup_percent=percent))
+    await callback.message.edit_text("Davlatni tanlang:", reply_markup=countries_menu(server, countries, markup_percent=percent))
 
 
 @router_numbers.callback_query(F.data == "numtype:ready")
@@ -2333,17 +2341,18 @@ async def choose_ready(callback: CallbackQuery, state: FSMContext):
         data = await client.available_countries(3)
         countries = data.get("countries") or {}
     except SmmUpperError as e:
-        await callback.message.answer(f"\u274C Tayyor akkauntlar hozircha mavjud emas: {e.message}")
+        await callback.message.edit_text(f"\u274C Tayyor akkauntlar hozircha mavjud emas: {e.message}",
+                                          reply_markup=cancel_inline())
         return
 
     if not countries:
-        await callback.message.answer("\u274C Hozircha tayyor akkaunt yo'q.")
+        await callback.message.edit_text("\u274C Hozircha tayyor akkaunt yo'q.", reply_markup=cancel_inline())
         return
 
     await state.set_state(BuyNumber.choosing_country)
     await state.update_data(server=3, countries=countries)
     percent = await get_markup_percent()
-    await callback.message.answer("Davlatni tanlang:", reply_markup=countries_menu(3, countries, markup_percent=percent))
+    await callback.message.edit_text("Davlatni tanlang:", reply_markup=countries_menu(3, countries, markup_percent=percent))
 
 
 # ---------- Davlatlar ro'yxatini varaqlash va qidirish ----------
@@ -2446,7 +2455,7 @@ async def country_change_search_page(callback: CallbackQuery, state: FSMContext)
 @router_numbers.callback_query(BuyNumber.choosing_country, F.data.startswith("ctysearch:"))
 async def country_search_prompt(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BuyNumber.searching_country)
-    await callback.message.answer(
+    await callback.message.edit_text(
         "Davlat nomini yozing (masalan: turkiya):",
         reply_markup=cancel_inline(),
     )
@@ -2521,13 +2530,13 @@ async def choose_country(callback: CallbackQuery, state: FSMContext):
     )
 
     if balance < price:
-        await callback.message.answer(text + "\n\n" + insufficient_balance(price, balance),
-                                       reply_markup=balance_menu())
+        await callback.message.edit_text(text + "\n\n" + insufficient_balance(price, balance),
+                                          reply_markup=balance_menu())
         await state.clear()
         await callback.answer()
         return
 
-    await callback.message.answer(text + "\n\nTasdiqlaysizmi?", reply_markup=confirm_menu("buynum:confirm"))
+    await callback.message.edit_text(text + "\n\nTasdiqlaysizmi?", reply_markup=confirm_menu("buynum:confirm"))
     await callback.answer()
 
 
@@ -2537,6 +2546,11 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
     server = data["server"]
     country = data["country"]
     est_price = data["price"]
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
     # Balansni SHU YERDA, bitta atomik amal bilan tekshirib-va-yechib qo'yamiz —
     # SmmUpper'ga ketadigan (sekin) so'rovdan OLDIN. Aks holda ikkita xaridni bir
@@ -2797,12 +2811,16 @@ async def stars_username(message: Message, state: FSMContext):
 async def stars_amount_choice(callback: CallbackQuery, state: FSMContext):
     value = callback.data.split(":", 1)[1]
     if value == "custom":
-        await callback.message.answer(f"Nechta Stars kerak? Sonini yozing (min {MIN_STARS}).",
-                                       reply_markup=cancel_inline())
+        await callback.message.edit_text(f"Nechta Stars kerak? Sonini yozing (min {MIN_STARS}).",
+                                          reply_markup=cancel_inline())
         await callback.answer()
         return
 
     await callback.answer()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     await _process_stars_amount(callback.message, state, int(value), callback.from_user.id)
 
 
@@ -2857,6 +2875,11 @@ async def confirm_stars(callback: CallbackQuery, state: FSMContext, bot):
     username = data["username"]
     amount = data["amount"]
     est_price = data["price"]
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
     if not await try_deduct_balance(callback.from_user.id, est_price):
         balance = await get_balance(callback.from_user.id)
@@ -2922,8 +2945,8 @@ async def premium_months_choice(callback: CallbackQuery, state: FSMContext):
     months = int(callback.data.split(":")[1])
     await state.update_data(months=months)
     await state.set_state(BuyPremium.username)
-    await callback.message.answer("Kimga? Telegram username kiriting (masalan: durov).",
-                                   reply_markup=cancel_inline())
+    await callback.message.edit_text("Kimga? Telegram username kiriting (masalan: durov).",
+                                      reply_markup=cancel_inline())
     await callback.answer()
 
 
@@ -2972,6 +2995,11 @@ async def confirm_premium(callback: CallbackQuery, state: FSMContext, bot):
     username = data["username"]
     months = data["months"]
     est_price = data["price"]
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
     if not await try_deduct_balance(callback.from_user.id, est_price):
         balance = await get_balance(callback.from_user.id)
@@ -3028,7 +3056,7 @@ FINAL_STATUSES = {"done", "failed", "error", "refunded"}
 
 _STATUS_EMOJI = {
     "done": "\u2705", "processing": "\u23F3", "pending": "\u23F3", "waiting": "\u23F3",
-    "failed": "\u274C", "error": "\u274C", "review": "\U0001F575",
+    "failed": "\u274C", "error": "\u274C", "review": "\U0001F575", "refunded": "\U0001F4B8",
 }
 _TYPE_LABEL = {
     "number": "\U0001F4F1 Raqam", "stars": "\u2B50 Stars", "premium": "\U0001F48E Premium",
@@ -3947,6 +3975,33 @@ async def _run_health_server():
     logging.info(f"Health-check server {port}-portda ochildi")
 
 
+async def global_error_handler(event: ErrorEvent) -> bool:
+    """
+    Hech qaysi handler o'zi ushlamagan (kutilmagan) xatoliklar uchun oxirgi
+    xavfsizlik tarmog'i. Bu bo'lmasa: biror funksiya ichida kutilmagan
+    xatolik chiqsa (masalan API kutilmagan formatda javob qaytarsa),
+    callback HECH QACHON javob olmasdi — foydalanuvchi tugmani bossa, u
+    "yuklanmoqda" holatida abadiy osilib qolardi va hech qanday xabar
+    ko'rsatilmasdi. Endi bunday holatda foydalanuvchiga kamida tushunarli
+    xabar chiqadi, xatolikning o'zi esa logga (server konsoliga) yoziladi.
+    """
+    logging.error(f"Kutilmagan xatolik: {event.exception!r}", exc_info=event.exception)
+    try:
+        update = event.update
+        if update.callback_query:
+            await update.callback_query.answer(
+                "\u274C Kutilmagan xatolik yuz berdi. Qayta urinib ko'ring yoki /start bosing.",
+                show_alert=True,
+            )
+        elif update.message:
+            await update.message.answer(
+                "\u274C Kutilmagan xatolik yuz berdi. /start bosib qayta urinib ko'ring."
+            )
+    except Exception:
+        pass
+    return True
+
+
 async def main():
     logging.basicConfig(level=logging.INFO)
 
@@ -3960,6 +4015,7 @@ async def main():
 
     bot = Bot(token=BOT_TOKEN)
     dp = Dispatcher(storage=PersistentStorage())
+    dp.errors.register(global_error_handler)
 
     # Har bir xabar/tugma bosishi routerlarga yetib borishidan OLDIN: avval
     # bloklangan-emasligi tekshiriladi, keyin spam/flood cheklovi qo'llanadi.
