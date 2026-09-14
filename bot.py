@@ -1656,13 +1656,19 @@ def stars_amount_menu() -> InlineKeyboardMarkup:
     ])
 
 
-def premium_months_menu() -> InlineKeyboardMarkup:
+def premium_months_menu(prices: Optional[Dict[int, int]] = None) -> InlineKeyboardMarkup:
+    prices = prices or {}
+
+    def label(months: int) -> str:
+        price = prices.get(months)
+        if isinstance(price, (int, float)):
+            return f"\U0001F451 {months} oy \u2014 {fmt_money(round(price))} so'm"
+        return f"\U0001F451 {months} oy"
+
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="3 oy", callback_data="premmonths:3", style=STYLE_PRIMARY),
-            InlineKeyboardButton(text="6 oy", callback_data="premmonths:6", style=STYLE_PRIMARY),
-            InlineKeyboardButton(text="12 oy", callback_data="premmonths:12", style=STYLE_PRIMARY),
-        ],
+        [InlineKeyboardButton(text=label(3), callback_data="premmonths:3", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text=label(6), callback_data="premmonths:6", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text=label(12), callback_data="premmonths:12", style=STYLE_PRIMARY)],
         [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
     ])
 
@@ -2811,10 +2817,19 @@ async def stars_username(message: Message, state: FSMContext):
         await message.answer("Username noto'g'ri ko'rinadi. Qayta kiriting (masalan: durov).")
         return
 
+    try:
+        prices = await client.get_prices()
+        percent = await get_markup_percent()
+        per_star = prices["stars"]["price_per_star"] * (1 + percent / 100)
+    except (SmmUpperError, KeyError) as e:
+        await message.answer(f"\u274C Narxlarni olib bo'lmadi: {e}")
+        return
+
     await state.update_data(username=username)
     await state.set_state(BuyStars.amount)
     await message.answer(
-        f"Nechta Stars? (min {MIN_STARS}, yoki summani yozib yuboring)",
+        f"Nechta Stars? (min {MIN_STARS}, yoki summani yozib yuboring)\n"
+        f"\U0001F4B5 Narx: {per_star:.1f} so'm/Star",
         reply_markup=stars_amount_menu(),
     )
 
@@ -2948,8 +2963,25 @@ router_premium = Router(name="premium")
 @router_premium.message(F.text == BTN_PREMIUM)
 async def start_premium_flow(message: Message, state: FSMContext):
     await state.clear()
+
+    try:
+        raw_prices = (await client.get_prices())["premium"]
+        prices: Dict[int, int] = {}
+        for m in (3, 6, 12):
+            prices[m] = await with_markup(raw_prices[str(m)]["price"])
+    except (SmmUpperError, KeyError) as e:
+        await message.answer(f"\u274C Narxlarni olib bo'lmadi: {e}")
+        return
+
     await state.set_state(BuyPremium.months)
-    await message.answer("Necha oylik Premium kerak?", reply_markup=premium_months_menu())
+    text = (
+        "\U0001F48E Narxlar:\n"
+        f"\u2022 3 oy: {fmt_money(prices[3])} so'm\n"
+        f"\u2022 6 oy: {fmt_money(prices[6])} so'm\n"
+        f"\u2022 12 oy: {fmt_money(prices[12])} so'm\n\n"
+        "Necha oylik Premium kerak?"
+    )
+    await message.answer(text, reply_markup=premium_months_menu(prices))
 
 
 @router_premium.callback_query(BuyPremium.months, F.data.startswith("premmonths:"))
