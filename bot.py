@@ -6,11 +6,13 @@
 ==================================================================
 """
 import asyncio
+import contextlib
 import html
 import json
 import logging
 import os
 import re
+import signal
 import time
 import uuid
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -4053,9 +4055,40 @@ async def main():
 
     await bot.delete_webhook(drop_pending_updates=True)
     await _run_health_server()
+
+    # MUHIM (Render "zero-downtime deploy"ga oid): yangi deploy paytida
+    # Render eski va yangi instansiyani BIR NECHA O'N SONIYA (hattoki
+    # ~60 soniyagacha) PARALLEL ishlab turishga majbur qiladi — shu daqiqada
+    # ikkalasi ham Telegram'dan getUpdates so'rasa, "Conflict: terminated by
+    # other getUpdates request" xatosi chiqadi (loglarda ko'rilgan). aiogram
+    # buni o'zi avtomatik qayta urinib, bir necha soniyada tuzatadi — bu
+    # xavfli emas va o'z-o'zidan tuzaladi.
+    #
+    # Bu yerdagi signal handler esa BOSHQA narsani hal qiladi: Render eski
+    # instansiyaga SIGTERM yuborgan zahoti (deploy jarayonining tabiiy
+    # qismi) pollingni DARHOL to'xtatib, pastdagi `finally` blokidagi
+    # tozalashni (DB pool va bot sessiyasini toza yopish) ishga tushiradi.
+    # Handler bo'lmasa, jarayon SIGKILL bilan majburan o'chirilib, ochiq DB
+    # ulanishlari Postgres tomonida "idle" holida osilib qolishi mumkin edi.
+    stop_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass  # ba'zi platformalarda (masalan Windows) qo'llab-quvvatlanmaydi
+
     logging.info("Bot ishga tushdi (polling rejimida)")
     try:
-        await dp.start_polling(bot)
+        polling_task = asyncio.create_task(dp.start_polling(bot))
+        stop_task = asyncio.create_task(stop_event.wait())
+        await asyncio.wait({polling_task, stop_task}, return_when=asyncio.FIRST_COMPLETED)
+        if not polling_task.done():
+            logging.info("To'xtatish signali qabul qilindi — polling yakunlanmoqda...")
+            await dp.stop_polling()
+            polling_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await polling_task
     finally:
         # Server to'xtatilganda (Render/VPS restart, deploy, Ctrl+C) ochiq
         # ulanishlarni tartibli yopamiz — aks holda Postgres'da "idle"
