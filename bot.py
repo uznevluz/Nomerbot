@@ -15,6 +15,7 @@ import re
 import signal
 import time
 import uuid
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 import aiohttp
@@ -243,6 +244,13 @@ async def init_db():
             await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS country TEXT")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by BIGINT")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_earnings BIGINT NOT NULL DEFAULT 0")
+            # target_username / qty: 'stars' va 'premium' buyurtmalarida kimga
+            # va qancha (Stars soni yoki Premium oy soni) sotib olinganini
+            # saqlaydi — "oxirgi buyurtmani takrorlash" funksiyasi uchun kerak
+            # (SmmUpper javobida bu qiymatlar har doim aks etishiga tayanib
+            # bo'lmaydi, shuning uchun o'zimiz alohida saqlaymiz).
+            await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS target_username TEXT")
+            await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS qty INTEGER")
     else:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.executescript(_SCHEMA_SQLITE)
@@ -256,6 +264,14 @@ async def init_db():
                 pass
             try:
                 await db.execute("ALTER TABLE users ADD COLUMN referral_earnings INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass
+            try:
+                await db.execute("ALTER TABLE orders ADD COLUMN target_username TEXT")
+            except Exception:
+                pass
+            try:
+                await db.execute("ALTER TABLE orders ADD COLUMN qty INTEGER")
             except Exception:
                 pass
             await db.commit()
@@ -466,22 +482,27 @@ async def find_user(identifier: str) -> Optional[dict]:
 
 async def create_order(user_id: int, order_type: str, ref: Optional[str], server: Optional[int],
                         price: int, details: dict, status: str = "processing",
-                        country: Optional[str] = None) -> int:
+                        country: Optional[str] = None, target_username: Optional[str] = None,
+                        qty: Optional[int] = None) -> int:
     details_json = json.dumps(details, ensure_ascii=False)
     if _PG:
         async with _pool.acquire() as conn:
             row = await conn.fetchrow(
-                "INSERT INTO orders (user_id, order_type, ref, server, status, price, details, country, created_at) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
-                user_id, order_type, ref, server, status, price, details_json, country, int(time.time()),
+                "INSERT INTO orders (user_id, order_type, ref, server, status, price, details, country, "
+                "target_username, qty, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
+                user_id, order_type, ref, server, status, price, details_json, country,
+                target_username, qty, int(time.time()),
             )
             return row["id"]
     else:
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
-                "INSERT INTO orders (user_id, order_type, ref, server, status, price, details, country, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (user_id, order_type, ref, server, status, price, details_json, country, int(time.time())),
+                "INSERT INTO orders (user_id, order_type, ref, server, status, price, details, country, "
+                "target_username, qty, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (user_id, order_type, ref, server, status, price, details_json, country,
+                 target_username, qty, int(time.time())),
             )
             await db.commit()
             return cur.lastrowid
@@ -512,6 +533,70 @@ async def top_countries(limit: int = 10) -> list:
             )
             rows = await cur.fetchall()
             return [(r[0], r[1]) for r in rows]
+
+
+async def top_spenders(limit: int = 10) -> list:
+    """Eng ko'p pul sarflagan foydalanuvchilarni (jami to'lov, buyurtmalar
+    soni, username/ism bilan birga) kamayish tartibida qaytaradi. Faqat
+    bekor qilinmagan (status != 'refunded') buyurtmalar hisobga olinadi."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT o.user_id, COALESCE(SUM(o.price), 0) AS total, COUNT(*) AS cnt, "
+                "u.username AS username, u.full_name AS full_name "
+                "FROM orders o JOIN users u ON u.user_id = o.user_id "
+                "WHERE o.status != 'refunded' "
+                "GROUP BY o.user_id, u.username, u.full_name "
+                "ORDER BY total DESC LIMIT $1",
+                limit,
+            )
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT o.user_id, COALESCE(SUM(o.price), 0) AS total, COUNT(*) AS cnt, "
+                "u.username AS username, u.full_name AS full_name "
+                "FROM orders o JOIN users u ON u.user_id = o.user_id "
+                "WHERE o.status != 'refunded' "
+                "GROUP BY o.user_id, u.username, u.full_name "
+                "ORDER BY total DESC LIMIT ?",
+                (limit,),
+            )
+            return await cur.fetchall()
+
+
+async def daily_revenue(days: int = 7) -> list:
+    """Oxirgi `days` kunlik tushumni kun bo'yicha, eng eskisidan eng
+    yangisigacha, [(kun_str, summa), ...] ro'yxati sifatida qaytaradi
+    (kunlar Postgres/SQLite farqiga qaramay Python tomonida guruhlanadi,
+    shunda ikkala baza uchun ham bir xil ishlaydi)."""
+    since = int(time.time()) - days * 86400
+    if _PG:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT created_at, price FROM orders WHERE status != 'refunded' AND created_at >= $1",
+                since,
+            )
+            pairs = [(r["created_at"], r["price"]) for r in rows]
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT created_at, price FROM orders WHERE status != 'refunded' AND created_at >= ?",
+                (since,),
+            )
+            pairs = await cur.fetchall()
+
+    buckets: Dict[str, int] = {}
+    for created_at, price in pairs:
+        day = datetime.fromtimestamp(created_at).strftime("%m-%d")
+        buckets[day] = buckets.get(day, 0) + price
+
+    result = []
+    now = int(time.time())
+    for i in range(days - 1, -1, -1):
+        day = datetime.fromtimestamp(now - i * 86400).strftime("%m-%d")
+        result.append((day, buckets.get(day, 0)))
+    return result
 
 
 async def update_order_status(order_pk: int, status: str, details: Optional[dict] = None):
@@ -560,6 +645,24 @@ async def list_orders(user_id: int, limit: int = 10):
                 "SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit)
             )
             return await cur.fetchall()
+
+
+async def get_last_order(user_id: int):
+    """Foydalanuvchining ENG OXIRGI (turi qanday bo'lishidan qat'i nazar)
+    buyurtmasini qaytaradi — 'oxirgi buyurtmani takrorlash' funksiyasi
+    uchun. Topilmasa None."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            return await conn.fetchrow(
+                "SELECT * FROM orders WHERE user_id = $1 ORDER BY id DESC LIMIT 1", user_id
+            )
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,)
+            )
+            return await cur.fetchone()
 
 
 async def refund_order(order_pk: int, min_age_seconds: int = 0) -> Optional[dict]:
@@ -833,38 +936,46 @@ async def count_other_pending_topups(user_id: int, exclude_topup_id: int) -> int
 
 async def get_stats() -> dict:
     """Admin panel uchun umumiy statistika: foydalanuvchilar, buyurtmalar
-    (turlari bo'yicha), tushum va kutilayotgan to'ldirish so'rovlari."""
-    day_ago = int(time.time()) - 86400
+    (turlari bo'yicha), tushum (bugun/hafta/oy va turlar kesimida) va
+    kutilayotgan to'ldirish so'rovlari."""
+    now = int(time.time())
+    day_ago = now - 86400
+    week_ago = now - 7 * 86400
+    month_ago = now - 30 * 86400
     order_types = ("number", "stars", "premium")
 
     if _PG:
         async with _pool.acquire() as conn:
-            users_total = (await conn.fetchrow("SELECT COUNT(*) AS c FROM users"))["c"]
-            users_banned = (await conn.fetchrow(
-                "SELECT COUNT(*) AS c FROM users WHERE banned = TRUE"))["c"]
-            users_new_today = (await conn.fetchrow(
-                "SELECT COUNT(*) AS c FROM users WHERE created_at >= $1", day_ago))["c"]
-            balance_total = (await conn.fetchrow(
-                "SELECT COALESCE(SUM(balance), 0) AS s FROM users"))["s"]
+            async def scalar(query, *params):
+                row = await conn.fetchrow(query, *params)
+                val = row[0] if row else 0
+                return val if val is not None else 0
+
+            users_total = await scalar("SELECT COUNT(*) FROM users")
+            users_banned = await scalar("SELECT COUNT(*) FROM users WHERE banned = TRUE")
+            users_new_today = await scalar("SELECT COUNT(*) FROM users WHERE created_at >= $1", day_ago)
+            balance_total = await scalar("SELECT COALESCE(SUM(balance), 0) FROM users")
 
             orders_by_type = {}
+            revenue_by_type = {}
             for order_type in order_types:
-                row = await conn.fetchrow(
-                    "SELECT COUNT(*) AS c FROM orders WHERE order_type = $1", order_type
-                )
-                orders_by_type[order_type] = row["c"]
+                orders_by_type[order_type] = await scalar(
+                    "SELECT COUNT(*) FROM orders WHERE order_type = $1", order_type)
+                revenue_by_type[order_type] = await scalar(
+                    "SELECT COALESCE(SUM(price), 0) FROM orders WHERE order_type = $1 AND status != 'refunded'",
+                    order_type)
             orders_total = sum(orders_by_type.values())
-            orders_today = (await conn.fetchrow(
-                "SELECT COUNT(*) AS c FROM orders WHERE created_at >= $1", day_ago))["c"]
+            orders_today = await scalar("SELECT COUNT(*) FROM orders WHERE created_at >= $1", day_ago)
 
-            revenue_total = (await conn.fetchrow(
-                "SELECT COALESCE(SUM(price), 0) AS s FROM orders WHERE status != 'refunded'"))["s"]
-            revenue_today = (await conn.fetchrow(
-                "SELECT COALESCE(SUM(price), 0) AS s FROM orders "
-                "WHERE status != 'refunded' AND created_at >= $1", day_ago))["s"]
+            revenue_total = await scalar("SELECT COALESCE(SUM(price), 0) FROM orders WHERE status != 'refunded'")
+            revenue_today = await scalar(
+                "SELECT COALESCE(SUM(price), 0) FROM orders WHERE status != 'refunded' AND created_at >= $1", day_ago)
+            revenue_week = await scalar(
+                "SELECT COALESCE(SUM(price), 0) FROM orders WHERE status != 'refunded' AND created_at >= $1", week_ago)
+            revenue_month = await scalar(
+                "SELECT COALESCE(SUM(price), 0) FROM orders WHERE status != 'refunded' AND created_at >= $1", month_ago)
 
-            topups_pending = (await conn.fetchrow(
-                "SELECT COUNT(*) AS c FROM topups WHERE status = 'pending'"))["c"]
+            topups_pending = await scalar("SELECT COUNT(*) FROM topups WHERE status = 'pending'")
     else:
         async with aiosqlite.connect(DB_PATH) as db:
             async def scalar(query, params=()):
@@ -879,9 +990,13 @@ async def get_stats() -> dict:
             balance_total = await scalar("SELECT COALESCE(SUM(balance), 0) FROM users")
 
             orders_by_type = {}
+            revenue_by_type = {}
             for order_type in order_types:
                 orders_by_type[order_type] = await scalar(
                     "SELECT COUNT(*) FROM orders WHERE order_type = ?", (order_type,))
+                revenue_by_type[order_type] = await scalar(
+                    "SELECT COALESCE(SUM(price), 0) FROM orders WHERE order_type = ? AND status != 'refunded'",
+                    (order_type,))
             orders_total = sum(orders_by_type.values())
             orders_today = await scalar(
                 "SELECT COUNT(*) FROM orders WHERE created_at >= ?", (day_ago,))
@@ -891,6 +1006,12 @@ async def get_stats() -> dict:
             revenue_today = await scalar(
                 "SELECT COALESCE(SUM(price), 0) FROM orders "
                 "WHERE status != 'refunded' AND created_at >= ?", (day_ago,))
+            revenue_week = await scalar(
+                "SELECT COALESCE(SUM(price), 0) FROM orders "
+                "WHERE status != 'refunded' AND created_at >= ?", (week_ago,))
+            revenue_month = await scalar(
+                "SELECT COALESCE(SUM(price), 0) FROM orders "
+                "WHERE status != 'refunded' AND created_at >= ?", (month_ago,))
 
             topups_pending = await scalar(
                 "SELECT COUNT(*) FROM topups WHERE status = 'pending'")
@@ -905,6 +1026,9 @@ async def get_stats() -> dict:
         "orders_today": orders_today,
         "revenue_total": revenue_total,
         "revenue_today": revenue_today,
+        "revenue_week": revenue_week,
+        "revenue_month": revenue_month,
+        "revenue_by_type": revenue_by_type,
         "topups_pending": topups_pending,
     }
 
@@ -1093,6 +1217,8 @@ BTN_NUMBER = "\U0001F4F1 Raqam sotib olish"
 BTN_STARS = "\u2B50 Stars sotib olish"
 BTN_PREMIUM = "\U0001F48E Premium sotib olish"
 BTN_ORDERS = "\U0001F4CB Buyurtmalarim"
+BTN_CHECK_ORDER = "\U0001F50E Buyurtma ID orqali"
+BTN_REPEAT_ORDER = "\U0001F501 Oxirgini takrorlash"
 BTN_CANCEL = "\u274C Bekor qilish"
 BTN_CHECK_CODE = "\U0001F504 Kodni tekshirish"
 BTN_CONFIRM = "\u2705 Tasdiqlash"
@@ -1104,6 +1230,7 @@ REFERRAL_CASHBACK_PERCENT = 1  # taklif qilingan do'st balans to'ldirsa, shu foi
 RESERVED_TEXTS = {
     BTN_HELP, BTN_BALANCE, BTN_TOPUP, BTN_NUMBER,
     BTN_STARS, BTN_PREMIUM, BTN_ORDERS, BTN_CANCEL,
+    BTN_CHECK_ORDER, BTN_REPEAT_ORDER,
 }
 
 
@@ -1163,32 +1290,44 @@ def topup_approved_text(amount: int, balance: int) -> str:
 NO_ORDERS_YET = "Hali buyurtmalar yo'q."
 
 
-def channel_number_notice(buyer: str, country: str, price: int) -> str:
-    return (
-        f"\U0001F195 Yangi buyurtma \u2014 \U0001F4F1 Raqam\n"
-        f"\U0001F464 {buyer}\n"
-        f"\U0001F30D Davlat: {country}\n"
-        f"\U0001F4B5 Narx: {fmt_money(price)} so'm"
-    )
+def _mask_phone(number) -> str:
+    """Raqamni kanalga chiqarishdan oldin qisman yashiradi — oxirgi 4 ta
+    raqam '****' bilan almashtiriladi, qolgani ko'rinadi (masalan
+    +573159063519 -> +57315906****)."""
+    digits = re.sub(r"\D", "", str(number))
+    if not digits:
+        return str(number)
+    if len(digits) <= 4:
+        return "+" + "*" * len(digits)
+    return "+" + digits[:-4] + "*" * 4
+
+
+def channel_number_notice(buyer: str, country: str, price: int, number: str = "") -> str:
+    lines = [
+        f"\U0001F464 Xaridor: {buyer}",
+        f"\U0001F30E Mamlakat: {country_flag(country)} {country_display_name(country)}",
+    ]
+    if number:
+        lines.append(f"\U0001F4F2 Raqam: {_mask_phone(number)}")
+    lines.append(f"\U0001F4B0 To'lov: {fmt_money(price)} so'm")
+    return "\n".join(lines)
 
 
 def channel_stars_notice(buyer: str, target_username: str, amount: int, price: int) -> str:
     return (
-        f"\U0001F195 Yangi buyurtma \u2014 \u2B50 Stars\n"
-        f"\U0001F464 {buyer}\n"
+        f"\U0001F464 Xaridor: {buyer}\n"
         f"\U0001F3AF Kimga: @{target_username}\n"
-        f"\u2B50 Miqdor: {amount}\n"
-        f"\U0001F4B5 Narx: {fmt_money(price)} so'm"
+        f"\u2B50 Miqdor: {amount} Stars\n"
+        f"\U0001F4B0 To'lov: {fmt_money(price)} so'm"
     )
 
 
 def channel_premium_notice(buyer: str, target_username: str, months: int, price: int) -> str:
     return (
-        f"\U0001F195 Yangi buyurtma \u2014 \U0001F48E Premium\n"
-        f"\U0001F464 {buyer}\n"
+        f"\U0001F464 Xaridor: {buyer}\n"
         f"\U0001F3AF Kimga: @{target_username}\n"
         f"\U0001F4C5 Muddat: {months} oy\n"
-        f"\U0001F4B5 Narx: {fmt_money(price)} so'm"
+        f"\U0001F4B0 To'lov: {fmt_money(price)} so'm"
     )
 
 
@@ -1370,6 +1509,10 @@ def stats_text(s: dict) -> str:
         f"   {_TYPE_LABEL_STATS[k]}: {s['orders_by_type'].get(k, 0)}"
         for k in ("number", "stars", "premium")
     )
+    revenue_by_type_lines = "\n".join(
+        f"   {_TYPE_LABEL_STATS[k]}: {fmt_money(s['revenue_by_type'].get(k, 0))} so'm"
+        for k in ("number", "stars", "premium")
+    )
     return (
         f"\U0001F4CA Statistika\n\n"
         f"\U0001F465 Foydalanuvchilar\n"
@@ -1382,10 +1525,32 @@ def stats_text(s: dict) -> str:
         f"{by_type_lines}\n"
         f"   Bugun: {s['orders_today']}\n\n"
         f"\U0001F4B5 Tushum (refund qilinganlar hisobga olinmagan)\n"
-        f"   Jami: {fmt_money(s['revenue_total'])} so'm\n"
-        f"   Bugun: {fmt_money(s['revenue_today'])} so'm\n\n"
+        f"   Bugun: {fmt_money(s['revenue_today'])} so'm\n"
+        f"   Shu hafta (7 kun): {fmt_money(s['revenue_week'])} so'm\n"
+        f"   Shu oy (30 kun): {fmt_money(s['revenue_month'])} so'm\n"
+        f"   Jami: {fmt_money(s['revenue_total'])} so'm\n\n"
+        f"\U0001F4B5 Tur bo'yicha tushum (jami)\n"
+        f"{revenue_by_type_lines}\n\n"
         f"\u23F3 Kutilayotgan balans to'ldirish so'rovlari: {s['topups_pending']}"
     )
+
+
+def revenue_graph_text(daily: list) -> str:
+    """Kunlik tushumni ustunli (bar chart) ko'rinishida, oddiy Unicode
+    belgilar bilan chizadi — tashqi grafik kutubxonasi (masalan
+    matplotlib) talab qilinmaydi, shuning uchun har qanday serverda,
+    qo'shimcha o'rnatishsiz ishlayveradi."""
+    if not daily or all(v == 0 for _, v in daily):
+        return "\U0001F4C8 Kunlik tushum (oxirgi kunlar)\n\nHali ma'lumot yo'q."
+
+    max_val = max(v for _, v in daily) or 1
+    bar_width = 18
+    lines = ["\U0001F4C8 Kunlik tushum (oxirgi kunlar)\n"]
+    for day, value in daily:
+        filled = round((value / max_val) * bar_width) if max_val else 0
+        bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
+        lines.append(f"{day}  {bar}  {fmt_money(value)}")
+    return "\n".join(lines)
 
 
 # ==============================================================
@@ -1408,6 +1573,7 @@ def main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_ORDERS)],
             [KeyboardButton(text=BTN_NUMBER, style=STYLE_PRIMARY)],
             [KeyboardButton(text=BTN_STARS, style=STYLE_PRIMARY), KeyboardButton(text=BTN_PREMIUM, style=STYLE_PRIMARY)],
+            [KeyboardButton(text=BTN_REPEAT_ORDER), KeyboardButton(text=BTN_CHECK_ORDER)],
             [KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
@@ -1430,7 +1596,7 @@ def cancel_inline() -> InlineKeyboardMarkup:
 def number_type_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="\U0001F4F1 Oddiy raqam (SMS kod uchun)", callback_data="numtype:regular", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F510 Tayyor akkaunt (2FA parol bilan)", callback_data="numtype:ready", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="\U0001F510 Tayyor akkaunt", callback_data="numtype:ready", style=STYLE_PRIMARY)],
         [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
     ])
 
@@ -1706,6 +1872,17 @@ def admin_cancel_menu() -> InlineKeyboardMarkup:
     ])
 
 
+def stats_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="\U0001F3C6 Top userlar", callback_data="adm:topusers", style=STYLE_PRIMARY),
+            InlineKeyboardButton(text="\U0001F30D Top davlatlar", callback_data="adm:topcountries", style=STYLE_PRIMARY),
+        ],
+        [InlineKeyboardButton(text="\U0001F4C8 Grafik (7 kun)", callback_data="adm:graph", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="\u2B05\uFE0F Admin panelga qaytish", callback_data="adm:refresh", style=STYLE_DANGER)],
+    ])
+
+
 def users_admin_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="\U0001F50E Qidirish", callback_data="adm:find", style=STYLE_PRIMARY)],
@@ -1834,6 +2011,10 @@ class BuyPremium(StatesGroup):
 
 class HelpRequest(StatesGroup):
     message = State()
+
+
+class CheckOrder(StatesGroup):
+    order_id = State()
 
 
 class AdminPanel(StatesGroup):
@@ -2003,7 +2184,21 @@ async def notify_channel(bot, text: str):
     if not channel_id:
         return
     try:
-        await bot.send_message(channel_id, text)
+        username = (await bot.get_me()).username
+        dbl = "\u2550" * 18
+        thin = "\u2500" * 21
+        full_text = (
+            f"\u2554{dbl}\u2557\n"
+            "     \U0001F195 BUYURTMA\n"
+            f"\u255A{dbl}\u255D\n\n"
+            f"{text}\n\n"
+            f"\u256D{thin}\u256E\n"
+            "\U0001F916 Buyurtma manzili:\n"
+            f"\U0001F449 @{username}\n"
+            f"\u2570{thin}\u256F\n\n"
+            "\u2705 Tezkor \u2022 Qulay \u2022 Ishonchli"
+        )
+        await bot.send_message(channel_id, full_text)
     except Exception:
         pass
 
@@ -2612,7 +2807,7 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
     buyer = callback.from_user.full_name
     if callback.from_user.username:
         buyer += f" (@{callback.from_user.username})"
-    await notify_channel(bot, channel_number_notice(buyer, country, actual_price))
+    await notify_channel(bot, channel_number_notice(buyer, country, actual_price, number))
 
     sent = await callback.message.answer(
         f"\u2705 Raqam olindi: <code>{html.escape(str(number))}</code>\n"
@@ -2936,6 +3131,8 @@ async def confirm_stars(callback: CallbackQuery, state: FSMContext, bot):
         price=actual_price,
         details=result,
         status="processing",
+        target_username=username,
+        qty=amount,
     )
 
     buyer = callback.from_user.full_name
@@ -3003,7 +3200,10 @@ async def premium_username(message: Message, state: FSMContext):
 
     data = await state.get_data()
     months = data["months"]
+    await _process_premium_choice(message, state, username, months, message.from_user.id)
 
+
+async def _process_premium_choice(message: Message, state: FSMContext, username: str, months: int, user_id: int):
     try:
         prices = await client.get_prices()
         base_price = prices["premium"][str(months)]["price"]
@@ -3012,9 +3212,9 @@ async def premium_username(message: Message, state: FSMContext):
         return
 
     price = await with_markup(base_price)
-    balance = await get_balance(message.from_user.id)
+    balance = await get_balance(user_id)
 
-    await state.update_data(username=username, price=price)
+    await state.update_data(username=username, months=months, price=price)
     await state.set_state(BuyPremium.confirming)
 
     text = (
@@ -3073,6 +3273,8 @@ async def confirm_premium(callback: CallbackQuery, state: FSMContext, bot):
         price=actual_price,
         details=result,
         status="processing",
+        target_username=username,
+        qty=months,
     )
 
     buyer = callback.from_user.full_name
@@ -3160,6 +3362,132 @@ async def check_order(callback: CallbackQuery):
     status = result.get("status", row["status"])
     await update_order_status(order_pk, status, result)
     await callback.answer(f"Holat: {status}", show_alert=True)
+
+
+def _format_order_detail(row) -> str:
+    """Bitta buyurtmani (#ID bilan) batafsil ko'rinishda matnga aylantiradi —
+    '📋 Buyurtmalarim' ro'yxatidagi bitta qatorga o'xshash, lekin turi bo'yicha
+    qo'shimcha maydonlar (davlat / kimga / miqdor) bilan boyitilgan."""
+    status = row["status"]
+    lines = [
+        f"{_STATUS_EMOJI.get(status, '\u2754')} {_TYPE_LABEL.get(row['order_type'], row['order_type'])} \u2014 #{row['id']}",
+        f"Holat: {status}",
+        f"\U0001F4B0 Narx: {fmt_money(row['price'])} so'm",
+    ]
+    if row["order_type"] == "number" and row["country"]:
+        lines.append(f"\U0001F30E Davlat: {country_flag(row['country'])} {country_display_name(row['country'])}")
+    target_username = row["target_username"] if "target_username" in row.keys() else None
+    if target_username:
+        lines.append(f"\U0001F3AF Kimga: @{target_username}")
+    qty = row["qty"] if "qty" in row.keys() else None
+    if qty:
+        if row["order_type"] == "stars":
+            lines.append(f"\u2B50 Miqdor: {qty}")
+        elif row["order_type"] == "premium":
+            lines.append(f"\U0001F4C5 Muddat: {qty} oy")
+    return "\n".join(lines)
+
+
+@router_orders.message(F.text == BTN_CHECK_ORDER)
+async def start_check_order(message: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(CheckOrder.order_id)
+    await message.answer(
+        "Buyurtma ID raqamini kiriting (masalan: 42) \u2014 bu \u00ab\U0001F4CB Buyurtmalarim\u00bb "
+        "ro'yxatida har bir buyurtma oldida \u00ab#\u00bb belgisi bilan ko'rsatilgan.",
+        reply_markup=cancel_inline(),
+    )
+
+
+@router_orders.message(CheckOrder.order_id, is_free_text)
+async def check_order_by_id(message: Message, state: FSMContext):
+    text = message.text.strip().lstrip("#")
+    if not text.isdigit():
+        await message.answer("Iltimos, faqat buyurtma raqamini (son) yuboring, masalan: 42")
+        return
+
+    order_pk = int(text)
+    row = await get_order_row(order_pk)
+    await state.clear()
+
+    if not row or row["user_id"] != message.from_user.id:
+        await message.answer(
+            f"\u274C #{order_pk} raqamli buyurtma topilmadi (yoki sizga tegishli emas).",
+            reply_markup=main_menu(),
+        )
+        return
+
+    markup = None
+    if row["status"] not in FINAL_STATUSES and row["ref"]:
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text="\U0001F504 Holatini tekshirish", callback_data=f"ordercheck:{row['id']}",
+        )]])
+    await message.answer(_format_order_detail(row), reply_markup=markup or main_menu())
+
+
+@router_orders.message(F.text == BTN_REPEAT_ORDER)
+async def repeat_last_order(message: Message, state: FSMContext):
+    """Foydalanuvchining eng oxirgi buyurtmasidagi davlat/mahsulotni
+    qayta tanlab, to'g'ridan-to'g'ri tasdiqlash bosqichiga olib boradi —
+    ogohlantirish/tur tanlash/ro'yxat bosqichlarini qayta bosish shart
+    emas. Narx har doim JORIY (joriy ustama bilan) qayta hisoblanadi —
+    eski buyurtmadagi narx emas, chunki narxlar/ustama o'shandan beri
+    o'zgargan bo'lishi mumkin."""
+    await state.clear()
+    row = await get_last_order(message.from_user.id)
+    if not row:
+        await message.answer("Sizda hali buyurtmalar tarixi yo'q. Avval biror narsa sotib oling.")
+        return
+
+    order_type = row["order_type"]
+    user_id = message.from_user.id
+
+    if order_type == "number":
+        if not row["server"] or not row["country"]:
+            await message.answer("Oxirgi buyurtma haqida yetarli ma'lumot yo'q, qaytadan \u00abRaqam sotib olish\u00bb orqali tanlang.")
+            return
+        try:
+            data = await client.available_countries(row["server"])
+            countries = data.get("countries") or {}
+        except SmmUpperError as e:
+            await message.answer(f"\u274C Narxlarni olib bo'lmadi: {e.message}")
+            return
+        info = countries.get(row["country"])
+        if not info:
+            await message.answer(
+                f"\u274C {country_display_name(row['country'])} uchun hozircha raqam yo'q. "
+                f"\u00abRaqam sotib olish\u00bb orqali boshqa davlat tanlang."
+            )
+            return
+
+        price = await with_markup(info.get("price", 0))
+        balance = await get_balance(user_id)
+        await state.update_data(server=row["server"], country=row["country"], countries=countries, price=price)
+        await state.set_state(BuyNumber.confirming)
+
+        text = (
+            f"\U0001F30D Davlat: {country_flag(row['country'])} {country_display_name(row['country'])}\n"
+            f"\U0001F4B5 Narx: {fmt_money(price)} so'm\n"
+            f"\U0001F4B0 Balansingiz: {fmt_money(balance)} so'm"
+        )
+        if balance < price:
+            await message.answer(text + "\n\n" + insufficient_balance(price, balance), reply_markup=balance_menu())
+            await state.clear()
+            return
+        await message.answer(text + "\n\nTasdiqlaysizmi?", reply_markup=confirm_menu("buynum:confirm"))
+
+    elif order_type == "stars":
+        if not row["target_username"] or not row["qty"]:
+            await message.answer("Oxirgi buyurtma haqida yetarli ma'lumot yo'q, qaytadan \u00abStars sotib olish\u00bb orqali tanlang.")
+            return
+        await state.update_data(username=row["target_username"])
+        await _process_stars_amount(message, state, row["qty"], user_id)
+
+    elif order_type == "premium":
+        if not row["target_username"] or not row["qty"]:
+            await message.answer("Oxirgi buyurtma haqida yetarli ma'lumot yo'q, qaytadan \u00abPremium sotib olish\u00bb orqali tanlang.")
+            return
+        await _process_premium_choice(message, state, row["target_username"], row["qty"], user_id)
 
 
 # ==============================================================
@@ -3829,7 +4157,56 @@ async def admin_stats(callback: CallbackQuery, state: FSMContext):
         return
     await state.clear()
     stats = await get_stats()
-    await callback.message.edit_text(stats_text(stats), reply_markup=admin_cancel_menu())
+    await callback.message.edit_text(stats_text(stats), reply_markup=stats_menu())
+    await callback.answer()
+
+
+@router_admin.callback_query(F.data == "adm:topusers")
+async def admin_top_users(callback: CallbackQuery):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    rows = await top_spenders(limit=10)
+    if not rows:
+        await callback.message.edit_text("\U0001F3C6 Hali buyurtmalar yo'q.", reply_markup=stats_menu())
+        await callback.answer()
+        return
+
+    lines = ["\U0001F3C6 Eng ko'p xarid qilgan userlar (jami to'lov bo'yicha)\n"]
+    for i, row in enumerate(rows, start=1):
+        name = row["full_name"] or "?"
+        if row["username"]:
+            name += f" (@{row['username']})"
+        lines.append(f"{i}. {name} \u2014 {fmt_money(row['total'])} so'm ({row['cnt']} ta buyurtma)")
+    await callback.message.edit_text("\n".join(lines), reply_markup=stats_menu())
+    await callback.answer()
+
+
+@router_admin.callback_query(F.data == "adm:topcountries")
+async def admin_top_countries(callback: CallbackQuery):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    rows = await top_countries(limit=10)
+    if not rows:
+        await callback.message.edit_text("\U0001F30D Hali raqam buyurtmalari yo'q.", reply_markup=stats_menu())
+        await callback.answer()
+        return
+
+    lines = ["\U0001F30D Eng ko'p sotilgan davlatlar (buyurtmalar soni bo'yicha)\n"]
+    for i, (code, cnt) in enumerate(rows, start=1):
+        lines.append(f"{i}. {country_flag(code)} {country_display_name(code)} \u2014 {cnt} ta")
+    await callback.message.edit_text("\n".join(lines), reply_markup=stats_menu())
+    await callback.answer()
+
+
+@router_admin.callback_query(F.data == "adm:graph")
+async def admin_graph(callback: CallbackQuery):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    daily = await daily_revenue(days=7)
+    await callback.message.edit_text(revenue_graph_text(daily), reply_markup=stats_menu())
     await callback.answer()
 
 
