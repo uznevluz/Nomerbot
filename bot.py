@@ -251,6 +251,14 @@ async def init_db():
             # bo'lmaydi, shuning uchun o'zimiz alohida saqlaymiz).
             await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS target_username TEXT")
             await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS qty INTEGER")
+            # last_flow_msg_id: foydalanuvchiga oxirgi marta yuborilgan "oqim
+            # tugagan" xabarning (masalan, "balans yetarli emas") message ID'si
+            # (bot faqat shaxsiy chatda ishlagani uchun chat_id == user_id,
+            # alohida ustun shart emas). Foydalanuvchi YANGI xarid oqimini
+            # boshlaganda, shu eski xabarning tugmalari avtomatik olib
+            # tashlanadi — ekranda ishlamaydigan eski tugmalar "yopishib"
+            # qolmasligi uchun.
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_flow_msg_id BIGINT")
     else:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.executescript(_SCHEMA_SQLITE)
@@ -272,6 +280,10 @@ async def init_db():
                 pass
             try:
                 await db.execute("ALTER TABLE orders ADD COLUMN qty INTEGER")
+            except Exception:
+                pass
+            try:
+                await db.execute("ALTER TABLE users ADD COLUMN last_flow_msg_id INTEGER")
             except Exception:
                 pass
             await db.commit()
@@ -380,6 +392,64 @@ async def change_balance(user_id: int, delta: int):
                 "UPDATE users SET balance = balance + ? WHERE user_id = ?", (delta, user_id)
             )
             await db.commit()
+
+
+async def set_last_flow_msg(user_id: int, message_id: Optional[int]):
+    """Foydalanuvchiga oxirgi marta yuborilgan "oqim tugadi" xabarining
+    (masalan, balans yetmasligi haqidagi) message ID'sini saqlaydi.
+    message_id=None berilsa — tozalaydi (masalan, xabar allaqachon
+    tozalangandan keyin)."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET last_flow_msg_id = $1 WHERE user_id = $2", message_id, user_id,
+            )
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                "UPDATE users SET last_flow_msg_id = ? WHERE user_id = ?", (message_id, user_id),
+            )
+            await db.commit()
+
+
+async def get_last_flow_msg(user_id: int) -> Optional[int]:
+    if _PG:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT last_flow_msg_id FROM users WHERE user_id = $1", user_id)
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("SELECT last_flow_msg_id FROM users WHERE user_id = ?", (user_id,))
+            row = await cur.fetchone()
+    return row[0] if row else None
+
+
+async def track_flow_msg(message) -> None:
+    """Yuborilgan/tahrirlangan xabarni "hozirgi faol oqim xabari" sifatida
+    belgilaydi. `insufficient_balance` kabi "oqim shu yerda to'xtaydi"
+    xabarlaridan keyin chaqiriladi — shunda foydalanuvchi keyinroq YANGI
+    xarid oqimini boshlasa, shu xabar avtomatik "tozalanadi" (tugmalari
+    olib tashlanadi). Bot faqat shaxsiy chatda ishlagani uchun
+    message.chat.id — bu aynan shu foydalanuvchining user_id'si."""
+    if message is not None:
+        await set_last_flow_msg(message.chat.id, message.message_id)
+
+
+async def clear_stale_flow_message(bot, user_id: int) -> None:
+    """Foydalanuvchi YANGI xarid oqimini (Raqam/Stars/Premium/Balans
+    to'ldirish) boshlaganda chaqiriladi: agar oldingi, "tugagan" oqimdan
+    qolgan xabar bo'lsa, uning tugmalarini olib tashlaydi — shunda eski,
+    endi ishlamaydigan tugmalar chatda abadiy osilib qolmaydi. Xabarning
+    o'zi (matni) qoladi — faqat tugmalar tozalanadi, chunki matnni
+    o'chirish/tahrirlash bu yerda shart emas va xavfliroq (masalan, xabar
+    juda eski bo'lsa Telegram tahrirlashga ruxsat bermaydi)."""
+    message_id = await get_last_flow_msg(user_id)
+    if not message_id:
+        return
+    try:
+        await bot.edit_message_reply_markup(chat_id=user_id, message_id=message_id, reply_markup=None)
+    except Exception:
+        pass
+    await set_last_flow_msg(user_id, None)
 
 
 async def try_deduct_balance(user_id: int, amount: int) -> bool:
@@ -1221,7 +1291,7 @@ BTN_CHECK_ORDER = "\U0001F50E Buyurtma ID orqali"
 BTN_REPEAT_ORDER = "\U0001F501 Oxirgini takrorlash"
 BTN_CANCEL = "\u274C Bekor qilish"
 BTN_CHECK_CODE = "\U0001F504 Kodni tekshirish"
-BTN_CONFIRM = "\u2705 Tasdiqlash"
+BTN_CONFIRM = "\u2705 Sotib olish"
 
 REFERRAL_CASHBACK_PERCENT = 1  # taklif qilingan do'st balans to'ldirsa, shu foizi taklif qilgan odamga keshbek sifatida qo'shiladi
 
@@ -1257,12 +1327,18 @@ def referral_text(link: str, invited: int = 0, earned: int = 0) -> str:
 
 def insufficient_balance(price: int, balance: int) -> str:
     return (
-        f"\u274C Balansingiz yetarli emas. "
-        f"Kerakli summa: {fmt_money(price)} so'm, sizda: {fmt_money(balance)} so'm."
+        f"\u274C Balans yetarli emas!\n"
+        f"\U0001F4B0 Kerakli summa: {fmt_money(price)} so'm\n"
+        f"\U0001F4B3 Sizning balansingiz: {fmt_money(balance)} so'm\n"
+        f"Balansingizni to'ldirib, qaytadan urinib ko'ring."
     )
 
 
-TOPUP_ASK_AMOUNT = "Necha so'mga balansni to'ldirmoqchisiz? Summani kiriting (masalan: 50000)."
+MIN_TOPUP = 5000
+TOPUP_ASK_AMOUNT = (
+    "Necha so'mga balansni to'ldirmoqchisiz? Summani kiriting (masalan: 50000).\n"
+    "Eng kam summa: " + fmt_money(MIN_TOPUP) + " so'm."
+)
 TOPUP_NOT_A_NUMBER = "Iltimos, faqat musbat son kiriting. Masalan: 50000"
 
 
@@ -1609,7 +1685,7 @@ NUMBER_PURCHASE_WARNING = (
     "\u274C Rasmiy Telegram ilovasidan foydalanmang\n"
     "\u2705 Ishonchli, norasmiy ilovadan foydalaning\n"
     "\u2764\uFE0F Maslahat: Telegraph\n\n"
-    "2\uFE0F\u20E3 Sarflangan pul QAYTARILMAYDI. \"Tasdiqlash\"ni bossangiz, "
+    "2\uFE0F\u20E3 Sarflangan pul QAYTARILMAYDI. \"Sotib olish\"ni bossangiz, "
     "buyurtma darhol amalga oshadi.\n\n"
     "3\uFE0F\u20E3 Kirish kodi va 2FA parol bexato keladi. Kod kelmasa \u2014 "
     "aloqangizni almashtiring (Wi-Fi \u2194 mobil internet).\n\n"
@@ -2415,7 +2491,8 @@ async def show_balance(message: Message, state: FSMContext):
 
 
 @router_balance.callback_query(F.data == "topup:start")
-async def topup_start(callback: CallbackQuery, state: FSMContext):
+async def topup_start(callback: CallbackQuery, state: FSMContext, bot):
+    await clear_stale_flow_message(bot, callback.from_user.id)
     await state.set_state(TopUp.amount)
     await callback.message.edit_text(TOPUP_ASK_AMOUNT, reply_markup=cancel_inline())
     await callback.answer()
@@ -2438,6 +2515,10 @@ async def topup_amount(message: Message, state: FSMContext):
         return
 
     amount = int(text)
+    if amount < MIN_TOPUP:
+        await message.answer(f"\u274C Eng kam to'ldirish summasi: {fmt_money(MIN_TOPUP)} so'm. Qayta kiriting.")
+        return
+
     await state.update_data(amount=amount)
     await state.set_state(TopUp.photo)
     card_number, card_holder = await get_card_info()
@@ -2500,8 +2581,9 @@ _background_tasks: set = set()
 
 
 @router_numbers.message(F.text == BTN_NUMBER)
-async def start_number_flow(message: Message, state: FSMContext):
+async def start_number_flow(message: Message, state: FSMContext, bot):
     await state.clear()
+    await clear_stale_flow_message(bot, message.from_user.id)
     await message.answer(NUMBER_PURCHASE_WARNING, reply_markup=number_warning_menu())
 
 
@@ -2743,13 +2825,14 @@ async def choose_country(callback: CallbackQuery, state: FSMContext):
     )
 
     if balance < price:
-        await callback.message.edit_text(text + "\n\n" + insufficient_balance(price, balance),
-                                          reply_markup=balance_menu())
+        sent = await callback.message.edit_text(text + "\n\n" + insufficient_balance(price, balance),
+                                                  reply_markup=balance_menu())
+        await track_flow_msg(sent)
         await state.clear()
         await callback.answer()
         return
 
-    await callback.message.edit_text(text + "\n\nTasdiqlaysizmi?", reply_markup=confirm_menu("buynum:confirm"))
+    await callback.message.edit_text(text + "\n\n\U0001F4F1 Ushbu raqamni sotib olishni tasdiqlaysizmi?", reply_markup=confirm_menu("buynum:confirm"))
     await callback.answer()
 
 
@@ -2771,7 +2854,8 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
     # mumkin bo'lardi.
     if not await try_deduct_balance(callback.from_user.id, est_price):
         balance = await get_balance(callback.from_user.id)
-        await callback.message.answer(insufficient_balance(est_price, balance))
+        sent = await callback.message.answer(insufficient_balance(est_price, balance), reply_markup=balance_menu())
+        await track_flow_msg(sent)
         await state.clear()
         await callback.answer()
         return
@@ -2810,9 +2894,11 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
     await notify_channel(bot, channel_number_notice(buyer, country, actual_price, number))
 
     sent = await callback.message.answer(
-        f"\u2705 Raqam olindi: <code>{html.escape(str(number))}</code>\n"
-        f"\U0001F4B5 Narx: {fmt_money(actual_price)} so'm\n\n"
-        f"\u23F3 SMS kod kutilmoqda...",
+        f"\u2705 Raqam muvaffaqiyatli olindi!\n"
+        f"\U0001F4F1 Raqam: <code>{html.escape(str(number))}</code>\n"
+        f"\U0001F4B5 Narx: {fmt_money(actual_price)} so'm\n"
+        f"\u23F3 SMS tasdiqlash kodi kutilmoqda...\n"
+        f"Iltimos, biroz kuting.",
         reply_markup=check_code_menu(order_pk),
         parse_mode="HTML",
     )
@@ -2859,9 +2945,9 @@ async def _poll_code(bot, user_id: int, order_pk: int, server: int, result: dict
         if data.get("success"):
             code = data.get("code", "?")
             password = data.get("password") or ""
-            text = f"\u2705 SMS kod keldi: <code>{html.escape(str(code))}</code>"
+            text = f"\u2705 SMS kodi qabul qilindi!\n\U0001F522 Kod: <code>{html.escape(str(code))}</code>"
             if password:
-                text += f"\n\U0001F511 2FA parol: <code>{html.escape(str(password))}</code>"
+                text += f"\n\U0001F510 2FA parol: <code>{html.escape(str(password))}</code>"
             await update_order_status(order_pk, "done", {**result, "code": code, "password": password})
             await _clear_buttons(bot, user_id, purchase_message_id)
             try:
@@ -2911,9 +2997,9 @@ async def manual_check_code(callback: CallbackQuery):
         # Popup alert (show_alert) matnni nusxalashga imkon bermaydi — shuning
         # uchun kodni alohida, <code> bilan formatlangan xabar sifatida
         # yuboramiz, bosib nusxa olish uchun.
-        text = f"\u2705 Kod: <code>{html.escape(str(code))}</code>"
+        text = f"\u2705 SMS kodi qabul qilindi!\n\U0001F522 Kod: <code>{html.escape(str(code))}</code>"
         if password:
-            text += f"\n\U0001F511 2FA parol: <code>{html.escape(str(password))}</code>"
+            text += f"\n\U0001F510 2FA parol: <code>{html.escape(str(password))}</code>"
         await callback.answer()
         await callback.message.answer(text, parse_mode="HTML")
     else:
@@ -2996,8 +3082,9 @@ MIN_STARS = 50
 
 
 @router_stars.message(F.text == BTN_STARS)
-async def start_stars_flow(message: Message, state: FSMContext):
+async def start_stars_flow(message: Message, state: FSMContext, bot):
     await state.clear()
+    await clear_stale_flow_message(bot, message.from_user.id)
     await state.set_state(BuyStars.username)
     await message.answer(
         "Kimga Stars sotib olamiz? Telegram username kiriting (masalan: durov).",
@@ -3083,12 +3170,13 @@ async def _process_stars_amount(message: Message, state: FSMContext, amount: int
     )
 
     if balance < price:
-        await message.answer(text + "\n\n" + insufficient_balance(price, balance),
-                              reply_markup=balance_menu())
+        sent = await message.answer(text + "\n\n" + insufficient_balance(price, balance),
+                                     reply_markup=balance_menu())
+        await track_flow_msg(sent)
         await state.clear()
         return
 
-    await message.answer(text + "\n\nTasdiqlaysizmi?", reply_markup=confirm_menu("buystars:confirm"))
+    await message.answer(text + "\n\n\u2B50 Ushbu Starsni sotib olishni tasdiqlaysizmi?", reply_markup=confirm_menu("buystars:confirm"))
 
 
 @router_stars.callback_query(BuyStars.confirming, F.data == "buystars:confirm")
@@ -3105,7 +3193,8 @@ async def confirm_stars(callback: CallbackQuery, state: FSMContext, bot):
 
     if not await try_deduct_balance(callback.from_user.id, est_price):
         balance = await get_balance(callback.from_user.id)
-        await callback.message.answer(insufficient_balance(est_price, balance))
+        sent = await callback.message.answer(insufficient_balance(est_price, balance), reply_markup=balance_menu())
+        await track_flow_msg(sent)
         await state.clear()
         await callback.answer()
         return
@@ -3158,8 +3247,9 @@ router_premium = Router(name="premium")
 
 
 @router_premium.message(F.text == BTN_PREMIUM)
-async def start_premium_flow(message: Message, state: FSMContext):
+async def start_premium_flow(message: Message, state: FSMContext, bot):
     await state.clear()
+    await clear_stale_flow_message(bot, message.from_user.id)
 
     try:
         raw_prices = (await client.get_prices())["premium"]
@@ -3225,12 +3315,13 @@ async def _process_premium_choice(message: Message, state: FSMContext, username:
     )
 
     if balance < price:
-        await message.answer(text + "\n\n" + insufficient_balance(price, balance),
-                              reply_markup=balance_menu())
+        sent = await message.answer(text + "\n\n" + insufficient_balance(price, balance),
+                                     reply_markup=balance_menu())
+        await track_flow_msg(sent)
         await state.clear()
         return
 
-    await message.answer(text + "\n\nTasdiqlaysizmi?", reply_markup=confirm_menu("buyprem:confirm"))
+    await message.answer(text + "\n\n\U0001F48E Ushbu Premiumni sotib olishni tasdiqlaysizmi?", reply_markup=confirm_menu("buyprem:confirm"))
 
 
 @router_premium.callback_query(BuyPremium.confirming, F.data == "buyprem:confirm")
@@ -3247,7 +3338,8 @@ async def confirm_premium(callback: CallbackQuery, state: FSMContext, bot):
 
     if not await try_deduct_balance(callback.from_user.id, est_price):
         balance = await get_balance(callback.from_user.id)
-        await callback.message.answer(insufficient_balance(est_price, balance))
+        sent = await callback.message.answer(insufficient_balance(est_price, balance), reply_markup=balance_menu())
+        await track_flow_msg(sent)
         await state.clear()
         await callback.answer()
         return
@@ -3426,7 +3518,7 @@ async def check_order_by_id(message: Message, state: FSMContext):
 
 
 @router_orders.message(F.text == BTN_REPEAT_ORDER)
-async def repeat_last_order(message: Message, state: FSMContext):
+async def repeat_last_order(message: Message, state: FSMContext, bot):
     """Foydalanuvchining eng oxirgi buyurtmasidagi davlat/mahsulotni
     qayta tanlab, to'g'ridan-to'g'ri tasdiqlash bosqichiga olib boradi —
     ogohlantirish/tur tanlash/ro'yxat bosqichlarini qayta bosish shart
@@ -3434,6 +3526,7 @@ async def repeat_last_order(message: Message, state: FSMContext):
     eski buyurtmadagi narx emas, chunki narxlar/ustama o'shandan beri
     o'zgargan bo'lishi mumkin."""
     await state.clear()
+    await clear_stale_flow_message(bot, message.from_user.id)
     row = await get_last_order(message.from_user.id)
     if not row:
         await message.answer("Sizda hali buyurtmalar tarixi yo'q. Avval biror narsa sotib oling.")
@@ -3471,10 +3564,11 @@ async def repeat_last_order(message: Message, state: FSMContext):
             f"\U0001F4B0 Balansingiz: {fmt_money(balance)} so'm"
         )
         if balance < price:
-            await message.answer(text + "\n\n" + insufficient_balance(price, balance), reply_markup=balance_menu())
+            sent = await message.answer(text + "\n\n" + insufficient_balance(price, balance), reply_markup=balance_menu())
+            await track_flow_msg(sent)
             await state.clear()
             return
-        await message.answer(text + "\n\nTasdiqlaysizmi?", reply_markup=confirm_menu("buynum:confirm"))
+        await message.answer(text + "\n\n\U0001F4F1 Ushbu raqamni sotib olishni tasdiqlaysizmi?", reply_markup=confirm_menu("buynum:confirm"))
 
     elif order_type == "stars":
         if not row["target_username"] or not row["qty"]:
