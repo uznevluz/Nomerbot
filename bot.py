@@ -526,10 +526,13 @@ async def find_user(identifier: str) -> Optional[dict]:
             if not row:
                 return None
             orders_row = await conn.fetchrow(
-                "SELECT COUNT(*) AS c FROM orders WHERE user_id = $1", row["user_id"]
+                "SELECT COUNT(*) AS c, COALESCE(SUM(price) FILTER (WHERE status != 'refunded'), 0) AS total "
+                "FROM orders WHERE user_id = $1",
+                row["user_id"],
             )
             result = dict(row)
             result["order_count"] = orders_row["c"]
+            result["total_spent"] = orders_row["total"]
             return result
     else:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -543,10 +546,15 @@ async def find_user(identifier: str) -> Optional[dict]:
             row = await cur.fetchone()
             if not row:
                 return None
-            cur2 = await db.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (row["user_id"],))
+            cur2 = await db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status != 'refunded' THEN price ELSE 0 END), 0) "
+                "FROM orders WHERE user_id = ?",
+                (row["user_id"],),
+            )
             count_row = await cur2.fetchone()
             result = dict(row)
             result["order_count"] = count_row[0]
+            result["total_spent"] = count_row[1]
             return result
 
 
@@ -717,6 +725,28 @@ async def list_orders(user_id: int, limit: int = 10):
             return await cur.fetchall()
 
 
+async def get_recent_orders(limit: int = 15, status: Optional[str] = None) -> list:
+    """Admin uchun: BARCHA foydalanuvchilarning eng oxirgi buyurtmalari,
+    xohlasa muayyan status bo'yicha filtrlangan holda."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            if status:
+                return await conn.fetch(
+                    "SELECT * FROM orders WHERE status = $1 ORDER BY id DESC LIMIT $2", status, limit
+                )
+            return await conn.fetch("SELECT * FROM orders ORDER BY id DESC LIMIT $1", limit)
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            if status:
+                cur = await db.execute(
+                    "SELECT * FROM orders WHERE status = ? ORDER BY id DESC LIMIT ?", (status, limit)
+                )
+            else:
+                cur = await db.execute("SELECT * FROM orders ORDER BY id DESC LIMIT ?", (limit,))
+            return await cur.fetchall()
+
+
 async def get_last_order(user_id: int):
     """Foydalanuvchining ENG OXIRGI (turi qanday bo'lishidan qat'i nazar)
     buyurtmasini qaytaradi — 'oxirgi buyurtmani takrorlash' funksiyasi
@@ -801,14 +831,63 @@ async def get_topup(topup_id: int):
             return await cur.fetchone()
 
 
-async def set_topup_status(topup_id: int, status: str):
+async def get_pending_topups(limit: int = 15) -> list:
+    """Barcha kutilayotgan (pending) balans to'ldirish so'rovlarini,
+    foydalanuvchi ma'lumoti (username/ism) bilan birga, eng eskisidan
+    boshlab qaytaradi (birinchi bo'lib kelgan birinchi ko'rib chiqilsin)."""
     if _PG:
         async with _pool.acquire() as conn:
-            await conn.execute("UPDATE topups SET status = $1 WHERE id = $2", status, topup_id)
+            return await conn.fetch(
+                "SELECT t.id, t.user_id, t.amount, t.created_at, "
+                "u.username AS username, u.full_name AS full_name "
+                "FROM topups t LEFT JOIN users u ON u.user_id = t.user_id "
+                "WHERE t.status = 'pending' ORDER BY t.id ASC LIMIT $1",
+                limit,
+            )
     else:
         async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT t.id, t.user_id, t.amount, t.created_at, "
+                "u.username AS username, u.full_name AS full_name "
+                "FROM topups t LEFT JOIN users u ON u.user_id = t.user_id "
+                "WHERE t.status = 'pending' ORDER BY t.id ASC LIMIT ?",
+                (limit,),
+            )
+            return await cur.fetchall()
+
+
+async def set_topup_status(topup_id: int, status: str, expected_current: Optional[str] = None) -> bool:
+    """Topup holatini yangilaydi. `expected_current` berilsa — FAQAT topup
+    HOZIR aynan shu holatda (masalan 'pending') bo'lsagina yangilaydi, bitta
+    atomik amal bilan (tekshirish va yangilash bir vaqtda) — xuddi
+    `try_deduct_balance`dagi kabi. Bu ikki admin BIR XIL so'rovni deyarli bir
+    vaqtda tasdiqlashi orqali balans ikki marta qo'shilib ketishining oldini
+    oladi. Muvaffaqiyatli yangilansa True; `expected_current` berilgan-u,
+    lekin topup ALLAQACHON boshqa holatda bo'lsa (boshqa admin ulgurgan)
+    False qaytaradi."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            if expected_current is not None:
+                result = await conn.execute(
+                    "UPDATE topups SET status = $1 WHERE id = $2 AND status = $3",
+                    status, topup_id, expected_current,
+                )
+                return result.split()[-1] != "0"
+            await conn.execute("UPDATE topups SET status = $1 WHERE id = $2", status, topup_id)
+            return True
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            if expected_current is not None:
+                cur = await db.execute(
+                    "UPDATE topups SET status = ? WHERE id = ? AND status = ?",
+                    (status, topup_id, expected_current),
+                )
+                await db.commit()
+                return cur.rowcount > 0
             await db.execute("UPDATE topups SET status = ? WHERE id = ?", (status, topup_id))
             await db.commit()
+            return True
 
 
 async def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -1407,16 +1486,20 @@ def channel_premium_notice(buyer: str, target_username: str, months: int, price:
     )
 
 
-def admin_user_card(user: dict) -> str:
+def admin_user_card(user: dict, referral: Optional[dict] = None) -> str:
     banned = "\U0001F6AB Ha" if user.get("banned") else "Yo'q"
     username = f"@{user['username']}" if user.get("username") else "\u2014"
-    return (
-        f"\U0001F464 {user.get('full_name') or '\u2014'} ({username})\n"
-        f"\U0001F522 ID: {user['user_id']}\n"
-        f"\U0001F4B0 Balans: {fmt_money(user['balance'])} so'm\n"
-        f"\U0001F4E6 Buyurtmalar soni: {user.get('order_count', 0)}\n"
-        f"\U0001F6AB Bloklangan: {banned}"
-    )
+    lines = [
+        f"\U0001F464 {user.get('full_name') or '\u2014'} ({username})",
+        f"\U0001F522 ID: {user['user_id']}",
+        f"\U0001F4B0 Balans: {fmt_money(user['balance'])} so'm",
+        f"\U0001F4E6 Buyurtmalar soni: {user.get('order_count', 0)}",
+        f"\U0001F4B5 Jami xarid: {fmt_money(user.get('total_spent', 0))} so'm",
+    ]
+    if referral is not None:
+        lines.append(f"\U0001F381 Referallar: {referral.get('invited', 0)} ta (keshbek: {fmt_money(referral.get('earned', 0))} so'm)")
+    lines.append(f"\U0001F6AB Bloklangan: {banned}")
+    return "\n".join(lines)
 
 
 def balance_adjusted_by_admin(amount: int, new_balance: int) -> str:
@@ -1663,16 +1746,19 @@ def balance_menu() -> InlineKeyboardMarkup:
     ])
 
 
-def cancel_inline() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
-    ])
+def cancel_inline(back_callback: Optional[str] = None) -> InlineKeyboardMarkup:
+    rows = []
+    if back_callback:
+        rows.append(nav_row(back_callback))
+    rows.append([InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def number_type_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="\U0001F4F1 Oddiy raqam (SMS kod uchun)", callback_data="numtype:regular", style=STYLE_PRIMARY)],
         [InlineKeyboardButton(text="\U0001F510 Tayyor akkaunt", callback_data="numtype:ready", style=STYLE_PRIMARY)],
+        nav_row(),
         [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
     ])
 
@@ -1697,7 +1783,7 @@ NUMBER_PURCHASE_WARNING = (
 
 def number_warning_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=BTN_CONFIRM, callback_data="numwarn:confirm", style=STYLE_SUCCESS)],
+        [InlineKeyboardButton(text="\u2705 Tasdiqlash", callback_data="numwarn:confirm", style=STYLE_SUCCESS)],
         [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
     ])
 
@@ -1869,19 +1955,23 @@ def countries_menu(server: int, countries: dict, page: int = 0, *, mode: str = "
             InlineKeyboardButton(text="\U0001F4C9 Arzon davlatlar", callback_data=f"ctycpg:{server}:0", style=STYLE_PRIMARY),
         ])
         rows.append([InlineKeyboardButton(text="\U0001F50D Qidirish", callback_data=f"ctysearch:{server}", style=STYLE_PRIMARY)])
+        rows.append(nav_row(back_callback="numback:type"))
     elif mode == "search":
         rows.append([InlineKeyboardButton(text="\U0001F50D Qayta qidirish", callback_data=f"ctysearch:{server}", style=STYLE_PRIMARY)])
         rows.append([InlineKeyboardButton(text="\U0001F519 Ro'yxatga qaytish", callback_data=f"ctyback:{server}", style=STYLE_PRIMARY)])
+        rows.append(nav_row())
     else:  # "cheap"
         rows.append([InlineKeyboardButton(text="\U0001F519 Ro'yxatga qaytish", callback_data=f"ctyback:{server}", style=STYLE_PRIMARY)])
+        rows.append(nav_row())
 
     rows.append([InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def confirm_menu(confirm_data: str) -> InlineKeyboardMarkup:
+def confirm_menu(confirm_data: str, back_callback: Optional[str] = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=BTN_CONFIRM, callback_data=confirm_data, style=STYLE_SUCCESS)],
+        nav_row(back_callback),
         [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
     ])
 
@@ -1894,6 +1984,7 @@ def stars_amount_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="500", callback_data="starsamt:500", style=STYLE_PRIMARY),
         ],
         [InlineKeyboardButton(text="\u270F\uFE0F Boshqa summa", callback_data="starsamt:custom", style=STYLE_PRIMARY)],
+        nav_row(back_callback="starsback:username"),
         [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
     ])
 
@@ -1911,6 +2002,7 @@ def premium_months_menu(prices: Optional[Dict[int, int]] = None) -> InlineKeyboa
         [InlineKeyboardButton(text=label(3), callback_data="premmonths:3", style=STYLE_PRIMARY)],
         [InlineKeyboardButton(text=label(6), callback_data="premmonths:6", style=STYLE_PRIMARY)],
         [InlineKeyboardButton(text=label(12), callback_data="premmonths:12", style=STYLE_PRIMARY)],
+        nav_row(),
         [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
     ])
 
@@ -1929,6 +2021,10 @@ def admin_menu() -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(text="\U0001F465 Foydalanuvchilar", callback_data="adm:menu:users", style=STYLE_PRIMARY),
             InlineKeyboardButton(text="\U0001F4CA Statistika", callback_data="adm:stats", style=STYLE_PRIMARY),
+        ],
+        [
+            InlineKeyboardButton(text="\U0001F4B3 To'lovlar", callback_data="adm:payments", style=STYLE_PRIMARY),
+            InlineKeyboardButton(text="\U0001F6D2 Buyurtmalar", callback_data="adm:orders:menu", style=STYLE_PRIMARY),
         ],
         [
             InlineKeyboardButton(text="\u2699\uFE0F Sozlamalar", callback_data="adm:menu:settings", style=STYLE_PRIMARY),
@@ -1973,6 +2069,22 @@ def users_admin_menu() -> InlineKeyboardMarkup:
 
 def users_cancel_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\u2B05\uFE0F Foydalanuvchilar bo'limiga qaytish", callback_data="adm:menu:users", style=STYLE_DANGER)],
+    ])
+
+
+def admin_user_actions_menu(user_id: int, banned: bool) -> InlineKeyboardMarkup:
+    """Foydalanuvchi profili kartasi ostidagi tezkor amallar — ID'ni qayta
+    kiritmasdan, to'g'ridan-to'g'ri shu foydalanuvchi ustida ishlash uchun."""
+    ban_btn = (
+        InlineKeyboardButton(text="\u2705 Blokdan chiqarish", callback_data=f"adm:quickunban:{user_id}", style=STYLE_SUCCESS)
+        if banned else
+        InlineKeyboardButton(text="\U0001F6AB Bloklash", callback_data=f"adm:quickban:{user_id}", style=STYLE_DANGER)
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\U0001F4B0 Balans o'zgartirish", callback_data=f"adm:quickbalance:{user_id}", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="\U0001F6D2 Buyurtmalari", callback_data=f"adm:orders:user:{user_id}", style=STYLE_PRIMARY)],
+        [ban_btn],
         [InlineKeyboardButton(text="\u2B05\uFE0F Foydalanuvchilar bo'limiga qaytish", callback_data="adm:menu:users", style=STYLE_DANGER)],
     ])
 
@@ -2109,6 +2221,8 @@ class AdminPanel(StatesGroup):
     force_sub_url = State()
     refund_seconds = State()
     add_admin_id = State()
+    order_search_id = State()
+    order_search_user = State()
 
 
 # ==============================================================
@@ -2362,6 +2476,34 @@ async def force_sub_check(callback: CallbackQuery, bot):
         await callback.answer(FORCE_SUB_STILL_NOT, show_alert=True)
 
 
+@router_common.callback_query(F.data == "home")
+async def go_home(callback: CallbackQuery, state: FSMContext):
+    """"Bekor qilish"dan farqli o'laroq (bu "harakat to'xtatildi" deb
+    tuyuladi), bu tugma neytral — foydalanuvchi shunchaki bosh menyuga
+    qaytmoqchi bo'lganda ishlatiladi."""
+    await state.clear()
+    try:
+        await callback.message.edit_text("\U0001F3E0 Bosh menyu.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+    except Exception:
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.message.answer("\U0001F3E0 Bosh menyu.", reply_markup=main_menu())
+    await callback.answer()
+
+
+def nav_row(back_callback: Optional[str] = None) -> list:
+    """Har bir koʻp bosqichli menyuning oxiriga qoʻshiladigan
+    "⬅️ Orqaga" (agar shu bosqichdan oldingi bosqich boʻlsa) va
+    "🏠 Bosh sahifa" tugmalari qatori."""
+    row = []
+    if back_callback:
+        row.append(InlineKeyboardButton(text="\u2B05\uFE0F Orqaga", callback_data=back_callback, style=STYLE_PRIMARY))
+    row.append(InlineKeyboardButton(text="\U0001F3E0 Bosh sahifa", callback_data="home", style=STYLE_DANGER))
+    return row
+
+
 @router_common.callback_query(F.data == "cancel")
 async def cancel_any(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -2612,6 +2754,12 @@ async def _fetch_countries_with_fallback(primary_server: int, fallback_server: O
     return primary_server, {}
 
 
+@router_numbers.callback_query(F.data == "numback:type")
+async def number_back_to_type(callback: CallbackQuery):
+    await callback.message.edit_text("Qanday raqam kerak?", reply_markup=number_type_menu())
+    await callback.answer()
+
+
 @router_numbers.callback_query(F.data == "numtype:regular")
 async def choose_regular(callback: CallbackQuery, state: FSMContext):
     await callback.answer("Davlatlar yuklanmoqda...")
@@ -2832,7 +2980,21 @@ async def choose_country(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    await callback.message.edit_text(text + "\n\n\U0001F4F1 Ushbu raqamni sotib olishni tasdiqlaysizmi?", reply_markup=confirm_menu("buynum:confirm"))
+    await callback.message.edit_text(text + "\n\n\U0001F4F1 Ushbu raqamni sotib olishni tasdiqlaysizmi?", reply_markup=confirm_menu("buynum:confirm", back_callback="numback:country"))
+    await callback.answer()
+
+
+@router_numbers.callback_query(BuyNumber.confirming, F.data == "numback:country")
+async def number_back_to_country(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    server = data.get("server")
+    countries = data.get("countries")
+    if not server or not countries:
+        await callback.answer("Ro'yxatga qaytib bo'lmadi, qaytadan tanlang.", show_alert=True)
+        return
+    await state.set_state(BuyNumber.choosing_country)
+    percent = await get_markup_percent()
+    await callback.message.edit_text("Davlatni tanlang:", reply_markup=countries_menu(server, countries, markup_percent=percent))
     await callback.answer()
 
 
@@ -3092,6 +3254,39 @@ async def start_stars_flow(message: Message, state: FSMContext, bot):
     )
 
 
+@router_stars.callback_query(BuyStars.amount, F.data == "starsback:username")
+async def stars_back_to_username(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BuyStars.username)
+    await callback.message.edit_text(
+        "Kimga Stars sotib olamiz? Telegram username kiriting (masalan: durov).",
+        reply_markup=cancel_inline(),
+    )
+    await callback.answer()
+
+
+@router_stars.callback_query(BuyStars.confirming, F.data == "starsback:amount")
+async def stars_back_to_amount(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    username = data.get("username")
+    if not username:
+        await callback.answer("Orqaga qaytib bo'lmadi, qaytadan boshlang.", show_alert=True)
+        return
+    try:
+        prices = await client.get_prices()
+        percent = await get_markup_percent()
+        per_star = prices["stars"]["price_per_star"] * (1 + percent / 100)
+    except (SmmUpperError, KeyError) as e:
+        await callback.answer(f"Narxlarni olib bo'lmadi: {e}", show_alert=True)
+        return
+    await state.set_state(BuyStars.amount)
+    await callback.message.edit_text(
+        f"Nechta Stars? (min {MIN_STARS}, yoki summani yozib yuboring)\n"
+        f"\U0001F4B5 Narx: {per_star:.1f} so'm/Star",
+        reply_markup=stars_amount_menu(),
+    )
+    await callback.answer()
+
+
 @router_stars.message(BuyStars.username, is_free_text)
 async def stars_username(message: Message, state: FSMContext):
     username = message.text.strip().lstrip("@")
@@ -3176,7 +3371,7 @@ async def _process_stars_amount(message: Message, state: FSMContext, amount: int
         await state.clear()
         return
 
-    await message.answer(text + "\n\n\u2B50 Ushbu Starsni sotib olishni tasdiqlaysizmi?", reply_markup=confirm_menu("buystars:confirm"))
+    await message.answer(text + "\n\n\u2B50 Ushbu Starsni sotib olishni tasdiqlaysizmi?", reply_markup=confirm_menu("buystars:confirm", back_callback="starsback:amount"))
 
 
 @router_stars.callback_query(BuyStars.confirming, F.data == "buystars:confirm")
@@ -3277,7 +3472,37 @@ async def premium_months_choice(callback: CallbackQuery, state: FSMContext):
     await state.update_data(months=months)
     await state.set_state(BuyPremium.username)
     await callback.message.edit_text("Kimga? Telegram username kiriting (masalan: durov).",
-                                      reply_markup=cancel_inline())
+                                      reply_markup=cancel_inline(back_callback="premback:months"))
+    await callback.answer()
+
+
+@router_premium.callback_query(BuyPremium.username, F.data == "premback:months")
+async def premium_back_to_months(callback: CallbackQuery, state: FSMContext):
+    try:
+        raw_prices = (await client.get_prices())["premium"]
+        prices: Dict[int, int] = {}
+        for m in (3, 6, 12):
+            prices[m] = await with_markup(raw_prices[str(m)]["price"])
+    except (SmmUpperError, KeyError) as e:
+        await callback.answer(f"Narxlarni olib bo'lmadi: {e}", show_alert=True)
+        return
+    await state.set_state(BuyPremium.months)
+    text = (
+        "\U0001F48E Narxlar:\n"
+        f"\u2022 3 oy: {fmt_money(prices[3])} so'm\n"
+        f"\u2022 6 oy: {fmt_money(prices[6])} so'm\n"
+        f"\u2022 12 oy: {fmt_money(prices[12])} so'm\n\n"
+        "Necha oylik Premium kerak?"
+    )
+    await callback.message.edit_text(text, reply_markup=premium_months_menu(prices))
+    await callback.answer()
+
+
+@router_premium.callback_query(BuyPremium.confirming, F.data == "premback:username")
+async def premium_back_to_username(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(BuyPremium.username)
+    await callback.message.edit_text("Kimga? Telegram username kiriting (masalan: durov).",
+                                      reply_markup=cancel_inline(back_callback="premback:months"))
     await callback.answer()
 
 
@@ -3321,7 +3546,7 @@ async def _process_premium_choice(message: Message, state: FSMContext, username:
         await state.clear()
         return
 
-    await message.answer(text + "\n\n\U0001F48E Ushbu Premiumni sotib olishni tasdiqlaysizmi?", reply_markup=confirm_menu("buyprem:confirm"))
+    await message.answer(text + "\n\n\U0001F48E Ushbu Premiumni sotib olishni tasdiqlaysizmi?", reply_markup=confirm_menu("buyprem:confirm", back_callback="premback:username"))
 
 
 @router_premium.callback_query(BuyPremium.confirming, F.data == "buyprem:confirm")
@@ -3456,16 +3681,20 @@ async def check_order(callback: CallbackQuery):
     await callback.answer(f"Holat: {status}", show_alert=True)
 
 
-def _format_order_detail(row) -> str:
+def _format_order_detail(row, include_buyer: bool = False) -> str:
     """Bitta buyurtmani (#ID bilan) batafsil ko'rinishda matnga aylantiradi —
     '📋 Buyurtmalarim' ro'yxatidagi bitta qatorga o'xshash, lekin turi bo'yicha
-    qo'shimcha maydonlar (davlat / kimga / miqdor) bilan boyitilgan."""
+    qo'shimcha maydonlar (davlat / kimga / miqdor) bilan boyitilgan.
+    include_buyer=True bo'lsa (admin panelida), buyurtma kimniki ekanini
+    ham (user_id) qo'shadi."""
     status = row["status"]
     lines = [
         f"{_STATUS_EMOJI.get(status, '\u2754')} {_TYPE_LABEL.get(row['order_type'], row['order_type'])} \u2014 #{row['id']}",
-        f"Holat: {status}",
-        f"\U0001F4B0 Narx: {fmt_money(row['price'])} so'm",
     ]
+    if include_buyer:
+        lines.append(f"\U0001F464 Foydalanuvchi ID: {row['user_id']}")
+    lines.append(f"Holat: {status}")
+    lines.append(f"\U0001F4B0 Narx: {fmt_money(row['price'])} so'm")
     if row["order_type"] == "number" and row["country"]:
         lines.append(f"\U0001F30E Davlat: {country_flag(row['country'])} {country_display_name(row['country'])}")
     target_username = row["target_username"] if "target_username" in row.keys() else None
@@ -3746,7 +3975,12 @@ async def admin_find_receive(message: Message, state: FSMContext, bot):
     if not user:
         await _panel_edit(bot, state, message, "Foydalanuvchi topilmadi.", users_cancel_menu())
     else:
-        await _panel_edit(bot, state, message, admin_user_card(user), users_cancel_menu())
+        referral = await get_referral_stats(user["user_id"])
+        await _panel_edit(
+            bot, state, message,
+            admin_user_card(user, referral),
+            admin_user_actions_menu(user["user_id"], bool(user.get("banned"))),
+        )
     await state.clear()
 
 
@@ -3760,6 +3994,48 @@ async def admin_balance_start(callback: CallbackQuery, state: FSMContext):
     await _ask(callback, state, AdminPanel.balance_id, ASK_BALANCE_ID, users_cancel_menu())
 
 
+@router_admin.callback_query(F.data.startswith("adm:quickbalance:"))
+async def admin_quick_balance(callback: CallbackQuery, state: FSMContext):
+    """Profil kartasidan to'g'ridan-to'g'ri — ID qayta kiritilmaydi,
+    darhol summa so'raladi."""
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    target_id = int(callback.data.split(":")[2])
+    await state.update_data(target_id=target_id)
+    await _ask(callback, state, AdminPanel.balance_amount, ASK_BALANCE_AMOUNT, users_cancel_menu())
+
+
+@router_admin.callback_query(F.data.startswith("adm:quickban:"))
+async def admin_quick_ban(callback: CallbackQuery):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    target_id = int(callback.data.split(":")[2])
+    await set_banned(target_id, True)
+    await callback.answer(f"\U0001F6AB {target_id} bloklandi.", show_alert=True)
+    user = await find_user(str(target_id))
+    if user:
+        referral = await get_referral_stats(target_id)
+        await callback.message.edit_text(admin_user_card(user, referral),
+                                          reply_markup=admin_user_actions_menu(target_id, True))
+
+
+@router_admin.callback_query(F.data.startswith("adm:quickunban:"))
+async def admin_quick_unban(callback: CallbackQuery):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    target_id = int(callback.data.split(":")[2])
+    await set_banned(target_id, False)
+    await callback.answer(f"\u2705 {target_id} blokdan chiqarildi.", show_alert=True)
+    user = await find_user(str(target_id))
+    if user:
+        referral = await get_referral_stats(target_id)
+        await callback.message.edit_text(admin_user_card(user, referral),
+                                          reply_markup=admin_user_actions_menu(target_id, False))
+
+
 @router_admin.message(AdminPanel.balance_id, is_free_text)
 async def admin_balance_id_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
@@ -3767,6 +4043,17 @@ async def admin_balance_id_receive(message: Message, state: FSMContext, bot):
     text = message.text.strip()
     if not text.isdigit():
         await _panel_edit(bot, state, message, NOT_A_VALID_ID, users_cancel_menu())
+        return
+    # Muhim: ID raqam ekanini tekshirish YETARLI EMAS — bunday ID umuman
+    # mavjud bo'lmasligi mumkin (masalan xato yozilgan). Foydalanuvchi
+    # topilmasa, change_balance() baribir "muvaffaqiyatli" ishlab, aslida
+    # HECH NARSANI o'zgartirmasdan jim qoladi (0 qator yangilanadi) — admin
+    # esa buni "balans 0 so'm bo'ldi" deb noto'g'ri tushunishi mumkin edi.
+    target = await find_user(text)
+    if not target:
+        await _panel_edit(bot, state, message,
+                           f"\u274C {text} ID'li foydalanuvchi topilmadi. Qayta kiriting.",
+                           users_cancel_menu())
         return
     await state.update_data(target_id=int(text))
     await state.set_state(AdminPanel.balance_amount)
@@ -3818,6 +4105,11 @@ async def admin_ban_receive(message: Message, state: FSMContext, bot):
     if not text.isdigit():
         await _panel_edit(bot, state, message, NOT_A_VALID_ID, users_cancel_menu())
         return
+    if not await find_user(text):
+        await _panel_edit(bot, state, message,
+                           f"\u274C {text} ID'li foydalanuvchi topilmadi. Qayta kiriting.",
+                           users_cancel_menu())
+        return
     user_id = int(text)
     await set_banned(user_id, True)
     await _panel_edit(bot, state, message, f"\U0001F6AB {user_id} bloklandi.", users_cancel_menu())
@@ -3839,6 +4131,11 @@ async def admin_unban_receive(message: Message, state: FSMContext, bot):
     text = message.text.strip()
     if not text.isdigit():
         await _panel_edit(bot, state, message, NOT_A_VALID_ID, users_cancel_menu())
+        return
+    if not await find_user(text):
+        await _panel_edit(bot, state, message,
+                           f"\u274C {text} ID'li foydalanuvchi topilmadi. Qayta kiriting.",
+                           users_cancel_menu())
         return
     user_id = int(text)
     await set_banned(user_id, False)
@@ -4304,7 +4601,168 @@ async def admin_graph(callback: CallbackQuery):
     await callback.answer()
 
 
+# ---------- To'lovlar paneli (barcha kutilayotgan so'rovlar ro'yxati) ----------
+
+@router_admin.callback_query(F.data == "adm:payments")
+async def admin_payments_panel(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    await state.clear()
+    rows = await get_pending_topups(limit=15)
+    if not rows:
+        await callback.message.edit_text("\U0001F4B3 Kutilayotgan to'lov so'rovlari yo'q.", reply_markup=admin_cancel_menu())
+        await callback.answer()
+        return
+
+    lines = [f"\U0001F4B3 Kutilayotgan to'lovlar: {len(rows)}\n"]
+    keyboard = []
+    for row in rows:
+        name = row["full_name"] or "\u2014"
+        if row["username"]:
+            name += f" (@{row['username']})"
+        lines.append(f"\U0001F464 {name} \u2014 {fmt_money(row['amount'])} so'm (#{row['id']})")
+        keyboard.append([
+            InlineKeyboardButton(text=f"\u2705 #{row['id']}", callback_data=f"topup:approve:{row['id']}", style=STYLE_SUCCESS),
+            InlineKeyboardButton(text=f"\u274C #{row['id']}", callback_data=f"topup:reject:{row['id']}", style=STYLE_DANGER),
+        ])
+    keyboard.append([InlineKeyboardButton(text="\U0001F504 Yangilash", callback_data="adm:payments", style=STYLE_PRIMARY)])
+    keyboard.append([InlineKeyboardButton(text="\u2B05\uFE0F Admin panelga qaytish", callback_data="adm:refresh", style=STYLE_DANGER)])
+
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    await callback.answer()
+
+
+# ---------- Buyurtmalarni boshqarish paneli ----------
+
+def orders_admin_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\U0001F50D ID orqali qidirish", callback_data="adm:orders:findid", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="\U0001F464 User ID orqali", callback_data="adm:orders:finduser", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="\U0001F4CB Oxirgi buyurtmalar", callback_data="adm:orders:recent", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="\u2B05\uFE0F Admin panelga qaytish", callback_data="adm:refresh", style=STYLE_DANGER)],
+    ])
+
+
+def orders_cancel_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="\u2B05\uFE0F Buyurtmalar bo'limiga qaytish", callback_data="adm:orders:menu", style=STYLE_DANGER)],
+    ])
+
+
+def _orders_compact_list(rows, header: str) -> str:
+    if not rows:
+        return header + "\n\nHech narsa topilmadi."
+    lines = [header + "\n"]
+    for row in rows:
+        emoji = _STATUS_EMOJI.get(row["status"], "\u2754")
+        type_label = _TYPE_LABEL.get(row["order_type"], row["order_type"])
+        lines.append(f"{emoji} #{row['id']} \u2014 {type_label} \u2014 {fmt_money(row['price'])} so'm \u2014 {row['status']}")
+    return "\n".join(lines)
+
+
+@router_admin.callback_query(F.data == "adm:orders:menu")
+async def admin_orders_menu(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text("\U0001F6D2 Buyurtmalarni boshqarish", reply_markup=orders_admin_menu())
+    await callback.answer()
+
+
+@router_admin.callback_query(F.data == "adm:orders:recent")
+async def admin_orders_recent(callback: CallbackQuery):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    rows = await get_recent_orders(limit=15)
+    text = _orders_compact_list(rows, "\U0001F4CB Oxirgi 15 ta buyurtma (barcha userlar)")
+    await callback.message.edit_text(text, reply_markup=orders_cancel_menu())
+    await callback.answer()
+
+
+@router_admin.callback_query(F.data == "adm:orders:findid")
+async def admin_orders_findid_start(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    await _ask(callback, state, AdminPanel.order_search_id,
+               "Buyurtma ID raqamini kiriting (masalan: 42):", orders_cancel_menu())
+
+
+@router_admin.message(AdminPanel.order_search_id, is_free_text)
+async def admin_orders_findid_receive(message: Message, state: FSMContext, bot):
+    if not await _is_admin(message.from_user.id):
+        return
+    text = message.text.strip().lstrip("#")
+    if not text.isdigit():
+        await _panel_edit(bot, state, message, "Iltimos, faqat raqam yuboring.", orders_cancel_menu())
+        return
+    row = await get_order_row(int(text))
+    await state.clear()
+    if not row:
+        await _panel_edit(bot, state, message, f"\u274C #{text} raqamli buyurtma topilmadi.", orders_cancel_menu())
+        return
+    await _panel_edit(bot, state, message, _format_order_detail(row, include_buyer=True), orders_cancel_menu())
+
+
+@router_admin.callback_query(F.data == "adm:orders:finduser")
+async def admin_orders_finduser_start(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    await _ask(callback, state, AdminPanel.order_search_user,
+               "Foydalanuvchi ID raqamini kiriting:", orders_cancel_menu())
+
+
+@router_admin.message(AdminPanel.order_search_user, is_free_text)
+async def admin_orders_finduser_receive(message: Message, state: FSMContext, bot):
+    if not await _is_admin(message.from_user.id):
+        return
+    text = message.text.strip()
+    if not text.isdigit():
+        await _panel_edit(bot, state, message, "Iltimos, faqat ID (raqam) yuboring.", orders_cancel_menu())
+        return
+    await state.clear()
+    rows = await list_orders(int(text), limit=15)
+    text_out = _orders_compact_list(rows, f"\U0001F6D2 {text} ID'li foydalanuvchining buyurtmalari")
+    await _panel_edit(bot, state, message, text_out, orders_cancel_menu())
+
+
+@router_admin.callback_query(F.data.startswith("adm:orders:user:"))
+async def admin_orders_by_user_direct(callback: CallbackQuery):
+    """Foydalanuvchi profili kartasidagi '🛒 Buyurtmalari' tugmasidan —
+    ID qayta kiritilmaydi."""
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    target_id = int(callback.data.split(":")[3])
+    rows = await list_orders(target_id, limit=15)
+    text_out = _orders_compact_list(rows, f"\U0001F6D2 {target_id} ID'li foydalanuvchining buyurtmalari")
+    await callback.message.edit_text(text_out, reply_markup=orders_cancel_menu())
+    await callback.answer()
+
+
 # ---------- Balansni to'ldirish so'rovlarini tasdiqlash / rad etish ----------
+
+async def _finalize_topup_message(callback: CallbackQuery, suffix: str):
+    """Ko'rib chiqilgan to'lov so'rovi xabarini yangilaydi. Xabar RASM
+    (skrinshot) bilan kelishi mumkin (individual bildirishnoma — caption
+    tahrirlanadi) yoki oddiy matn bo'lishi mumkin ("To'lovlar" ro'yxat
+    panelidan — matn tahrirlanadi). Xatolik chiqsa (masalan xabar juda
+    eski), adminga ta'sir qilmasligi uchun jimgina o'tkazib yuboriladi —
+    callback.answer() baribir tasdiqni ko'rsatadi."""
+    try:
+        if callback.message.photo:
+            old = callback.message.caption or ""
+            await callback.message.edit_caption(caption=old + suffix)
+        else:
+            old = callback.message.text or ""
+            await callback.message.edit_text(old + suffix)
+    except Exception:
+        pass
+
 
 @router_admin.callback_query(F.data.startswith("topup:approve:"))
 async def approve_topup(callback: CallbackQuery, bot):
@@ -4321,7 +4779,17 @@ async def approve_topup(callback: CallbackQuery, bot):
         await callback.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
         return
 
-    await set_topup_status(topup_id, "approved")
+    # Muhim: yuqoridagi tekshiruv (status != "pending") YOLG'IZ O'ZI yetarli
+    # emas — ikki admin xuddi shu so'rovni deyarli bir vaqtda bossa, ikkalasi
+    # ham shu tekshiruvdan "pending" holida o'tib ketishi mumkin edi. Shuning
+    # uchun status yangilashning O'ZI ham shartli va atomik: faqat topup HOZIR
+    # ham "pending" bo'lsagina "approved"ga o'tadi. Kimdir ulgurib bo'lgan
+    # bo'lsa (masalan boshqa admin), bu False qaytaradi va balans EKKI MARTA
+    # qo'shilmaydi.
+    if not await set_topup_status(topup_id, "approved", expected_current="pending"):
+        await callback.answer("Bu so'rovni aynan shu daqiqada boshqa admin ko'rib chiqdi.", show_alert=True)
+        return
+
     await change_balance(topup["user_id"], topup["amount"])
     new_balance = await get_balance(topup["user_id"])
 
@@ -4351,8 +4819,7 @@ async def approve_topup(callback: CallbackQuery, bot):
             except Exception:
                 pass
 
-    old_caption = callback.message.caption or ""
-    await callback.message.edit_caption(caption=old_caption + "\n\n\u2705 TASDIQLANDI")
+    await _finalize_topup_message(callback, "\n\n\u2705 TASDIQLANDI")
     await callback.answer("Tasdiqlandi \u2705")
 
 
@@ -4371,15 +4838,16 @@ async def reject_topup(callback: CallbackQuery, bot):
         await callback.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
         return
 
-    await set_topup_status(topup_id, "rejected")
+    if not await set_topup_status(topup_id, "rejected", expected_current="pending"):
+        await callback.answer("Bu so'rovni aynan shu daqiqada boshqa admin ko'rib chiqdi.", show_alert=True)
+        return
 
     try:
         await bot.send_message(topup["user_id"], TOPUP_REJECTED_USER)
     except Exception:
         pass
 
-    old_caption = callback.message.caption or ""
-    await callback.message.edit_caption(caption=old_caption + "\n\n\u274C RAD ETILDI")
+    await _finalize_topup_message(callback, "\n\n\u274C RAD ETILDI")
     await callback.answer("Rad etildi \u274C")
 
 
