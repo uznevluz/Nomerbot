@@ -35,6 +35,7 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     TelegramObject,
 )
 from aiohttp import web
@@ -230,6 +231,21 @@ CREATE TABLE IF NOT EXISTS support_threads (
 """
 
 
+@contextlib.asynccontextmanager
+async def _db_sqlite():
+    """SQLite ulanishini ochadi va har safar `busy_timeout`ni o'rnatadi.
+    Bu bot FSM holatini ham (har bir xabar/tugma bosishda!) shu bazaga
+    yozgani uchun, ko'p foydalanuvchi bir vaqtda yozsa, standart SQLite
+    "table is locked" xatosini darhol berib yuborishi mumkin edi —
+    busy_timeout esa shunday holatda darhol xato bermasdan, bir necha
+    soniya kutib, qulf ochilishini kutadi. WAL rejimi esa init_db()da
+    BIR MARTA yoqiladi (u baza faylining o'zida saqlanib qoladi, har bir
+    yangi ulanishda qayta o'rnatish shart emas)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA busy_timeout = 5000")
+        yield db
+
+
 async def init_db():
     global _pool
     if _PG:
@@ -260,7 +276,12 @@ async def init_db():
             # qolmasligi uchun.
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_flow_msg_id BIGINT")
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
+            # WAL rejimi baza faylida doimiy saqlanadi — shuning uchun bu
+            # yerda faqat BIR MARTA (har safar botni ishga tushirganda)
+            # o'rnatilsa kifoya, boshqa ulanishlar avtomatik shu rejimda
+            # ishlayveradi.
+            await db.execute("PRAGMA journal_mode=WAL")
             await db.executescript(_SCHEMA_SQLITE)
             try:
                 await db.execute("ALTER TABLE orders ADD COLUMN country TEXT")
@@ -306,7 +327,7 @@ async def ensure_user(user_id: int, username: Optional[str], full_name: Optional
                 username, full_name, user_id,
             )
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             await db.execute(
                 "INSERT OR IGNORE INTO users (user_id, username, full_name, balance, created_at, referred_by) "
                 "VALUES (?, ?, ?, 0, ?, ?)",
@@ -326,7 +347,7 @@ async def get_referrer(user_id: int) -> Optional[int]:
             row = await conn.fetchrow("SELECT referred_by FROM users WHERE user_id = $1", user_id)
             return row["referred_by"] if row else None
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute("SELECT referred_by FROM users WHERE user_id = ?", (user_id,))
             row = await cur.fetchone()
             return row[0] if row else None
@@ -342,7 +363,7 @@ async def add_referral_earning(user_id: int, amount: int):
                 amount, user_id,
             )
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             await db.execute(
                 "UPDATE users SET referral_earnings = referral_earnings + ? WHERE user_id = ?",
                 (amount, user_id),
@@ -358,7 +379,7 @@ async def get_referral_stats(user_id: int) -> dict:
             row = await conn.fetchrow("SELECT referral_earnings FROM users WHERE user_id = $1", user_id)
             earned = row["referral_earnings"] if row else 0
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute("SELECT COUNT(*) FROM users WHERE referred_by = ?", (user_id,))
             invited_row = await cur.fetchone()
             invited = invited_row[0] if invited_row else 0
@@ -374,7 +395,7 @@ async def get_balance(user_id: int) -> int:
             row = await conn.fetchrow("SELECT balance FROM users WHERE user_id = $1", user_id)
             return row["balance"] if row else 0
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
             row = await cur.fetchone()
             return row[0] if row else 0
@@ -387,7 +408,7 @@ async def change_balance(user_id: int, delta: int):
                 "UPDATE users SET balance = balance + $1 WHERE user_id = $2", delta, user_id
             )
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             await db.execute(
                 "UPDATE users SET balance = balance + ? WHERE user_id = ?", (delta, user_id)
             )
@@ -405,7 +426,7 @@ async def set_last_flow_msg(user_id: int, message_id: Optional[int]):
                 "UPDATE users SET last_flow_msg_id = $1 WHERE user_id = $2", message_id, user_id,
             )
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             await db.execute(
                 "UPDATE users SET last_flow_msg_id = ? WHERE user_id = ?", (message_id, user_id),
             )
@@ -417,7 +438,7 @@ async def get_last_flow_msg(user_id: int) -> Optional[int]:
         async with _pool.acquire() as conn:
             row = await conn.fetchrow("SELECT last_flow_msg_id FROM users WHERE user_id = $1", user_id)
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute("SELECT last_flow_msg_id FROM users WHERE user_id = ?", (user_id,))
             row = await cur.fetchone()
     return row[0] if row else None
@@ -467,7 +488,7 @@ async def try_deduct_balance(user_id: int, amount: int) -> bool:
             )
             return result.split()[-1] != "0"
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute(
                 "UPDATE users SET balance = balance - ? WHERE user_id = ? AND balance >= ?",
                 (amount, user_id, amount),
@@ -482,7 +503,7 @@ async def is_banned(user_id: int) -> bool:
             row = await conn.fetchrow("SELECT banned FROM users WHERE user_id = $1", user_id)
             return bool(row["banned"]) if row else False
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute("SELECT banned FROM users WHERE user_id = ?", (user_id,))
             row = await cur.fetchone()
             return bool(row[0]) if row else False
@@ -493,7 +514,7 @@ async def set_banned(user_id: int, banned: bool):
         async with _pool.acquire() as conn:
             await conn.execute("UPDATE users SET banned = $1 WHERE user_id = $2", banned, user_id)
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             await db.execute(
                 "UPDATE users SET banned = ? WHERE user_id = ?", (1 if banned else 0, user_id)
             )
@@ -506,7 +527,7 @@ async def get_all_user_ids() -> list:
             rows = await conn.fetch("SELECT user_id FROM users")
             return [r["user_id"] for r in rows]
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute("SELECT user_id FROM users")
             rows = await cur.fetchall()
             return [r[0] for r in rows]
@@ -535,7 +556,7 @@ async def find_user(identifier: str) -> Optional[dict]:
             result["total_spent"] = orders_row["total"]
             return result
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             db.row_factory = aiosqlite.Row
             if identifier.isdigit():
                 cur = await db.execute("SELECT * FROM users WHERE user_id = ?", (int(identifier),))
@@ -574,7 +595,7 @@ async def create_order(user_id: int, order_type: str, ref: Optional[str], server
             )
             return row["id"]
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute(
                 "INSERT INTO orders (user_id, order_type, ref, server, status, price, details, country, "
                 "target_username, qty, created_at) "
@@ -602,7 +623,7 @@ async def top_countries(limit: int = 10) -> list:
             )
             return [(r["country"], r["cnt"]) for r in rows]
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute(
                 "SELECT country, COUNT(*) AS cnt FROM orders "
                 "WHERE order_type = 'number' AND country IS NOT NULL AND status != 'refunded' "
@@ -629,7 +650,7 @@ async def top_spenders(limit: int = 10) -> list:
                 limit,
             )
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 "SELECT o.user_id, COALESCE(SUM(o.price), 0) AS total, COUNT(*) AS cnt, "
@@ -657,7 +678,7 @@ async def daily_revenue(days: int = 7) -> list:
             )
             pairs = [(r["created_at"], r["price"]) for r in rows]
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute(
                 "SELECT created_at, price FROM orders WHERE status != 'refunded' AND created_at >= ?",
                 (since,),
@@ -688,7 +709,7 @@ async def update_order_status(order_pk: int, status: str, details: Optional[dict
             else:
                 await conn.execute("UPDATE orders SET status = $1 WHERE id = $2", status, order_pk)
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             if details is not None:
                 await db.execute(
                     "UPDATE orders SET status = ?, details = ? WHERE id = ?",
@@ -704,7 +725,7 @@ async def get_order_row(order_pk: int):
         async with _pool.acquire() as conn:
             return await conn.fetchrow("SELECT * FROM orders WHERE id = $1", order_pk)
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT * FROM orders WHERE id = ?", (order_pk,))
             return await cur.fetchone()
@@ -717,7 +738,7 @@ async def list_orders(user_id: int, limit: int = 10):
                 "SELECT * FROM orders WHERE user_id = $1 ORDER BY id DESC LIMIT $2", user_id, limit
             )
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 "SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit)
@@ -736,7 +757,7 @@ async def get_recent_orders(limit: int = 15, status: Optional[str] = None) -> li
                 )
             return await conn.fetch("SELECT * FROM orders ORDER BY id DESC LIMIT $1", limit)
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             db.row_factory = aiosqlite.Row
             if status:
                 cur = await db.execute(
@@ -757,7 +778,7 @@ async def get_last_order(user_id: int):
                 "SELECT * FROM orders WHERE user_id = $1 ORDER BY id DESC LIMIT 1", user_id
             )
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 "SELECT * FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,)
@@ -787,7 +808,7 @@ async def refund_order(order_pk: int, min_age_seconds: int = 0) -> Optional[dict
             if result.split()[-1] == "0":
                 return None
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute(
                 "UPDATE orders SET status = 'refunded' WHERE id = ? AND status = 'processing'",
                 (order_pk,),
@@ -810,7 +831,7 @@ async def create_topup(user_id: int, amount: int, photo_file_id: Optional[str]) 
             )
             return row["id"]
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute(
                 "INSERT INTO topups (user_id, amount, photo_file_id, status, created_at) "
                 "VALUES (?, ?, ?, 'pending', ?)",
@@ -825,7 +846,7 @@ async def get_topup(topup_id: int):
         async with _pool.acquire() as conn:
             return await conn.fetchrow("SELECT * FROM topups WHERE id = $1", topup_id)
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT * FROM topups WHERE id = ?", (topup_id,))
             return await cur.fetchone()
@@ -845,7 +866,7 @@ async def get_pending_topups(limit: int = 15) -> list:
                 limit,
             )
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 "SELECT t.id, t.user_id, t.amount, t.created_at, "
@@ -877,7 +898,7 @@ async def set_topup_status(topup_id: int, status: str, expected_current: Optiona
             await conn.execute("UPDATE topups SET status = $1 WHERE id = $2", status, topup_id)
             return True
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             if expected_current is not None:
                 cur = await db.execute(
                     "UPDATE topups SET status = ? WHERE id = ? AND status = ?",
@@ -899,7 +920,7 @@ async def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
             row = await conn.fetchrow("SELECT value FROM settings WHERE key = $1", key)
             return row["value"] if row else default
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
             row = await cur.fetchone()
             return row[0] if row else default
@@ -914,7 +935,7 @@ async def set_setting(key: str, value: str):
                 key, value,
             )
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             await db.execute(
                 "INSERT INTO settings (key, value) VALUES (?, ?) "
                 "ON CONFLICT (key) DO UPDATE SET value = ?",
@@ -942,7 +963,7 @@ async def _fsm_get(key_str: str) -> Optional[tuple]:
             row = await conn.fetchrow("SELECT state, data FROM fsm_data WHERE storage_key = $1", key_str)
             return (row["state"], row["data"]) if row else None
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute("SELECT state, data FROM fsm_data WHERE storage_key = ?", (key_str,))
             row = await cur.fetchone()
             return (row[0], row[1]) if row else None
@@ -957,7 +978,7 @@ async def _fsm_set_state(key_str: str, state: Optional[str]):
                 key_str, state,
             )
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             await db.execute(
                 "INSERT INTO fsm_data (storage_key, state, data) VALUES (?, ?, '{}') "
                 "ON CONFLICT (storage_key) DO UPDATE SET state = ?",
@@ -975,7 +996,7 @@ async def _fsm_set_data(key_str: str, payload: str):
                 key_str, payload,
             )
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             await db.execute(
                 "INSERT INTO fsm_data (storage_key, state, data) VALUES (?, NULL, ?) "
                 "ON CONFLICT (storage_key) DO UPDATE SET data = ?",
@@ -1031,7 +1052,7 @@ async def save_support_thread(admin_chat_id: int, message_id: int, user_id: int)
                 admin_chat_id, message_id, user_id,
             )
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             await db.execute(
                 "INSERT INTO support_threads (admin_chat_id, message_id, user_id) VALUES (?, ?, ?) "
                 "ON CONFLICT (admin_chat_id, message_id) DO UPDATE SET user_id = ?",
@@ -1051,7 +1072,7 @@ async def get_support_thread(admin_chat_id: int, message_id: int) -> Optional[in
             )
             return row["user_id"] if row else None
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute(
                 "SELECT user_id FROM support_threads WHERE admin_chat_id = ? AND message_id = ?",
                 (admin_chat_id, message_id),
@@ -1074,7 +1095,7 @@ async def count_other_pending_topups(user_id: int, exclude_topup_id: int) -> int
             )
             return row["c"]
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             cur = await db.execute(
                 "SELECT COUNT(*) FROM topups WHERE user_id = ? AND status = 'pending' AND id != ?",
                 (user_id, exclude_topup_id),
@@ -1126,7 +1147,7 @@ async def get_stats() -> dict:
 
             topups_pending = await scalar("SELECT COUNT(*) FROM topups WHERE status = 'pending'")
     else:
-        async with aiosqlite.connect(DB_PATH) as db:
+        async with _db_sqlite() as db:
             async def scalar(query, params=()):
                 cur = await db.execute(query, params)
                 row = await cur.fetchone()
@@ -1301,25 +1322,15 @@ class SmmUpperClient:
     async def get_order(self, order_id) -> dict:
         return await self._request("getOrder", order_id=order_id)
 
-    # 9. Raqamni bekor qilish/bloklash (pul qaytarilganda chaqiriladi).
-    # DIQQAT: "cancelNumber" — TAXMINIY nom. Bizga yuborilgan 17 ta hujjat
-    # skrinshotida (getBalance/getPrices/available_countries/getNumber/
-    # getCode/buyStars/buyPremium/getOrder) bekor qilish amali yo'q edi.
-    # SmmUpper hamkorlik panelidan yoki texnik yordamidan aniq amal nomini
-    # so'rab, shu yerdagi "cancelNumber" so'zini almashtiring — aks holda
-    # bu chaqiruv doim xato qaytaradi (quyida refund_number_order shu
-    # xatoni ushlab, adminga ogohlantirish yuboradi, lekin foydalanuvchiga
-    # pul qaytarishni to'xtatmaydi).
-    async def cancel_number(self, server: int, *, hash_code: Optional[str] = None,
-                             number: Optional[str] = None, id: Optional[str] = None) -> dict:
-        params = {"server": server}
-        if server == 1:
-            params["hash_code"] = hash_code
-        elif server == 2:
-            params["number"] = number
-        else:
-            params["id"] = id
-        return await self._request("cancelNumber", **params)
+    # 9. Raqamni bekor qilish/bloklash — BUNDAY AMAL YO'Q.
+    # https://smmupper.uz/api/v2/docs (v2, tekshirilgan sana: shu tahrir
+    # kuni) — hujjatda bor-yo'g'i 8 ta amal bor: getBalance, getPrices,
+    # available_countries, getNumber, getCode, buyStars, buyPremium,
+    # getOrder. Raqamni bekor qilish/bo'shatish uchun API orqali HECH
+    # QANDAY yo'l yo'q, shuning uchun bu metod olib tashlandi — pastda
+    # refund_number_order endi providerga hech narsa yubormay, faqat
+    # foydalanuvchi balansini qaytaradi.
+
 
 
 # ==============================================================
@@ -1338,13 +1349,25 @@ async def get_markup_percent() -> float:
         return MARKUP_PERCENT
 
 
+def _markup_multiplier(percent: float) -> float:
+    """Ustama foizini ko'paytiruvchiga aylantiradi. Bu formula avval 4 joyda
+    (with_markup, davlat tugmasi narxi, Stars narxini ko'rsatish — 2 joyda)
+    alohida-alohida takrorlangan edi; endi hammasi shu yerdan foydalanadi,
+    shunda formulani o'zgartirish kerak bo'lsa, bitta joyni tuzatish yetarli."""
+    return 1 + percent / 100
+
+
 async def with_markup(base_price) -> int:
     """Bazaviy (SmmUpper) narxga sozlangan foyda foizini qo'shib, yaxlit
     so'mga aylantiradi. Raqam, Stars va Premium — uchalasi ham shu bitta
     funksiyadan foydalanadi, shuning uchun ustama hammasiga bir xilda
-    qo'llanadi."""
+    qo'llanadi. Natija HECH QACHON 0 dan past bo'lmaydi — ustama foizi xato
+    sozlansa ham (masalan admin -100 dan pastroq qiymat kiritib qo'ysa)
+    narx manfiyga tushib, foydalanuvchi "bepul olish + balansga pul qo'shib
+    olish" holatiga tushib qolmasligi uchun muhim himoya chizig'i."""
     percent = await get_markup_percent()
-    return round(float(base_price) * (1 + percent / 100))
+    price = round(float(base_price) * _markup_multiplier(percent))
+    return max(0, price)
 
 
 # ==============================================================
@@ -1559,6 +1582,11 @@ ASK_MARKUP_PERCENT = (
     "bir vaqtda qo'llanadi."
 )
 NOT_A_VALID_PERCENT = "\u274C Noto'g'ri qiymat. Faqat son kiriting, masalan: 10 yoki 0"
+INVALID_MARKUP_RANGE = (
+    "\u274C Ustama -100% dan katta bo'lishi kerak (aks holda narx 0 yoki "
+    "manfiy bo'lib, foydalanuvchilar mahsulotni bepul olib qolishi mumkin). "
+    "Boshqa qiymat kiriting."
+)
 
 
 def markup_saved(percent: float) -> str:
@@ -1743,6 +1771,7 @@ def balance_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=BTN_TOPUP, callback_data="topup:start", style=STYLE_PRIMARY)],
         [InlineKeyboardButton(text="\U0001F381 Do'stlarni taklif qilish", callback_data="referral:info", style=STYLE_PRIMARY)],
+        nav_row(),
     ])
 
 
@@ -1885,7 +1914,7 @@ def _country_button_label(code: str, info: dict, markup_percent: float = 0.0) ->
     flag = country_flag(code)
     label_name = f"{flag} {name}" if flag else name
     if isinstance(price, (int, float)):
-        shown_price = round(float(price) * (1 + markup_percent / 100))
+        shown_price = max(0, round(float(price) * _markup_multiplier(markup_percent)))
         return f"{label_name} — {fmt_money(shown_price)} so'm"
     return label_name
 
@@ -2011,6 +2040,7 @@ def check_code_menu(order_pk: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=BTN_CHECK_CODE, callback_data=f"numcheck:{order_pk}", style=STYLE_PRIMARY)],
         [InlineKeyboardButton(text="\U0001F4B8 Pulni qaytarish", callback_data=f"numrefund:{order_pk}", style=STYLE_DANGER)],
+        nav_row(),
     ])
 
 
@@ -2480,16 +2510,22 @@ async def force_sub_check(callback: CallbackQuery, bot):
 async def go_home(callback: CallbackQuery, state: FSMContext):
     """"Bekor qilish"dan farqli o'laroq (bu "harakat to'xtatildi" deb
     tuyuladi), bu tugma neytral — foydalanuvchi shunchaki bosh menyuga
-    qaytmoqchi bo'lganda ishlatiladi."""
+    qaytmoqchi bo'lganda ishlatiladi.
+
+    MUHIM: pastdagi katta menyu (reply-klaviatura) faqat YANGI xabar bilan
+    qaytariladi — Telegram uni mavjud xabarni tahrirlash orqali ulashga
+    ruxsat bermaydi. Shuning uchun eski inline xabarning faqat tugmalari
+    tozalanadi (matni o'zgarmay qoladi — xuddi clear_stale_flow_message()
+    kabi), katta menyu esa alohida, qisqa xabar bilan qaytadan ko'rsatiladi."""
     await state.clear()
     try:
-        await callback.message.edit_text("\U0001F3E0 Bosh menyu.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
+        await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         try:
             await callback.message.delete()
         except Exception:
             pass
-        await callback.message.answer("\U0001F3E0 Bosh menyu.", reply_markup=main_menu())
+    await callback.message.answer("\U0001F3E0 Bosh menyu.", reply_markup=main_menu())
     await callback.answer()
 
 
@@ -2515,6 +2551,10 @@ async def cancel_any(callback: CallbackQuery, state: FSMContext):
     # tugmalarni saqlab qoladi (o'chirmaydi) — shuning uchun bo'sh
     # InlineKeyboardMarkup ANIQ berilishi shart, aks holda "Bekor qilindi"
     # yozuvi ostida eski (endi ishlamaydigan) tugmalar osilib qolaveradi.
+    #
+    # Pastdagi katta menyu (reply-klaviatura) ham xuddi go_home()'dagidek —
+    # faqat YANGI xabar bilan qaytariladi, shuning uchun har doim (tahrirlash
+    # muvaffaqiyatli bo'lsa ham) alohida xabar bilan qayta yuboriladi.
     try:
         await callback.message.edit_text("\u274C Bekor qilindi.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[]))
     except Exception:
@@ -2522,8 +2562,28 @@ async def cancel_any(callback: CallbackQuery, state: FSMContext):
             await callback.message.delete()
         except Exception:
             pass
-        await callback.message.answer("\u274C Bekor qilindi.", reply_markup=main_menu())
+    await callback.message.answer("\U0001F3E0 Asosiy menyu.", reply_markup=main_menu())
     await callback.answer()
+
+
+async def hide_main_menu(message: Message) -> None:
+    """Pastdagi doimiy menyuni (asosiy reply-klaviatura) yashiradi, lekin
+    suhbatda ortiqcha xabar qoldirmaydi. Telegram'da reply-klaviaturani olib
+    tashlash faqat YANGI xabar bilan mumkin (mavjud xabarni tahrirlab emas)
+    — shuning uchun ko'rinmas belgili "texnik" xabar yuboriladi va klaviatura
+    yashiringandan so'ng shu zahoti o'chiriladi; xabarning o'zi ekranda
+    umuman ko'rinmaydi.
+
+    Ko'p bosqichli xarid oqimlariga kirishda (Balans, Raqam/Stars/Premium
+    sotib olish, Yordam, Admin panel) chaqiriladi — shundan keyingi barcha
+    qadamlar inline tugmalar bilan davom etadi, "\U0001F3E0 Bosh sahifa"
+    yoki "\u274C Bekor qilish" bosilgandagina katta menyu qaytadan chiqadi
+    (qarang: go_home, cancel_any)."""
+    try:
+        sent = await message.answer("\u2063", reply_markup=ReplyKeyboardRemove())
+        await sent.delete()
+    except Exception:
+        pass
 
 
 # ==============================================================
@@ -2533,7 +2593,7 @@ router_start = Router(name="start")
 
 
 @router_start.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext, command: CommandObject):
+async def cmd_start(message: Message, state: FSMContext, command: CommandObject, bot):
     await state.clear()
 
     referred_by = None
@@ -2545,7 +2605,18 @@ async def cmd_start(message: Message, state: FSMContext, command: CommandObject)
             if candidate != message.from_user.id:
                 referred_by = candidate
 
+    # MUHIM: ensure_user() (demak — referal ID'ni saqlash) doim, majburiy
+    # obuna holatidan qat'i nazar, shu yerda, ENG BIRINCHI amalga oshiriladi.
+    # ForceSubMiddleware endi /start xabarini shu handlerga yetkazishdan
+    # oldin bloklamaydi (aks holda referal payload — Telegram uni qayta
+    # yubormagani uchun — butunlay yo'qolib qolar edi). Faqat XUSH KELIBSIZ
+    # menyusi obunaga bog'liq — u pastda, is_subscribed tekshiruvidan keyin.
     await ensure_user(message.from_user.id, message.from_user.username, message.from_user.full_name, referred_by=referred_by)
+
+    if not await is_subscribed(bot, message.from_user.id):
+        await send_force_sub_prompt(bot, message.chat.id)
+        return
+
     await message.answer(WELCOME, reply_markup=main_menu())
 
 
@@ -2571,6 +2642,7 @@ def help_forward_text(user, text: str) -> str:
 @router_start.message(F.text == BTN_HELP)
 async def help_start(message: Message, state: FSMContext):
     await state.set_state(HelpRequest.message)
+    await hide_main_menu(message)
     await message.answer(ASK_HELP_MESSAGE, reply_markup=cancel_inline())
 
 
@@ -2629,6 +2701,7 @@ router_balance = Router(name="balance")
 async def show_balance(message: Message, state: FSMContext):
     await state.clear()
     balance = await get_balance(message.from_user.id)
+    await hide_main_menu(message)
     await message.answer(balance_text(balance), reply_markup=balance_menu())
 
 
@@ -2726,6 +2799,7 @@ _background_tasks: set = set()
 async def start_number_flow(message: Message, state: FSMContext, bot):
     await state.clear()
     await clear_stale_flow_message(bot, message.from_user.id)
+    await hide_main_menu(message)
     await message.answer(NUMBER_PURCHASE_WARNING, reply_markup=number_warning_menu())
 
 
@@ -3028,12 +3102,21 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
         result = await client.get_number(server, country, request_id=new_request_id())
     except SmmUpperError as e:
         await change_balance(callback.from_user.id, est_price)
-        await callback.message.answer(f"\u274C Xatolik: {e.message}\n\U0001F4B0 Pulingiz balansga qaytarildi.")
+        await callback.message.answer(
+            f"\u274C Xatolik: {e.message}\n\U0001F4B0 Pulingiz balansga qaytarildi.",
+            reply_markup=main_menu(),
+        )
         await state.clear()
         return
 
     actual_price = await with_markup(result.get("price", 0))
-    if actual_price != est_price:
+    if actual_price > est_price:
+        # Yakuniy narx taxminiydan qimmat chiqsa — farqni yechishga harakat
+        # qilamiz, lekin try_deduct_balance xavfsiz: agar balans yetmasa,
+        # hech narsa yechilmaydi. Balans HECH QACHON manfiyga tushirilmaydi,
+        # chunki bu paytda mahsulot SmmUpper'dan allaqachon olib bo'lingan.
+        await try_deduct_balance(callback.from_user.id, actual_price - est_price)
+    elif actual_price < est_price:
         await change_balance(callback.from_user.id, est_price - actual_price)
 
     ref = result.get("hash_code") or result.get("number") or str(result.get("id"))
@@ -3113,7 +3196,7 @@ async def _poll_code(bot, user_id: int, order_pk: int, server: int, result: dict
             await update_order_status(order_pk, "done", {**result, "code": code, "password": password})
             await _clear_buttons(bot, user_id, purchase_message_id)
             try:
-                await bot.send_message(user_id, text, parse_mode="HTML")
+                await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=main_menu())
             except Exception:
                 pass
             return
@@ -3128,17 +3211,13 @@ async def _poll_code(bot, user_id: int, order_pk: int, server: int, result: dict
         pass
 
 
-@router_numbers.callback_query(F.data.startswith("numcheck:"))
-async def manual_check_code(callback: CallbackQuery):
-    order_pk = int(callback.data.split(":")[1])
-    row = await get_order_row(order_pk)
-    if not row or row["user_id"] != callback.from_user.id:
-        await callback.answer("Buyurtma topilmadi.", show_alert=True)
-        return
-    if row["status"] != "processing":
-        await callback.answer("Bu buyurtma allaqachon yakunlangan.", show_alert=True)
-        return
-
+async def _check_and_report_number_code(callback: CallbackQuery, order_pk: int, row, clear_markup: bool) -> None:
+    """"Raqam" turidagi buyurtma uchun SMS kodni SmmUpper'dan so'raydi va
+    natijani foydalanuvchiga ko'rsatadi. numcheck: (xariddan keyingi tugma)
+    va ordercheck: (buyurtmalar ro'yxatidagi umumiy tugma) — ikkalasi ham
+    shu funksiyadan foydalanadi: "raqam" buyurtmalarida haqiqiy order_id
+    yo'q (faqat hash_code/number/id bor), shuning uchun holatni har doim
+    getCode orqali (getOrder emas) tekshirish kerak."""
     result = json.loads(row["details"]) if row["details"] else {}
     server = row["server"]
 
@@ -3152,10 +3231,11 @@ async def manual_check_code(callback: CallbackQuery):
         code = data.get("code", "?")
         password = data.get("password") or ""
         await update_order_status(order_pk, "done", {**result, "code": code, "password": password})
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            pass
+        if clear_markup:
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
         # Popup alert (show_alert) matnni nusxalashga imkon bermaydi — shuning
         # uchun kodni alohida, <code> bilan formatlangan xabar sifatida
         # yuboramiz, bosib nusxa olish uchun.
@@ -3163,9 +3243,22 @@ async def manual_check_code(callback: CallbackQuery):
         if password:
             text += f"\n\U0001F510 2FA parol: <code>{html.escape(str(password))}</code>"
         await callback.answer()
-        await callback.message.answer(text, parse_mode="HTML")
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=main_menu())
     else:
         await callback.answer("\u23F3 Kod hali kelmagan. Birozdan so'ng qayta tekshiring.", show_alert=True)
+
+
+@router_numbers.callback_query(F.data.startswith("numcheck:"))
+async def manual_check_code(callback: CallbackQuery):
+    order_pk = int(callback.data.split(":")[1])
+    row = await get_order_row(order_pk)
+    if not row or row["user_id"] != callback.from_user.id:
+        await callback.answer("Buyurtma topilmadi.", show_alert=True)
+        return
+    if row["status"] != "processing":
+        await callback.answer("Bu buyurtma allaqachon yakunlangan.", show_alert=True)
+        return
+    await _check_and_report_number_code(callback, order_pk, row, clear_markup=True)
 
 
 @router_numbers.callback_query(F.data.startswith("numrefund:"))
@@ -3194,33 +3287,20 @@ async def refund_number_order(callback: CallbackQuery, bot):
         await callback.answer("Pulni qaytarib bo'lmadi \u2014 balki allaqachon yakunlangan.", show_alert=True)
         return
 
-    # Foydalanuvchiga pul qaytarildi — endi SmmUpper'da ham shu raqamni
-    # bekor qilishga urinamiz, aks holda provayder uni band holda ushlab
-    # turishi (va bizning hamkor balansimizni band qilishi) mumkin. Amal
-    # nomi hali tasdiqlanmagani uchun xato bo'lishi mumkin — bu holatda
-    # foydalanuvchiga pul qaytarish TO'XTATILMAYDI, faqat admin xabardor
-    # qilinadi (qo'lda tekshirish uchun).
-    try:
-        details = json.loads(row["details"]) if row["details"] else {}
-        await client.cancel_number(
-            row["server"],
-            hash_code=details.get("hash_code"),
-            number=details.get("number"),
-            id=details.get("id"),
-        )
-    except Exception as e:
-        err_text = getattr(e, "message", str(e))
-        logging.warning(f"SmmUpper cancel_number xato (order {order_pk}): {err_text}")
-        for admin_id in set(ADMIN_IDS) | set(await get_extra_admin_ids()):
-            try:
-                await bot.send_message(
-                    admin_id,
-                    f"\u26A0\uFE0F Buyurtma #{order_pk}: foydalanuvchiga pul qaytarildi, "
-                    f"lekin SmmUpper'da raqamni bekor qilib bo'lmadi ({err_text}).\n"
-                    f"Qo'lda tekshiring va/yoki cancel_number amal nomini tasdiqlang.",
-                )
-            except Exception:
-                pass
+    # SmmUpper Hamkorlik API v2 hujjatida (smmupper.uz/api/v2/docs) raqamni
+    # bekor qilish/bo'shatish uchun HECH QANDAY endpoint yo'q — bor-yo'g'i
+    # 8 ta amal bor (getBalance...getOrder), ular orasida "cancel" yo'q.
+    # Shuning uchun bu yerda providerga hech narsa yuborilmaydi — yuqoridagi
+    # balans qaytarish (refund_order) kifoya. Raqamning o'zi provayder
+    # tomonida "band" holida qolishi mumkin — buni hal qilishning yagona
+    # yo'li ular bilan to'g'ridan-to'g'ri (API'dan tashqari) bog'lanish.
+    # Kelajakda ko'plab "band" qolgan raqamlarni birdan hisoblash kerak
+    # bo'lib qolsa deb, shu holatlar log'ga yozib qo'yiladi (admin'larga
+    # xabar YUBORILMAYDI — bu doimiy, kutilgan holat, xatolik emas).
+    logging.info(
+        f"Raqam refund qilindi, lekin provayderda bo'shatilmadi (bunday "
+        f"endpoint yo'q): order={order_pk} server={row['server']} ref={row['ref']}"
+    )
 
     new_balance = await get_balance(callback.from_user.id)
     try:
@@ -3229,7 +3309,8 @@ async def refund_number_order(callback: CallbackQuery, bot):
         pass
     await callback.message.answer(
         f"\U0001F4B8 {fmt_money(refund['price'])} so'm balansingizga qaytarildi.\n"
-        f"\U0001F4B0 Joriy balans: {fmt_money(new_balance)} so'm"
+        f"\U0001F4B0 Joriy balans: {fmt_money(new_balance)} so'm",
+        reply_markup=main_menu(),
     )
     await callback.answer()
 
@@ -3248,6 +3329,7 @@ async def start_stars_flow(message: Message, state: FSMContext, bot):
     await state.clear()
     await clear_stale_flow_message(bot, message.from_user.id)
     await state.set_state(BuyStars.username)
+    await hide_main_menu(message)
     await message.answer(
         "Kimga Stars sotib olamiz? Telegram username kiriting (masalan: durov).",
         reply_markup=cancel_inline(),
@@ -3274,7 +3356,7 @@ async def stars_back_to_amount(callback: CallbackQuery, state: FSMContext):
     try:
         prices = await client.get_prices()
         percent = await get_markup_percent()
-        per_star = prices["stars"]["price_per_star"] * (1 + percent / 100)
+        per_star = prices["stars"]["price_per_star"] * _markup_multiplier(percent)
     except (SmmUpperError, KeyError) as e:
         await callback.answer(f"Narxlarni olib bo'lmadi: {e}", show_alert=True)
         return
@@ -3297,7 +3379,7 @@ async def stars_username(message: Message, state: FSMContext):
     try:
         prices = await client.get_prices()
         percent = await get_markup_percent()
-        per_star = prices["stars"]["price_per_star"] * (1 + percent / 100)
+        per_star = prices["stars"]["price_per_star"] * _markup_multiplier(percent)
     except (SmmUpperError, KeyError) as e:
         await message.answer(f"\u274C Narxlarni olib bo'lmadi: {e}")
         return
@@ -3400,12 +3482,19 @@ async def confirm_stars(callback: CallbackQuery, state: FSMContext, bot):
         result = await client.buy_stars(username, amount, request_id=new_request_id())
     except SmmUpperError as e:
         await change_balance(callback.from_user.id, est_price)
-        await callback.message.answer(f"\u274C Xatolik: {e.message}\n\U0001F4B0 Pulingiz balansga qaytarildi.")
+        await callback.message.answer(
+            f"\u274C Xatolik: {e.message}\n\U0001F4B0 Pulingiz balansga qaytarildi.",
+            reply_markup=main_menu(),
+        )
         await state.clear()
         return
 
     actual_price = await with_markup(result.get("price", 0))
-    if actual_price != est_price:
+    if actual_price > est_price:
+        # Balans HECH QACHON manfiyga tushirilmaydi — izoh uchun
+        # confirm_number'dagi bir xil o'zgarishga qarang.
+        await try_deduct_balance(callback.from_user.id, actual_price - est_price)
+    elif actual_price < est_price:
         await change_balance(callback.from_user.id, est_price - actual_price)
     order_pk = await create_order(
         user_id=callback.from_user.id,
@@ -3430,7 +3519,8 @@ async def confirm_stars(callback: CallbackQuery, state: FSMContext, bot):
         f"\u2B50 {amount} Stars\n"
         f"\U0001F4B5 {fmt_money(actual_price)} so'm\n"
         f"\U0001F522 Buyurtma raqami: {result.get('order_id')} (#{order_pk})\n\n"
-        f"Holatini «{BTN_ORDERS}» bo'limidan kuzatishingiz mumkin."
+        f"Holatini «{BTN_ORDERS}» bo'limidan kuzatishingiz mumkin.",
+        reply_markup=main_menu(),
     )
     await state.clear()
 
@@ -3463,6 +3553,7 @@ async def start_premium_flow(message: Message, state: FSMContext, bot):
         f"\u2022 12 oy: {fmt_money(prices[12])} so'm\n\n"
         "Necha oylik Premium kerak?"
     )
+    await hide_main_menu(message)
     await message.answer(text, reply_markup=premium_months_menu(prices))
 
 
@@ -3575,12 +3666,19 @@ async def confirm_premium(callback: CallbackQuery, state: FSMContext, bot):
         result = await client.buy_premium(username, months, request_id=new_request_id())
     except SmmUpperError as e:
         await change_balance(callback.from_user.id, est_price)
-        await callback.message.answer(f"\u274C Xatolik: {e.message}\n\U0001F4B0 Pulingiz balansga qaytarildi.")
+        await callback.message.answer(
+            f"\u274C Xatolik: {e.message}\n\U0001F4B0 Pulingiz balansga qaytarildi.",
+            reply_markup=main_menu(),
+        )
         await state.clear()
         return
 
     actual_price = await with_markup(result.get("price", 0))
-    if actual_price != est_price:
+    if actual_price > est_price:
+        # Balans HECH QACHON manfiyga tushirilmaydi — izoh uchun
+        # confirm_number'dagi bir xil o'zgarishga qarang.
+        await try_deduct_balance(callback.from_user.id, actual_price - est_price)
+    elif actual_price < est_price:
         await change_balance(callback.from_user.id, est_price - actual_price)
     order_pk = await create_order(
         user_id=callback.from_user.id,
@@ -3605,7 +3703,8 @@ async def confirm_premium(callback: CallbackQuery, state: FSMContext, bot):
         f"\U0001F48E {months} oy Premium\n"
         f"\U0001F4B5 {fmt_money(actual_price)} so'm\n"
         f"\U0001F522 Buyurtma raqami: {result.get('order_id')} (#{order_pk})\n\n"
-        f"Holatini «{BTN_ORDERS}» bo'limidan kuzatishingiz mumkin."
+        f"Holatini «{BTN_ORDERS}» bo'limidan kuzatishingiz mumkin.",
+        reply_markup=main_menu(),
     )
     await state.clear()
 
@@ -3667,6 +3766,15 @@ async def check_order(callback: CallbackQuery):
     # qaytarib olish yo'lini ochib qo'yishi mumkin edi.
     if row["status"] in FINAL_STATUSES:
         await callback.answer(f"Holat: {row['status']}", show_alert=True)
+        return
+
+    # "Raqam" turidagi buyurtmalarda "ref" — hash_code/number/id, Stars/
+    # Premium'dagi kabi haqiqiy order_id emas. SmmUpper'ning umumiy
+    # getOrder'i bunday ID bilan noto'g'ri ishlashi mumkin, shuning uchun
+    # bu turdagi buyurtmalar uchun har doim getCode orqali (xuddi
+    # manual_check_code'dagi kabi) tekshiramiz.
+    if row["order_type"] == "number":
+        await _check_and_report_number_code(callback, order_pk, row, clear_markup=False)
         return
 
     try:
@@ -3916,6 +4024,7 @@ def _admins_text(extra_ids: list) -> str:
 
 
 async def _show_panel(message: Message):
+    await hide_main_menu(message)
     await message.answer(await _panel_text(), reply_markup=admin_menu())
 
 
@@ -4293,6 +4402,9 @@ async def admin_markup_receive(message: Message, state: FSMContext, bot):
         percent = float(text)
     except ValueError:
         await _panel_edit(bot, state, message, NOT_A_VALID_PERCENT, settings_cancel_menu())
+        return
+    if percent <= -100:
+        await _panel_edit(bot, state, message, INVALID_MARKUP_RANGE, settings_cancel_menu())
         return
 
     await set_setting(SETTINGS_KEY_MARKUP, str(percent))
@@ -4889,6 +5001,19 @@ class ForceSubMiddleware(BaseMiddleware):
 
         if isinstance(event, CallbackQuery) and event.data == "forcesub:check":
             return await handler(event, data)
+
+        # /start (referal payload bilan bo'lishi ham mumkin: "/start ref123")
+        # har doim cmd_start'ga yetkaziladi — Telegram start-payload'ni FAQAT
+        # shu birinchi xabarda beradi, qayta yubormaydi. Agar shu yerda
+        # to'xtatib qo'yilsa, foydalanuvchi keyinroq "✅ A'zo bo'ldim" bossa
+        # ham referal ID abadiy yo'qolib qolar edi. cmd_start endi
+        # ensure_user() (va referalni saqlashni) obunadan QAT'I NAZAR eng
+        # avval bajaradi, so'ng kerak bo'lsa majburiy obuna xabarini o'zi
+        # ko'rsatadi — shuning uchun bu yerda uni bloklash shart emas.
+        if isinstance(event, Message) and event.text:
+            first_word = event.text.split()[0].split("@")[0]
+            if first_word == "/start":
+                return await handler(event, data)
 
         # Avval kanallar sozlanganmi shuni tekshiramiz (bitta baza so'rovi) — bu
         # ko'pchilik holatda (majburiy obuna o'chiq) darhol chiqib ketadi,
