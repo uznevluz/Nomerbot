@@ -29,6 +29,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.types import (
     CallbackQuery,
+    CopyTextButton,
     ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -909,6 +910,34 @@ async def set_topup_status(topup_id: int, status: str, expected_current: Optiona
             await db.execute("UPDATE topups SET status = ? WHERE id = ?", (status, topup_id))
             await db.commit()
             return True
+
+
+async def set_topup_amount(topup_id: int, new_amount: int) -> bool:
+    """Admin tasdiqlashdan oldin summani tuzatganda ishlatiladi — masalan
+    foydalanuvchi 5 000 deb ko'rsatgan, lekin aslida kartaga faqat 4 000
+    tushgan bo'lsa. Faqat so'rov HALI "pending" holatida bo'lsagina
+    yangilanadi (bitta atomik amal, xuddi set_topup_status'dagi kabi) —
+    aks holda boshqa admin AYNAN shu payt (juda kam ehtimol, lekin
+    mumkin) so'rovni ESKI summa bilan allaqachon tasdiqlab ulgurgan
+    bo'lishi, keyin esa bu yerda summa "orqadan" o'zgartirilib, jadvaldagi
+    yozuv haqiqatda balansga tushgan summadan farq qilib qolishi mumkin
+    edi. Muvaffaqiyatli yangilansa True, so'rov endi "pending" bo'lmasa
+    (boshqa admin ulgurgan) False qaytaradi."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE topups SET amount = $1 WHERE id = $2 AND status = 'pending'",
+                new_amount, topup_id,
+            )
+            return result.split()[-1] != "0"
+    else:
+        async with _db_sqlite() as db:
+            cur = await db.execute(
+                "UPDATE topups SET amount = ? WHERE id = ? AND status = 'pending'",
+                (new_amount, topup_id),
+            )
+            await db.commit()
+            return cur.rowcount > 0
 
 
 async def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -2036,12 +2065,49 @@ def premium_months_menu(prices: Optional[Dict[int, int]] = None) -> InlineKeyboa
     ])
 
 
-def check_code_menu(order_pk: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=BTN_CHECK_CODE, callback_data=f"numcheck:{order_pk}", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F4B8 Pulni qaytarish", callback_data=f"numrefund:{order_pk}", style=STYLE_DANGER)],
-        nav_row(),
-    ])
+def check_code_menu(order_pk: int, copy_number: Optional[str] = None) -> InlineKeyboardMarkup:
+    rows = []
+    number_str = str(copy_number).strip() if copy_number else ""
+    if number_str:
+        rows.append([InlineKeyboardButton(
+            text="\U0001F4CB Raqamni nusxalash",
+            copy_text=CopyTextButton(text=number_str),
+        )])
+    rows.append([InlineKeyboardButton(text=BTN_CHECK_CODE, callback_data=f"numcheck:{order_pk}", style=STYLE_PRIMARY)])
+    rows.append([InlineKeyboardButton(text="\U0001F4B8 Pulni qaytarish", callback_data=f"numrefund:{order_pk}", style=STYLE_DANGER)])
+    rows.append(nav_row())
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _code_copy_menu(code, password: str = "") -> InlineKeyboardMarkup:
+    """SMS kodi (va bo'lsa — 2FA parol) uchun aniq "nusxalash" tugmalari.
+    <code> teglari orqali ham (matnni bosib turib) nusxalab bo'ladi, lekin
+    alohida tugma ancha aniqroq va barcha foydalanuvchilar uchun tushunarli.
+    Telegram CopyTextButton bo'sh matnni qabul qilmaydi (1-256 belgi talab
+    qilinadi) — shuning uchun bo'sh/bo'sh joy bo'lsa, tugma qo'shilmaydi
+    (aks holda BUTUN xabar yuborilmay qolar edi)."""
+    code_str = str(code).strip()
+    rows = []
+    if code_str:
+        rows.append([InlineKeyboardButton(text="\U0001F4CB Kodni nusxalash", copy_text=CopyTextButton(text=code_str))])
+    password_str = str(password).strip() if password else ""
+    if password_str:
+        rows.append([InlineKeyboardButton(text="\U0001F510 Parolni nusxalash", copy_text=CopyTextButton(text=password_str))])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _card_copy_menu(card_number: str) -> InlineKeyboardMarkup:
+    """To'ldirish uchun ko'rsatilgan plastik karta raqamini bitta bosishda
+    nusxalash tugmasi — pul o'tkazishda raqamni qo'lda terib xato
+    qilmaslik uchun. Bo'sh/bo'sh joy bo'lsa tugma qo'shilmaydi (yuqoridagi
+    izohga qarang)."""
+    rows = []
+    card_str = str(card_number).strip() if card_number else ""
+    if card_str:
+        rows.append([InlineKeyboardButton(text="\U0001F4B3 Karta raqamini nusxalash", copy_text=CopyTextButton(text=card_str))])
+    rows.append([InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 
 def admin_menu() -> InlineKeyboardMarkup:
@@ -2198,6 +2264,7 @@ def topup_review_menu(topup_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="\u2705 Tasdiqlash", callback_data=f"topup:approve:{topup_id}", style=STYLE_SUCCESS),
             InlineKeyboardButton(text="\u274C Rad etish", callback_data=f"topup:reject:{topup_id}", style=STYLE_DANGER),
         ],
+        [InlineKeyboardButton(text="\u270F\uFE0F Summani tuzatish", callback_data=f"topup:edit:{topup_id}", style=STYLE_PRIMARY)],
     ])
 
 
@@ -2253,6 +2320,7 @@ class AdminPanel(StatesGroup):
     add_admin_id = State()
     order_search_id = State()
     order_search_user = State()
+    topup_amount = State()
 
 
 # ==============================================================
@@ -2394,11 +2462,14 @@ async def remove_extra_admin(user_id: int):
         await set_setting(SETTINGS_KEY_EXTRA_ADMINS, ",".join(str(x) for x in ids))
 
 
-async def notify_channel(bot, text: str):
+async def notify_channel(bot, text: str, order_type: str = ""):
     """Raqam / Stars / Premium sotib olinganda kanalga xabar yuboradi.
     Kanal sozlanmagan bo'lsa — hech narsa qilmaydi. Kanalga yuborish
     muvaffaqiyatsiz bo'lsa (masalan, bot hali admin qilib qo'shilmagan bo'lsa),
     xatolik foydalanuvchiga ta'sir qilmasligi uchun jimgina e'tiborsiz qoldiriladi.
+    `order_type` sarlavhada qaysi turdagi buyurtma ekanini ko'rsatadi
+    ("number"/"stars"/"premium") — aks holda xabar faqat umumiy "BUYURTMA"
+    deb chiqib, o'qiganlar bu Raqammi, Starsmi yoki Premiummi bilolmas edi.
     """
     channel_id = await get_channel_id()
     if not channel_id:
@@ -2407,9 +2478,16 @@ async def notify_channel(bot, text: str):
         username = (await bot.get_me()).username
         dbl = "\u2550" * 18
         thin = "\u2500" * 21
+        type_labels = {
+            "number": "\U0001F4F1 Raqam",
+            "stars": "\u2B50 Stars",
+            "premium": "\U0001F48E Premium",
+        }
+        type_label = type_labels.get(order_type, "")
+        header = f"     \U0001F195 BUYURTMA \u2014 {type_label}" if type_label else "     \U0001F195 BUYURTMA"
         full_text = (
             f"\u2554{dbl}\u2557\n"
-            "     \U0001F195 BUYURTMA\n"
+            f"{header}\n"
             f"\u255A{dbl}\u255D\n\n"
             f"{text}\n\n"
             f"\u256D{thin}\u256E\n"
@@ -2737,7 +2815,7 @@ async def topup_amount(message: Message, state: FSMContext):
     await state.update_data(amount=amount)
     await state.set_state(TopUp.photo)
     card_number, card_holder = await get_card_info()
-    await message.answer(topup_instructions(amount, card_number, card_holder), reply_markup=cancel_inline())
+    await message.answer(topup_instructions(amount, card_number, card_holder), reply_markup=_card_copy_menu(card_number))
 
 
 @router_balance.message(TopUp.photo, F.photo)
@@ -3136,7 +3214,7 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
     buyer = callback.from_user.full_name
     if callback.from_user.username:
         buyer += f" (@{callback.from_user.username})"
-    await notify_channel(bot, channel_number_notice(buyer, country, actual_price, number))
+    await notify_channel(bot, channel_number_notice(buyer, country, actual_price, number), order_type="number")
 
     sent = await callback.message.answer(
         f"\u2705 Raqam muvaffaqiyatli olindi!\n"
@@ -3144,7 +3222,7 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
         f"\U0001F4B5 Narx: {fmt_money(actual_price)} so'm\n"
         f"\u23F3 SMS tasdiqlash kodi kutilmoqda...\n"
         f"Iltimos, biroz kuting.",
-        reply_markup=check_code_menu(order_pk),
+        reply_markup=check_code_menu(order_pk, copy_number=number),
         parse_mode="HTML",
     )
 
@@ -3196,7 +3274,7 @@ async def _poll_code(bot, user_id: int, order_pk: int, server: int, result: dict
             await update_order_status(order_pk, "done", {**result, "code": code, "password": password})
             await _clear_buttons(bot, user_id, purchase_message_id)
             try:
-                await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=main_menu())
+                await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=_code_copy_menu(code, password))
             except Exception:
                 pass
             return
@@ -3205,7 +3283,7 @@ async def _poll_code(bot, user_id: int, order_pk: int, server: int, result: dict
         await bot.send_message(
             user_id,
             "\u231B Kod hali kelmadi. Pastdagi tugma orqali istalgan vaqt tekshirishingiz mumkin.",
-            reply_markup=check_code_menu(order_pk),
+            reply_markup=check_code_menu(order_pk, copy_number=result.get("number")),
         )
     except Exception:
         pass
@@ -3243,7 +3321,7 @@ async def _check_and_report_number_code(callback: CallbackQuery, order_pk: int, 
         if password:
             text += f"\n\U0001F510 2FA parol: <code>{html.escape(str(password))}</code>"
         await callback.answer()
-        await callback.message.answer(text, parse_mode="HTML", reply_markup=main_menu())
+        await callback.message.answer(text, parse_mode="HTML", reply_markup=_code_copy_menu(code, password))
     else:
         await callback.answer("\u23F3 Kod hali kelmagan. Birozdan so'ng qayta tekshiring.", show_alert=True)
 
@@ -3511,7 +3589,7 @@ async def confirm_stars(callback: CallbackQuery, state: FSMContext, bot):
     buyer = callback.from_user.full_name
     if callback.from_user.username:
         buyer += f" (@{callback.from_user.username})"
-    await notify_channel(bot, channel_stars_notice(buyer, username, amount, actual_price))
+    await notify_channel(bot, channel_stars_notice(buyer, username, amount, actual_price), order_type="stars")
 
     await callback.message.answer(
         f"\u2705 Buyurtma qabul qilindi!\n"
@@ -3695,7 +3773,7 @@ async def confirm_premium(callback: CallbackQuery, state: FSMContext, bot):
     buyer = callback.from_user.full_name
     if callback.from_user.username:
         buyer += f" (@{callback.from_user.username})"
-    await notify_channel(bot, channel_premium_notice(buyer, username, months, actual_price))
+    await notify_channel(bot, channel_premium_notice(buyer, username, months, actual_price), order_type="premium")
 
     await callback.message.answer(
         f"\u2705 Buyurtma qabul qilindi!\n"
@@ -4475,6 +4553,9 @@ async def admin_card_number_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
     card_number = message.text.strip()
+    if not card_number:
+        await _panel_edit(bot, state, message, "\u274C Karta raqami bo'sh bo'lishi mumkin emas. Qayta kiriting.", settings_cancel_menu())
+        return
     await state.update_data(card_number=card_number)
     await state.set_state(AdminPanel.card_holder)
     await _panel_edit(bot, state, message, ASK_CARD_HOLDER, settings_cancel_menu())
@@ -4629,8 +4710,12 @@ async def admin_add_admin_receive(message: Message, state: FSMContext, bot):
         await state.clear()
         return
 
-    await add_extra_admin(user_id)
+    added = await add_extra_admin(user_id)
     ids = await get_extra_admin_ids()
+    if not added:
+        await _panel_edit(bot, state, message, ALREADY_ADMIN, admins_cancel_menu())
+        await state.clear()
+        return
     await _panel_edit(bot, state, message, _admins_text(ids), admins_admin_menu(ids))
     await state.clear()
 
@@ -4876,6 +4961,113 @@ async def _finalize_topup_message(callback: CallbackQuery, suffix: str):
         pass
 
 
+@router_admin.callback_query(F.data.startswith("topup:edit:"))
+async def topup_edit_amount_start(callback: CallbackQuery, state: FSMContext, bot):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+
+    topup_id = int(callback.data.split(":")[2])
+    topup = await get_topup(topup_id)
+    if not topup:
+        await callback.answer("So'rov topilmadi.", show_alert=True)
+        return
+    if topup["status"] != "pending":
+        await callback.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
+        return
+
+    # Xabarning o'zini (rasm captioni yoki oddiy matn) va uning chat/message
+    # ID'sini saqlab qo'yamiz — yangi summa kiritilgach, aynan shu xabarni
+    # (Tasdiqlash/Rad etish tugmalari turgan joyni) yangilaymiz.
+    await state.update_data(
+        edit_topup_id=topup_id,
+        edit_topup_chat_id=callback.message.chat.id,
+        edit_topup_message_id=callback.message.message_id,
+        edit_topup_old_text=callback.message.caption or callback.message.text or "",
+        edit_topup_is_photo=bool(callback.message.photo),
+    )
+    await state.set_state(AdminPanel.topup_amount)
+    await callback.answer()
+    await callback.message.answer(
+        f"\u270F\uFE0F #{topup_id} so'rovi uchun YANGI summani kiriting (so'mda).\n"
+        f"Foydalanuvchi ko'rsatgan summa: {fmt_money(topup['amount'])} so'm.",
+        reply_markup=admin_cancel_menu(),
+    )
+
+
+@router_admin.message(AdminPanel.topup_amount, is_free_text)
+async def topup_edit_amount_receive(message: Message, state: FSMContext, bot):
+    if not await _is_admin(message.from_user.id):
+        return
+    text = message.text.strip().replace(" ", "")
+    if not text.isdigit() or int(text) <= 0:
+        await message.answer("\u274C Noto'g'ri summa. Faqat musbat butun son kiriting.")
+        return
+    new_amount = int(text)
+
+    data = await state.get_data()
+    topup_id = data.get("edit_topup_id")
+    chat_id = data.get("edit_topup_chat_id")
+    message_id = data.get("edit_topup_message_id")
+    old_text = data.get("edit_topup_old_text", "")
+    is_photo = data.get("edit_topup_is_photo", False)
+    await state.clear()
+
+    if not topup_id:
+        await message.answer("\u274C Xatolik: qaysi so'rov ekanligi topilmadi. Qaytadan urinib ko'ring.")
+        return
+
+    topup = await get_topup(topup_id)
+    if not topup or topup["status"] != "pending":
+        await message.answer("Bu so'rov endi mavjud emas yoki allaqachon ko'rib chiqilgan.")
+        return
+
+    old_amount = topup["amount"]
+    updated = await set_topup_amount(topup_id, new_amount)
+    if not updated:
+        await message.answer(
+            "\u26A0\uFE0F Bu so'rovni shu payt ichida boshqa admin allaqachon ko'rib "
+            "chiqib ulgurdi — summa o'zgartirilmadi."
+        )
+        return
+
+    # Bildirishnoma xabaridagi "Summa:" qatorini yangi summaga almashtiramiz,
+    # avvalgi (foydalanuvchi ko'rsatgan) summani ham qavs ichida saqlab
+    # qo'yamiz — shaffoflik/audit uchun.
+    new_lines = []
+    replaced = False
+    for line in old_text.split("\n"):
+        if line.startswith("\U0001F4B0 Summa:"):
+            new_lines.append(
+                f"\U0001F4B0 Summa: {fmt_money(new_amount)} so'm "
+                f"(\u270F\uFE0F tahrirlandi, avvalgi: {fmt_money(old_amount)} so'm)"
+            )
+            replaced = True
+        else:
+            new_lines.append(line)
+    new_text = "\n".join(new_lines) if replaced else old_text
+
+    if chat_id and message_id:
+        try:
+            if is_photo:
+                await bot.edit_message_caption(
+                    chat_id=chat_id, message_id=message_id,
+                    caption=new_text, reply_markup=topup_review_menu(topup_id),
+                )
+            else:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=message_id,
+                    text=new_text, reply_markup=topup_review_menu(topup_id),
+                )
+        except Exception:
+            pass
+
+    await message.answer(
+        f"\u2705 #{topup_id} so'rovi uchun summa {fmt_money(new_amount)} so'mga o'zgartirildi.\n"
+        f"Endi yuqoridagi xabardan \u2705 Tasdiqlashingiz mumkin."
+    )
+
+
 @router_admin.callback_query(F.data.startswith("topup:approve:"))
 async def approve_topup(callback: CallbackQuery, bot):
     if not await _is_admin(callback.from_user.id):
@@ -5002,6 +5194,13 @@ class ForceSubMiddleware(BaseMiddleware):
         if isinstance(event, CallbackQuery) and event.data == "forcesub:check":
             return await handler(event, data)
 
+        # Avval kanallar sozlanganmi shuni tekshiramiz (bitta baza so'rovi) — bu
+        # ko'pchilik holatda (majburiy obuna o'chiq) darhol chiqib ketadi,
+        # adminlikni tekshirish uchun QO'SHIMCHA baza so'rovi yubormaydi.
+        channels = await get_force_sub_channels()
+        if not channels:
+            return await handler(event, data)
+
         # /start (referal payload bilan bo'lishi ham mumkin: "/start ref123")
         # har doim cmd_start'ga yetkaziladi — Telegram start-payload'ni FAQAT
         # shu birinchi xabarda beradi, qayta yubormaydi. Agar shu yerda
@@ -5010,17 +5209,13 @@ class ForceSubMiddleware(BaseMiddleware):
         # ensure_user() (va referalni saqlashni) obunadan QAT'I NAZAR eng
         # avval bajaradi, so'ng kerak bo'lsa majburiy obuna xabarini o'zi
         # ko'rsatadi — shuning uchun bu yerda uni bloklash shart emas.
+        # (`words and` tekshiruvi shart: bo'sh yoki faqat bo'sh joylardan
+        # iborat xabar matnida .split() bo'sh ro'yxat qaytaradi, tekshirmasa
+        # words[0] IndexError berardi.)
         if isinstance(event, Message) and event.text:
-            first_word = event.text.split()[0].split("@")[0]
-            if first_word == "/start":
+            words = event.text.split()
+            if words and words[0].split("@")[0] == "/start":
                 return await handler(event, data)
-
-        # Avval kanallar sozlanganmi shuni tekshiramiz (bitta baza so'rovi) — bu
-        # ko'pchilik holatda (majburiy obuna o'chiq) darhol chiqib ketadi,
-        # adminlikni tekshirish uchun QO'SHIMCHA baza so'rovi yubormaydi.
-        channels = await get_force_sub_channels()
-        if not channels:
-            return await handler(event, data)
 
         if await _is_admin(user.id):
             return await handler(event, data)
