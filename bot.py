@@ -11,6 +11,7 @@ import functools
 import html
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -71,7 +72,10 @@ SMMUPPER_BASE_URL = "https://smmupper.uz/api/v2"
 CARD_NUMBER = os.getenv("CARD_NUMBER", "0000 0000 0000 0000")
 CARD_HOLDER = os.getenv("CARD_HOLDER", "F.I.SH.")
 
-# Narxga qo'shiladigan foyda foizi. Masalan 10 -> SmmUpper narxiga +10%
+# Narxga qo'shiladigan foyda foizi (UMUMIY/standart qiymat). Masalan 10 -> SmmUpper narxiga +10%.
+# Har bir bo'lim uchun ALOHIDA ustama ham qo'yish mumkin: admin panel -> Sozlamalar -> Narx ustamasi,
+# yoki .env: MARKUP_PERCENT_NUMBER / MARKUP_PERCENT_STARS / MARKUP_PERCENT_PREMIUM / MARKUP_PERCENT_UC.
+# Bo'lim uchun alohida qiymat bo'lmasa, shu umumiy foiz ishlatiladi.
 MARKUP_PERCENT = float(os.getenv("MARKUP_PERCENT", "0"))
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
@@ -180,6 +184,12 @@ CREATE TABLE IF NOT EXISTS support_threads (
     user_id INTEGER NOT NULL,
     PRIMARY KEY (admin_chat_id, message_id)
 );
+
+CREATE INDEX IF NOT EXISTS ix_orders_user ON orders (user_id, id);
+CREATE INDEX IF NOT EXISTS ix_orders_status ON orders (status, id);
+CREATE INDEX IF NOT EXISTS ix_orders_type_status ON orders (order_type, status, country);
+CREATE INDEX IF NOT EXISTS ix_topups_status ON topups (status, id);
+CREATE INDEX IF NOT EXISTS ix_topups_user ON topups (user_id, status);
 """
 
 _SCHEMA_PG = """
@@ -233,6 +243,12 @@ CREATE TABLE IF NOT EXISTS support_threads (
     user_id BIGINT NOT NULL,
     PRIMARY KEY (admin_chat_id, message_id)
 );
+
+CREATE INDEX IF NOT EXISTS ix_orders_user ON orders (user_id, id);
+CREATE INDEX IF NOT EXISTS ix_orders_status ON orders (status, id);
+CREATE INDEX IF NOT EXISTS ix_orders_type_status ON orders (order_type, status, country);
+CREATE INDEX IF NOT EXISTS ix_topups_status ON topups (status, id);
+CREATE INDEX IF NOT EXISTS ix_topups_user ON topups (user_id, status);
 """
 
 
@@ -612,29 +628,31 @@ async def create_order(user_id: int, order_type: str, ref: Optional[str], server
             return cur.lastrowid
 
 
-async def top_countries(limit: int = 10) -> list:
+async def top_countries(limit: int = 10, ready: Optional[bool] = None) -> list:
     """Eng ko'p buyurtma qilingan davlatlarni (kod, soni) juftliklari
     ro'yxati sifatida, kamayish tartibida qaytaradi. Faqat "country"
     ustuni saqlangan (ya'ni shu funksiya botga qo'shilgandan keyin
     qilingan) 'number' turidagi va bekor qilinmagan buyurtmalar
-    hisobga olinadi."""
+    hisobga olinadi. `ready`: None — hammasi; True — faqat "Tayyor akkaunt"
+    (server 3); False — faqat "Oddiy raqam" (server 1/2)."""
+    if ready is True:
+        server_clause = "AND server = 3 "
+    elif ready is False:
+        server_clause = "AND COALESCE(server, 0) != 3 "
+    else:
+        server_clause = ""
+    sql = (
+        "SELECT country, COUNT(*) AS cnt FROM orders "
+        "WHERE order_type = 'number' AND country IS NOT NULL AND status != 'refunded' "
+        + server_clause
+    )
     if _PG:
         async with _pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT country, COUNT(*) AS cnt FROM orders "
-                "WHERE order_type = 'number' AND country IS NOT NULL AND status != 'refunded' "
-                "GROUP BY country ORDER BY cnt DESC LIMIT $1",
-                limit,
-            )
+            rows = await conn.fetch(sql + "GROUP BY country ORDER BY cnt DESC LIMIT $1", limit)
             return [(r["country"], r["cnt"]) for r in rows]
     else:
         async with _db_sqlite() as db:
-            cur = await db.execute(
-                "SELECT country, COUNT(*) AS cnt FROM orders "
-                "WHERE order_type = 'number' AND country IS NOT NULL AND status != 'refunded' "
-                "GROUP BY country ORDER BY cnt DESC LIMIT ?",
-                (limit,),
-            )
+            cur = await db.execute(sql + "GROUP BY country ORDER BY cnt DESC LIMIT ?", (limit,))
             rows = await cur.fetchall()
             return [(r[0], r[1]) for r in rows]
 
@@ -1266,9 +1284,26 @@ def new_request_id() -> str:
 
 
 class SmmUpperClient:
+    PRICES_CACHE_TTL = 90  # soniya — shu vaqt ichida getPrices() qayta so'ralmaydi (narxlar soniyama-soniya o'zgarmaydi)
+
     def __init__(self, api_key: str = SMMUPPER_API_KEY, base_url: str = SMMUPPER_BASE_URL):
         self.api_key = api_key  # .env'dagi standart qiymat — DB bo'sh bo'lsa shu ishlatiladi
         self.base_url = base_url
+        self._session: Optional[aiohttp.ClientSession] = None  # so'rovlar orasida qayta ishlatiladi
+        self._prices_cache: Optional[dict] = None
+        self._prices_cache_ts: float = 0.0
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Bitta umumiy sessiyani qayta ishlatadi — har bir so'rovda yangi TCP/TLS ulanish ochish
+        o'rniga. Yopilib qolgan yoki hali yaratilmagan bo'lsa — yangisini ochadi."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+        return self._session
+
+    async def close(self) -> None:
+        """Bot to'xtaganda (graceful shutdown) chaqiriladi — ochiq ulanishni tartibli yopadi."""
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
 
     async def _current_api_key(self) -> str:
         """Admin panel orqali DB'ga saqlangan API kalit bo'lsa o'shani, aks holda
@@ -1284,38 +1319,47 @@ class SmmUpperClient:
             if value is not None:
                 query[key] = value
 
-        timeout = aiohttp.ClientTimeout(total=20)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(self.base_url, params=query) as resp:
-                if resp.status == 429 and _retry_on_limit:
-                    retry_after = 5
-                    try:
-                        retry_after = int(resp.headers.get("Retry-After", "5"))
-                    except ValueError:
-                        pass
-                    await asyncio.sleep(min(retry_after, 15))
-                    return await self._request(
-                        action, raise_on_error=raise_on_error, _retry_on_limit=False, **params
-                    )
-
+        session = await self._get_session()
+        async with session.get(self.base_url, params=query) as resp:
+            if resp.status == 429 and _retry_on_limit:
+                retry_after = 5
                 try:
-                    data = await resp.json(content_type=None)
-                except Exception:
-                    text = await resp.text()
-                    raise SmmUpperError(f"Server javobini o'qib bo'lmadi: {text[:200]}", resp.status)
+                    retry_after = int(resp.headers.get("Retry-After", "5"))
+                except ValueError:
+                    pass
+                await asyncio.sleep(min(retry_after, 15))
+                return await self._request(
+                    action, raise_on_error=raise_on_error, _retry_on_limit=False, **params
+                )
 
-                if raise_on_error and not data.get("success"):
-                    raise SmmUpperError(data.get("error", "Noma'lum xato"), resp.status)
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                text = await resp.text()
+                raise SmmUpperError(f"Server javobini o'qib bo'lmadi: {text[:200]}", resp.status)
 
-                return data
+            if raise_on_error and not data.get("success"):
+                raise SmmUpperError(data.get("error", "Noma'lum xato"), resp.status)
+
+            return data
 
     # 1. Balans (bizning hamkor hisobimizning SmmUpper'dagi balansi)
     async def get_balance(self) -> dict:
         return await self._request("getBalance")
 
     # 2. Narxlar (Stars / Premium)
-    async def get_prices(self) -> dict:
-        return await self._request("getPrices")
+    async def get_prices(self, *, force_refresh: bool = False) -> dict:
+        """PRICES_CACHE_TTL soniya ichida keshdan qaytadi — Stars/Premium/UC oqimlarining har biri
+        bitta xaridda bir necha marta chaqiradi, narxlar esa soniyama-soniya o'zgarmaydi.
+        `force_refresh=True` keshni chetlab o'tadi.
+        """
+        now = time.monotonic()
+        if not force_refresh and self._prices_cache is not None and now - self._prices_cache_ts < self.PRICES_CACHE_TTL:
+            return self._prices_cache
+        data = await self._request("getPrices")
+        self._prices_cache = data
+        self._prices_cache_ts = now
+        return data
 
     # 3. Davlatlar ro'yxati
     async def available_countries(self, server: int) -> dict:
@@ -1379,38 +1423,105 @@ class SmmUpperClient:
 # ==============================================================
 # NARXLASH (pricing)
 # ==============================================================
-SETTINGS_KEY_MARKUP = "markup_percent"
+SETTINGS_KEY_MARKUP = "markup_percent"   # UMUMIY ustama: alohida qiymati yo'q bo'limlar shuni ishlatadi
+
+# Alohida narx ustamasi qo'yiladigan bo'limlar (buyurtma turlari nomlari bilan bir xil).
+# "Tayyor akkaunt" ham "number" bo'limiga kiradi — uning ustamasi Raqam bilan bir xil.
+MARKUP_CATEGORIES = ("number", "stars", "premium", "uc")
+MAX_MARKUP_PERCENT = 1000.0   # xato kiritilgan katta qiymat (masalan 10000) narxlarni buzib yubormasligi uchun
 
 
-async def get_markup_percent() -> float:
-    """Admin panel orqali bazaga saqlangan narx ustamasi bo'lsa o'shani,
-    aks holda .env (MARKUP_PERCENT) dagisini qaytaradi."""
-    raw = await get_setting(SETTINGS_KEY_MARKUP, default=str(MARKUP_PERCENT))
+def _parse_markup(raw) -> Optional[float]:
+    """Saqlangan/kiritilgan ustamani songa aylantiradi. Bo'sh, buzuq, cheksiz (nan/inf) yoki -100% dan
+    past qiymat bo'lsa None qaytaradi (bunday qiymat narxni 0 yoki manfiy qilib yuborardi)."""
+    if raw is None:
+        return None
     try:
-        return float(raw)
+        value = float(str(raw).strip().replace(",", "."))
     except (TypeError, ValueError):
-        return MARKUP_PERCENT
+        return None
+    return value if math.isfinite(value) and value > -100 else None
+
+
+def _markup_key(category: Optional[str]) -> str:
+    return f"{SETTINGS_KEY_MARKUP}_{category}" if category else SETTINGS_KEY_MARKUP
+
+
+def _env_markup(category: str) -> Optional[float]:
+    """.env dagi MARKUP_PERCENT_NUMBER / _STARS / _PREMIUM / _UC (o'rnatilmagan bo'lsa None)."""
+    return _parse_markup(os.getenv(f"MARKUP_PERCENT_{category.upper()}"))
+
+
+async def get_markup_percent(category: Optional[str] = None) -> float:
+    """Narx ustamasi (foizda). `category` (number / stars / premium / uc) berilsa — shu bo'lim uchun ALOHIDA
+    qo'yilgan ustama; u yo'q bo'lsa (yoki bo'lim berilmasa) — UMUMIY ustama. Ustuvorlik (yuqoridan pastga):
+      1) admin paneldan saqlangan bo'lim ustamasi;   2) .env: MARKUP_PERCENT_<BO'LIM>;
+      3) admin paneldan saqlangan umumiy ustama;     4) .env: MARKUP_PERCENT."""
+    if category in MARKUP_CATEGORIES:
+        own = _parse_markup(await get_setting(_markup_key(category), default=None))
+        if own is None:
+            own = _env_markup(category)
+        if own is not None:
+            return own
+    general = _parse_markup(await get_setting(SETTINGS_KEY_MARKUP, default=None))
+    return general if general is not None else MARKUP_PERCENT
+
+
+async def get_markup_overview() -> dict:
+    """Admin panel uchun: {"general": umumiy foiz, "items": {bo'lim: (foiz, alohida_qo'yilganmi)}}."""
+    general = await get_markup_percent()
+    items = {}
+    for category in MARKUP_CATEGORIES:
+        own = _parse_markup(await get_setting(_markup_key(category), default=None))
+        if own is None:
+            own = _env_markup(category)
+        items[category] = (own if own is not None else general, own is not None)
+    return {"general": general, "items": items}
 
 
 def _markup_multiplier(percent: float) -> float:
-    """Ustama foizini ko'paytiruvchiga aylantiradi. Bu formula avval 4 joyda
-    (with_markup, davlat tugmasi narxi, Stars narxini ko'rsatish — 2 joyda)
-    alohida-alohida takrorlangan edi; endi hammasi shu yerdan foydalanadi,
-    shunda formulani o'zgartirish kerak bo'lsa, bitta joyni tuzatish yetarli."""
+    """Ustama foizini ko'paytiruvchiga aylantiradi. Formula shu yerda BITTA — o'zgartirish kerak bo'lsa,
+    hamma joyda (davlat tugmasi narxi, Stars narxi, xarid) birdaniga o'zgaradi."""
     return 1 + percent / 100
 
 
-async def with_markup(base_price) -> int:
-    """Bazaviy (SmmUpper) narxga sozlangan foyda foizini qo'shib, yaxlit
-    so'mga aylantiradi. Raqam, Stars va Premium — uchalasi ham shu bitta
-    funksiyadan foydalanadi, shuning uchun ustama hammasiga bir xilda
-    qo'llanadi. Natija HECH QACHON 0 dan past bo'lmaydi — ustama foizi xato
-    sozlansa ham (masalan admin -100 dan pastroq qiymat kiritib qo'ysa)
-    narx manfiyga tushib, foydalanuvchi "bepul olish + balansga pul qo'shib
-    olish" holatiga tushib qolmasligi uchun muhim himoya chizig'i."""
-    percent = await get_markup_percent()
-    price = round(float(base_price) * _markup_multiplier(percent))
-    return max(0, price)
+def _positive_number(value) -> Optional[float]:
+    """Provayder javobidagi narx (son yoki son ko'rinishidagi satr): faqat MUSBAT va chekli bo'lsa qaytaradi."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+async def with_markup(base_price, category: Optional[str] = None) -> int:
+    """Bazaviy (SmmUpper) narxga `category` bo'limining foyda foizini qo'shib, yaxlit so'mga aylantiradi.
+    Raqam, Stars, Premium va UC — har biri O'Z ustamasi bilan hisoblanadi (bo'lim berilmasa — umumiy ustama).
+    Natija HECH QACHON 0 dan past bo'lmaydi. Bazaviy narx noma'lum/noto'g'ri bo'lsa ham 0 qaytadi — bu
+    "narx aniqlanmadi" degani: chaqiruvchi uni SOTMASLIGI kerak (aks holda mahsulot tekinga ketib qolardi)."""
+    base = _positive_number(base_price)
+    if base is None:
+        return 0
+    percent = await get_markup_percent(category)
+    return max(0, round(base * _markup_multiplier(percent)))
+
+
+async def final_price(user_id: int, result: dict, est_price: int, category: str) -> int:
+    """Xariddan keyingi YAKUNIY qadam: provayder javobidagi HAQIQIY narxni (+ `category` ustamasi) taxminiy
+    narx bilan solishtirib, farqni balansdan hisob-kitob qiladi (ortig'ini yechadi yoki ortiqchasini darhol
+    qaytaradi — settle_price_difference orqali) va foydalanuvchidan HAQIQATDA yechilgan summani qaytaradi;
+    AYNAN shu summa buyurtmaga yozilishi shart. Javobda narx yo'q/noto'g'ri bo'lsa — hisob-kitob qilinmaydi,
+    taxminiy narx qoladi (aks holda "farq" foydalanuvchiga to'liq qaytarilib, mahsulot tekinga ketib qolardi)."""
+    raw = _positive_number((result or {}).get("price"))
+    if raw is None:
+        logging.warning(f"Provayder javobida narx yo'q yoki noto'g'ri ({category}) — taxminiy narx ishlatildi")
+        return est_price
+    actual = await with_markup(raw, category)
+    if actual <= 0:
+        return est_price
+    return await settle_price_difference(user_id, est_price, actual)
 
 
 async def settle_price_difference(user_id: int, est_price: int, actual_price: int) -> int:
@@ -1436,6 +1547,8 @@ async def settle_price_difference(user_id: int, est_price: int, actual_price: in
 
 # ---------------- Xaridni himoyalash: parallel bosish, eskirgan callback, tarmoq xatosi ----------------
 _NET_ERRORS = (asyncio.TimeoutError, aiohttp.ClientError)
+_API_ERRORS = (SmmUpperError,) + _NET_ERRORS   # provayder xatosi YOKI tarmoq/timeout
+_FETCH_ERRORS = _API_ERRORS + (KeyError,)      # + javob kutilmagan ko'rinishda bo'lsa
 _purchase_inflight: set = set()
 
 
@@ -1465,6 +1578,11 @@ async def _safe_answer(callback, text=None, show_alert: bool = False):
         await callback.answer(text, show_alert=show_alert)
     except Exception:
         pass
+
+
+def _err_text(e: BaseException) -> str:
+    """Xato matni: SmmUpperError.message, aks holda (tarmoq xatosi/timeout) qisqa tavsif."""
+    return getattr(e, "message", None) or str(e) or type(e).__name__
 
 
 class PurchaseUnknownError(Exception):
@@ -1544,25 +1662,39 @@ WELCOME = (
 BTN_HELP = "\U0001F195 Yordam"
 BTN_BALANCE = "\U0001F4B0 Balans"
 BTN_TOPUP = "\U0001F4B3 Balansni to'ldirish"
-BTN_NUMBER = "\U0001F4F1 Raqam sotib olish"
-BTN_STARS = "\u2B50 Stars sotib olish"
-BTN_PREMIUM = "\U0001F48E Premium sotib olish"
-BTN_UC = "\U0001F3AE UC sotib olish"
+BTN_NUMBER = "\U0001F4F1 Raqam"
+BTN_STARS = "\u2B50 Stars"
+BTN_PREMIUM = "\U0001F48E Premium"
+BTN_UC = "\U0001F3AE PUBG UC"
 BTN_ORDERS = "\U0001F4CB Buyurtmalarim"
 BTN_CHECK_ORDER = "\U0001F50E Buyurtma ID orqali"
-BTN_REPEAT_ORDER = "\U0001F501 Oxirgini takrorlash"
+BTN_REPEAT_ORDER = "\U0001F501 Qayta buyurtma"
+BTN_BACK = "\u2B05\uFE0F Orqaga"
 BTN_CANCEL = "\u274C Bekor qilish"
 BTN_CHECK_CODE = "\U0001F504 Kodni tekshirish"
 BTN_CONFIRM = "\u2705 Sotib olish"
 
 REFERRAL_CASHBACK_PERCENT = 1  # taklif qilingan do'st balans to'ldirsa, shu foizi taklif qilgan odamga keshbek sifatida qo'shiladi
 
+# Asosiy (pastki) menyu tugmalari uchun qabul qilinadigan matnlar: hozirgi qisqa yorliq + ESKI (uzunroq)
+# yorliqlar. Foydalanuvchida eski klaviatura qolib ketgan bo'lishi mumkin (Telegram uni bot yangisini
+# yuborguncha almashtirmaydi) — eski tugma bosilsa ham bot javob berishi uchun ikkalasi ham ishlaydi.
+MENU_HELP = frozenset({BTN_HELP})
+MENU_BALANCE = frozenset({BTN_BALANCE})
+MENU_NUMBER = frozenset({BTN_NUMBER, "\U0001F4F1 Raqam sotib olish"})
+MENU_STARS = frozenset({BTN_STARS, "\u2B50 Stars sotib olish"})
+MENU_PREMIUM = frozenset({BTN_PREMIUM, "\U0001F48E Premium sotib olish"})
+MENU_UC = frozenset({BTN_UC, "\U0001F3AE UC sotib olish"})
+MENU_ORDERS = frozenset({BTN_ORDERS})
+MENU_CHECK_ORDER = frozenset({BTN_CHECK_ORDER})
+MENU_REPEAT_ORDER = frozenset({BTN_REPEAT_ORDER, "\U0001F501 Oxirgini takrorlash"})
+
 # Bosh menyudagi tugma matnlari — bular FSM holatida turgan "erkin matn"
 # handlerlar tomonidan "username" yoki "summa" deb noto'g'ri qabul qilinmasligi kerak.
 RESERVED_TEXTS = {
-    BTN_HELP, BTN_BALANCE, BTN_TOPUP, BTN_NUMBER,
-    BTN_STARS, BTN_PREMIUM, BTN_UC, BTN_ORDERS, BTN_CANCEL,
-    BTN_CHECK_ORDER, BTN_REPEAT_ORDER,
+    BTN_TOPUP, BTN_CANCEL,
+    *MENU_HELP, *MENU_BALANCE, *MENU_NUMBER, *MENU_STARS, *MENU_PREMIUM,
+    *MENU_UC, *MENU_ORDERS, *MENU_CHECK_ORDER, *MENU_REPEAT_ORDER,
 }
 
 
@@ -1734,27 +1866,77 @@ def current_api_key_line(masked: str) -> str:
     return f"\U0001F511 Joriy API kalit: {masked}"
 
 
-ASK_MARKUP_PERCENT = (
-    "Narxlarga qo'shiladigan foyda foizini kiriting (masalan: 10 — bu SmmUpper "
-    "narxining ustiga +10% qo'shib sotish degani).\n"
-    "Ustama qo'ymaslik uchun: 0\n\n"
-    "Bu foiz \U0001F4F1 Raqam, \u2B50 Stars, \U0001F48E Premium va \U0001F3AE UC — hammasiga ham "
-    "bir vaqtda qo'llanadi."
-)
+MARKUP_ICONS = {"number": "\U0001F4F1", "stars": "\u2B50", "premium": "\U0001F48E", "uc": "\U0001F3AE"}
+MARKUP_NAMES = {"number": "Raqam", "stars": "Stars", "premium": "Premium", "uc": "PUBG UC"}
+MARKUP_LABELS = {c: f"{MARKUP_ICONS[c]} {MARKUP_NAMES[c]}" for c in MARKUP_CATEGORIES}
+
+
+def ask_markup_percent(target: str) -> str:
+    """Ustama foizini so'rash matni. target: bo'lim ("number"/"stars"/"premium"/"uc") yoki "all" (hammasiga)."""
+    if target == "all":
+        scope = (
+            "\U0001F310 Bu foiz \U0001F4F1 Raqam, \u2B50 Stars, \U0001F48E Premium va \U0001F3AE PUBG UC \u2014 "
+            "HAMMASIGA bir xil qo'yiladi."
+        )
+        reset_hint = ""
+    else:
+        scope = f"{MARKUP_LABELS[target]} uchun ALOHIDA foiz qo'yiladi (boshqa bo'limlarga tegmaydi)."
+        reset_hint = "\nUmumiy foizga qaytarish uchun: -"
+    return (
+        "Narxlarga qo'shiladigan foyda foizini kiriting (masalan: 10 \u2014 SmmUpper narxining ustiga "
+        "+10% qo'shib sotish degani).\n"
+        f"Ustama qo'ymaslik uchun: 0{reset_hint}\n\n{scope}"
+    )
+
+
 NOT_A_VALID_PERCENT = "\u274C Noto'g'ri qiymat. Faqat son kiriting, masalan: 10 yoki 0"
 INVALID_MARKUP_RANGE = (
     "\u274C Ustama -100% dan katta bo'lishi kerak (aks holda narx 0 yoki "
     "manfiy bo'lib, foydalanuvchilar mahsulotni bepul olib qolishi mumkin). "
     "Boshqa qiymat kiriting."
 )
+INVALID_MARKUP_MAX = (
+    f"\u274C Ustama juda katta (eng ko'pi bilan {MAX_MARKUP_PERCENT:g}%). "
+    "Xato yozmadingizmi? Boshqa qiymat kiriting."
+)
 
 
-def markup_saved(percent: float) -> str:
-    return f"\u2705 Narx ustamasi saqlandi: {percent:g}%\n\nBarcha yangi buyurtmalarda shu foiz qo'llaniladi."
+def markup_saved(percent: float, target: str = "all") -> str:
+    if target == "all":
+        return f"\u2705 Barcha bo'limlar uchun ustama saqlandi: {percent:g}%\n\nYangi buyurtmalarda shu foiz qo'llaniladi."
+    return (
+        f"\u2705 {MARKUP_LABELS[target]} uchun ustama saqlandi: {percent:g}%\n\n"
+        "Yangi buyurtmalarda shu foiz qo'llaniladi."
+    )
 
 
-def current_markup_line(percent: float) -> str:
-    return f"\U0001F4C8 Joriy narx ustamasi: {percent:g}%"
+def markup_reset_text(target: str, percent: float) -> str:
+    return (
+        f"\u2705 {MARKUP_LABELS[target]} endi umumiy ustamadan foydalanadi: {percent:g}%"
+    )
+
+
+def markup_panel_text(overview: dict) -> str:
+    """Narx ustamasi paneli matni: har bir bo'lim uchun joriy foiz (alohida qo'yilmagan bo'lsa — "umumiy")."""
+    lines = ["\U0001F4C8 Narx ustamasi", ""]
+    for category in MARKUP_CATEGORIES:
+        percent, custom = overview["items"][category]
+        lines.append(f"{MARKUP_LABELS[category]}: {percent:g}%" + ("" if custom else " (umumiy)"))
+    lines += [
+        "",
+        f"\U0001F310 Umumiy: {overview['general']:g}%",
+        "",
+        "Narx = SmmUpper narxi + ustama. O'zgartirmoqchi bo'lgan bo'limni tanlang \U0001F447",
+    ]
+    return "\n".join(lines)
+
+
+def markup_short_line(overview: dict) -> str:
+    """Sozlamalar ekranidagi bir qatorli xulosa."""
+    parts = " \u00B7 ".join(
+        f"{MARKUP_ICONS[c]} {overview['items'][c][0]:g}%" for c in MARKUP_CATEGORIES
+    )
+    return f"\U0001F4C8 Narx ustamasi: {parts}"
 
 
 FORCE_SUB_PROMPT = (
@@ -1910,46 +2092,106 @@ def revenue_graph_text(daily: list) -> str:
 # Aiogram kutubxonasi bu maydonni hali rasman "tanimagan" versiyada boʼlsa ham,
 # Telegram obyektlari noma'lum maydonlarni qabul qilib, serverga toʼgʼri
 # yuborib beradi — shuning uchun bu yerda oddiy satr sifatida ishlatiladi.
-STYLE_DANGER = "danger"    # qizil — bekor qilish / rad etish kabi "orqaga" tugmalar
-STYLE_SUCCESS = "success"  # yashil — tasdiqlash / tasdiqlangan amallar
-STYLE_PRIMARY = "primary"  # koʼk — asosiy tanlov tugmalari
+# Bot API 9.4 ni qo'llaydigan yangi aiogram versiyalarida bu maydon rasman bor; eskilarida Telegram obyektlari
+# noma'lum maydonlarni qabul qilib, serverga o'zi yuborib beradi. Muhitingizda ranglar muammo tug'dirsa (kutubxona yoki
+# Telegram qo'llamasa) — .env ga BUTTON_STYLES=0 yozing: tugmalar ranglarsiz, lekin XATOSIZ ishlaydi.
+# Bundan tashqari ishga tushishda _probe_button_style_support() kutubxonani o'zi tekshiradi va kerak bo'lsa
+# ranglarni avtomatik o'chiradi.
+BUTTON_STYLES_ENABLED = os.getenv("BUTTON_STYLES", "1").strip().lower() not in ("0", "false", "no", "off")
+STYLE_DANGER = "danger" if BUTTON_STYLES_ENABLED else None    # qizil — bekor qilish / rad etish / orqaga
+STYLE_SUCCESS = "success" if BUTTON_STYLES_ENABLED else None  # yashil — tasdiqlash / tasdiqlangan amallar
+STYLE_PRIMARY = "primary" if BUTTON_STYLES_ENABLED else None  # koʼk — asosiy tanlov tugmalari
+
+
+def _probe_button_style_support() -> None:
+    """Ishga tushganda BIR marta: aiogram `style` maydonini serverga yuboriladigan tugma obyektiga
+    qo'shyaptimi, tekshiradi. Qo'shmasa yoki xato bersa — ranglar o'chiriladi (bot ranglarsiz ishlayveradi,
+    hech narsa buzilmaydi)."""
+    global STYLE_DANGER, STYLE_SUCCESS, STYLE_PRIMARY
+    if not BUTTON_STYLES_ENABLED:
+        logging.info("Tugma ranglari o'chirilgan (BUTTON_STYLES=0)")
+        return
+    try:
+        probe = InlineKeyboardButton(text="x", callback_data="x", style="primary")
+        supported = probe.model_dump(exclude_none=True).get("style") == "primary"
+    except Exception:
+        supported = False
+    if not supported:
+        STYLE_DANGER = STYLE_SUCCESS = STYLE_PRIMARY = None
+        logging.warning("Aiogram tugma 'style' maydonini qo'llamayapti — tugma ranglari o'chirildi.")
+
+
+def _kb(rows: list) -> InlineKeyboardMarkup:
+    """Inline klaviatura yig'ish: BO'SH qatorlar tashlab yuboriladi (Telegram bo'sh qatorli
+    klaviaturani rad etadi va butun xabar yuborilmay qoladi)."""
+    return InlineKeyboardMarkup(inline_keyboard=[list(row) for row in rows if row])
+
+
+def nav_rows(back_callback: Optional[str] = None, *, cancel: bool = True) -> list:
+    """Pastki navigatsiya QATORLARI ro'yxati: "Orqaga" va "Bekor qilish" BITTA qatorda (avval ikki qator
+    edi). Natija qatorlar ro'yxati va u BO'SH bo'lishi ham mumkin (hech narsa so'ralmasa), shuning uchun
+    uni `rows.extend(nav_rows(...))` bilan qo'shing — bo'sh natija hech qanday bo'sh qator hosil qilmaydi."""
+    row = []
+    if back_callback:
+        row.append(InlineKeyboardButton(text=BTN_BACK, callback_data=back_callback, style=STYLE_PRIMARY))
+    if cancel:
+        row.append(InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER))
+    return [row] if row else []
+
+
+COPY_TEXT_MAX = 256   # Telegram: CopyTextButton matni 1..256 belgi
+
+
+def _copy_text(value) -> Optional[str]:
+    """Nusxalanadigan matn: bo'sh yoki 256 belgidan uzun bo'lsa None (Telegram bunday tugmali BUTUN xabarni rad etadi)."""
+    text = str(value).strip() if value is not None else ""
+    return text if 0 < len(text) <= COPY_TEXT_MAX else None
+
+
+def _copy_button(label: str, value) -> Optional[InlineKeyboardButton]:
+    """"Nusxalash" tugmasi; qiymat yaroqsiz bo'lsa None (tugma umuman qo'shilmaydi)."""
+    text = _copy_text(value)
+    if not text:
+        return None
+    return InlineKeyboardButton(text=label, copy_text=CopyTextButton(text=text))
 
 
 def main_menu() -> ReplyKeyboardMarkup:
+    """Asosiy menyu: 4 qator x 2 ustun (avval 6 qator edi). Xarid bo'limlari tepada."""
     return ReplyKeyboardMarkup(
         keyboard=[
+            [KeyboardButton(text=BTN_NUMBER, style=STYLE_PRIMARY), KeyboardButton(text=BTN_STARS, style=STYLE_PRIMARY)],
+            [KeyboardButton(text=BTN_PREMIUM, style=STYLE_PRIMARY), KeyboardButton(text=BTN_UC, style=STYLE_PRIMARY)],
             [KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_ORDERS)],
-            [KeyboardButton(text=BTN_NUMBER, style=STYLE_PRIMARY)],
-            [KeyboardButton(text=BTN_STARS, style=STYLE_PRIMARY), KeyboardButton(text=BTN_PREMIUM, style=STYLE_PRIMARY)],
-            [KeyboardButton(text=BTN_UC, style=STYLE_PRIMARY)],
-            [KeyboardButton(text=BTN_REPEAT_ORDER), KeyboardButton(text=BTN_CHECK_ORDER)],
-            [KeyboardButton(text=BTN_HELP)],
+            [KeyboardButton(text=BTN_REPEAT_ORDER), KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
+        input_field_placeholder="Bo'limni tanlang \U0001F447",
     )
 
 
 def balance_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return _kb([
         [InlineKeyboardButton(text=BTN_TOPUP, callback_data="topup:start", style=STYLE_PRIMARY)],
         [InlineKeyboardButton(text="\U0001F381 Do'stlarni taklif qilish", callback_data="referral:info", style=STYLE_PRIMARY)],
     ])
 
 
 def cancel_inline(back_callback: Optional[str] = None) -> InlineKeyboardMarkup:
-    rows = []
-    if back_callback:
-        rows.append(nav_row(back_callback))
-    rows.append([InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return _kb(nav_rows(back_callback))
+
+
+NUMBER_TYPE_TEXT = "Qanday raqam kerak?\n\n\U0001F4F1 Oddiy raqam \u2014 SMS kod uchun."
+PICK_COUNTRY_TEXT = "Davlatni tanlang (narx \u2014 so'mda):"
 
 
 def number_type_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\U0001F4F1 Oddiy raqam (SMS kod uchun)", callback_data="numtype:regular", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F510 Tayyor akkaunt", callback_data="numtype:ready", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
-    ])
+    rows = [[
+        InlineKeyboardButton(text="\U0001F4F1 Oddiy raqam", callback_data="numtype:regular", style=STYLE_PRIMARY),
+        InlineKeyboardButton(text="\U0001F510 Tayyor akkaunt", callback_data="numtype:ready", style=STYLE_PRIMARY),
+    ]]
+    rows.extend(nav_rows())
+    return _kb(rows)
 
 
 NUMBER_PURCHASE_WARNING = (
@@ -1971,10 +2213,10 @@ NUMBER_PURCHASE_WARNING = (
 
 
 def number_warning_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\u2705 Tasdiqlash", callback_data="numwarn:confirm", style=STYLE_SUCCESS)],
-        [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
-    ])
+    return _kb([[
+        InlineKeyboardButton(text="\u2705 Roziman", callback_data="numwarn:confirm", style=STYLE_SUCCESS),
+        InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER),
+    ]])
 
 
 # ==============================================================
@@ -2068,14 +2310,22 @@ def country_flag(code: str) -> str:
     return "".join(chr(0x1F1E6 + (ord(ch) - ord("A"))) for ch in code)
 
 
+COUNTRY_BUTTON_NAME_MAX = 13   # tugmada davlat nomi shundan uzun bo'lsa "…" bilan qisqartiriladi (narx doim ko'rinsin)
+
+
 def _country_button_label(code: str, info: dict, markup_percent: float = 0.0) -> str:
+    """Davlat tugmasi matni: "🇹🇷 Turkiya · 25 000" (narx so'mda — buni ro'yxat sarlavhasi aytadi).
+    Qisqa yorliq: ikki ustunli tugmada narx Telegram tomonidan kesilib qolmasin. To'liq nom tanlagandan
+    keyingi tasdiqlash ekranida ko'rinadi."""
     price = info.get("price", "?")
     name = country_display_name(code)
+    if len(name) > COUNTRY_BUTTON_NAME_MAX:
+        name = name[:COUNTRY_BUTTON_NAME_MAX - 1].rstrip() + "\u2026"
     flag = country_flag(code)
     label_name = f"{flag} {name}" if flag else name
     if isinstance(price, (int, float)):
         shown_price = max(0, round(float(price) * _markup_multiplier(markup_percent)))
-        return f"{label_name} — {fmt_money(shown_price)} so'm"
+        return f"{label_name} \u00B7 {fmt_money(shown_price)}"
     return label_name
 
 
@@ -2106,12 +2356,13 @@ _COUNTRY_MENU_MODES = {
 def countries_menu(server: int, countries: dict, page: int = 0, *, mode: str = "browse", markup_percent: float = 0.0) -> InlineKeyboardMarkup:
     """Davlatlar ro'yxatini to'liq nom (+ bayroq) bilan, sahifalab ko'rsatadi
     (bitta ulkan ro'yxat o'rniga). `mode`:
-      - "browse": alifbo tartibida, pastda TOP10/Arzon/Qidirish tugmalari
-      - "cheap":  narx bo'yicha arzondan qimmatga, "ro'yxatga qaytish" bilan
-      - "search": qidiruv natijalari, "qayta qidirish"+"ro'yxatga qaytish" bilan
+      - "browse": alifbo tartibida, pastda TOP10/Arzon/Qidirish tugmalari (bitta qatorda)
+      - "cheap":  narx bo'yicha arzondan qimmatga, "orqaga" (ro'yxatga) bilan
+      - "search": qidiruv natijalari, "qayta qidirish" + "orqaga" (ro'yxatga) bilan
     `markup_percent` — narxlarni ko'rsatishda qo'shiladigan ustama (admin
     panelda o'zgartirilganda shu yerdagi ko'rinish ham darhol yangilanishi
     uchun chaqiruvchi joyda oldindan hisoblab, parametr sifatida beriladi).
+    Chaqiruvchi ro'yxat uchun "number" bo'limi ustamasini beradi.
     """
     sort_key, pg_prefix = _COUNTRY_MENU_MODES[mode]
     items = _sorted_country_items(countries, sort=sort_key)
@@ -2140,40 +2391,36 @@ def countries_menu(server: int, countries: dict, page: int = 0, *, mode: str = "
 
     if mode == "browse":
         rows.append([
-            InlineKeyboardButton(text="\U0001F3C6 TOP 10 davlatlar", callback_data=f"ctytop:{server}", style=STYLE_PRIMARY),
-            InlineKeyboardButton(text="\U0001F4C9 Arzon davlatlar", callback_data=f"ctycpg:{server}:0", style=STYLE_PRIMARY),
+            InlineKeyboardButton(text="\U0001F3C6 TOP 10", callback_data=f"ctytop:{server}", style=STYLE_PRIMARY),
+            InlineKeyboardButton(text="\U0001F4C9 Arzon", callback_data=f"ctycpg:{server}:0", style=STYLE_PRIMARY),
+            InlineKeyboardButton(text="\U0001F50D Qidirish", callback_data=f"ctysearch:{server}", style=STYLE_PRIMARY),
         ])
-        rows.append([InlineKeyboardButton(text="\U0001F50D Qidirish", callback_data=f"ctysearch:{server}", style=STYLE_PRIMARY)])
-        rows.append(nav_row(back_callback="numback:type"))
+        rows.extend(nav_rows("numback:type"))
     elif mode == "search":
         rows.append([InlineKeyboardButton(text="\U0001F50D Qayta qidirish", callback_data=f"ctysearch:{server}", style=STYLE_PRIMARY)])
-        rows.append([InlineKeyboardButton(text="\U0001F519 Ro'yxatga qaytish", callback_data=f"ctyback:{server}", style=STYLE_PRIMARY)])
+        rows.extend(nav_rows(f"ctyback:{server}"))
     else:  # "cheap"
-        rows.append([InlineKeyboardButton(text="\U0001F519 Ro'yxatga qaytish", callback_data=f"ctyback:{server}", style=STYLE_PRIMARY)])
+        rows.extend(nav_rows(f"ctyback:{server}"))
 
-    rows.append([InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return _kb(rows)
 
 
 def confirm_menu(confirm_data: str, back_callback: Optional[str] = None) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=BTN_CONFIRM, callback_data=confirm_data, style=STYLE_SUCCESS)]]
-    if back_callback:
-        rows.append(nav_row(back_callback))
-    rows.append([InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    rows.extend(nav_rows(back_callback))
+    return _kb(rows)
+
+
+STARS_PRESETS = (50, 100, 250, 500, 1000)
 
 
 def stars_amount_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="50", callback_data="starsamt:50", style=STYLE_PRIMARY),
-            InlineKeyboardButton(text="100", callback_data="starsamt:100", style=STYLE_PRIMARY),
-            InlineKeyboardButton(text="500", callback_data="starsamt:500", style=STYLE_PRIMARY),
-        ],
+    rows = [
+        [InlineKeyboardButton(text=str(n), callback_data=f"starsamt:{n}", style=STYLE_PRIMARY) for n in STARS_PRESETS],
         [InlineKeyboardButton(text="\u270F\uFE0F Boshqa summa", callback_data="starsamt:custom", style=STYLE_PRIMARY)],
-        nav_row(back_callback="starsback:username"),
-        [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
-    ])
+    ]
+    rows.extend(nav_rows("starsback:username"))
+    return _kb(rows)
 
 
 def premium_months_menu(prices: Optional[Dict[int, int]] = None) -> InlineKeyboardMarkup:
@@ -2181,60 +2428,65 @@ def premium_months_menu(prices: Optional[Dict[int, int]] = None) -> InlineKeyboa
 
     def label(months: int) -> str:
         price = prices.get(months)
-        if isinstance(price, (int, float)):
+        if isinstance(price, (int, float)) and price > 0:
             return f"\U0001F451 {months} oy \u2014 {fmt_money(round(price))} so'm"
         return f"\U0001F451 {months} oy"
 
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=label(3), callback_data="premmonths:3", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text=label(6), callback_data="premmonths:6", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text=label(12), callback_data="premmonths:12", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
-    ])
+    rows = [
+        [InlineKeyboardButton(text=label(months), callback_data=f"premmonths:{months}", style=STYLE_PRIMARY)]
+        for months in (3, 6, 12)
+    ]
+    rows.extend(nav_rows())
+    return _kb(rows)
 
 
 def check_code_menu(order_pk: int, copy_number: Optional[str] = None) -> InlineKeyboardMarkup:
+    # "Pulni qaytarish" ATAYIN alohida qatorda: qaytarish qaytarib bo'lmaydigan amal, shuning uchun
+    # "Kodni tekshirish" bilan yonma-yon qo'yilib tasodifan bosilib ketmasligi kerak.
     rows = []
-    number_str = str(copy_number).strip() if copy_number else ""
-    if number_str:
-        rows.append([InlineKeyboardButton(
-            text="\U0001F4CB Raqamni nusxalash",
-            copy_text=CopyTextButton(text=number_str),
-        )])
+    copy_btn = _copy_button("\U0001F4CB Raqamni nusxalash", copy_number)
+    if copy_btn:
+        rows.append([copy_btn])
     rows.append([InlineKeyboardButton(text=BTN_CHECK_CODE, callback_data=f"numcheck:{order_pk}", style=STYLE_PRIMARY)])
     rows.append([InlineKeyboardButton(text="\U0001F4B8 Pulni qaytarish", callback_data=f"numrefund:{order_pk}", style=STYLE_DANGER)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return _kb(rows)
 
 
 def _code_copy_menu(code, password: str = "") -> InlineKeyboardMarkup:
     """SMS kodi (va bo'lsa — 2FA parol) uchun aniq "nusxalash" tugmalari.
     <code> teglari orqali ham (matnni bosib turib) nusxalab bo'ladi, lekin
     alohida tugma ancha aniqroq va barcha foydalanuvchilar uchun tushunarli.
-    Telegram CopyTextButton bo'sh matnni qabul qilmaydi (1-256 belgi talab
-    qilinadi) — shuning uchun bo'sh/bo'sh joy bo'lsa, tugma qo'shilmaydi
+    Kod ham, parol ham bo'lsa — ikkalasi BITTA qatorda qisqa yorliq bilan;
+    faqat bittasi bo'lsa — to'liq yorliq bilan. Telegram CopyTextButton bo'sh
+    matnni qabul qilmaydi (1-256 belgi) — bunday qiymatda tugma qo'shilmaydi
     (aks holda BUTUN xabar yuborilmay qolar edi)."""
-    code_str = str(code).strip()
-    rows = []
-    if code_str:
-        rows.append([InlineKeyboardButton(text="\U0001F4CB Kodni nusxalash", copy_text=CopyTextButton(text=code_str))])
-    password_str = str(password).strip() if password else ""
-    if password_str:
-        rows.append([InlineKeyboardButton(text="\U0001F510 Parolni nusxalash", copy_text=CopyTextButton(text=password_str))])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    entries = [
+        ("\U0001F4CB Kod", "\U0001F4CB Kodni nusxalash", code),
+        ("\U0001F510 Parol", "\U0001F510 Parolni nusxalash", password),
+    ]
+    valid = [(short, full, value) for short, full, value in entries if _copy_text(value)]
+    use_short = len(valid) > 1
+    buttons = [_copy_button(short if use_short else full, value) for short, full, value in valid]
+    return _kb([buttons])
 
 
 def _card_copy_menu(card_number: str) -> InlineKeyboardMarkup:
     """To'ldirish uchun ko'rsatilgan plastik karta raqamini bitta bosishda
     nusxalash tugmasi — pul o'tkazishda raqamni qo'lda terib xato
     qilmaslik uchun. Bo'sh/bo'sh joy bo'lsa tugma qo'shilmaydi (yuqoridagi
-    izohga qarang)."""
-    rows = []
-    card_str = str(card_number).strip() if card_number else ""
-    if card_str:
-        rows.append([InlineKeyboardButton(text="\U0001F4B3 Karta raqamini nusxalash", copy_text=CopyTextButton(text=card_str))])
-    rows.append([InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    izohga qarang). "Bekor qilish" bilan bitta qatorda."""
+    row = []
+    copy_btn = _copy_button("\U0001F4CB Karta raqami", card_number)
+    if copy_btn:
+        row.append(copy_btn)
+    row.append(InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER))
+    return _kb([row])
 
+
+
+def _admin_back(label: str, callback_data: str) -> list:
+    """Admin bo'limlaridagi qisqa "orqaga" QATORI (qizil tugma). Uzun "...ga qaytish" o'rniga qisqa nom."""
+    return [InlineKeyboardButton(text=f"\u2B05\uFE0F {label}", callback_data=callback_data, style=STYLE_DANGER)]
 
 
 def admin_menu(owner: bool = False) -> InlineKeyboardMarkup:
@@ -2258,46 +2510,45 @@ def admin_menu(owner: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="\U0001F4E2 Xabar yuborish", callback_data="adm:broadcast", style=STYLE_PRIMARY),
         ],
     ]
+    last = [InlineKeyboardButton(text="\U0001F504 Yangilash", callback_data="adm:refresh", style=STYLE_PRIMARY)]
     if owner:
         # Avto-to'lov bo'limi FAQAT .env dagi asosiy adminlarga ko'rinadi (shaxsiy).
-        rows.append([InlineKeyboardButton(text="\U0001F916 Avto-to'lov (karta)", callback_data="adm:apay", style=STYLE_PRIMARY)])
-    rows.append([InlineKeyboardButton(text="\U0001F504 Yangilash", callback_data="adm:refresh", style=STYLE_PRIMARY)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        last.insert(0, InlineKeyboardButton(text="\U0001F916 Avto-to'lov", callback_data="adm:apay", style=STYLE_PRIMARY))
+    rows.append(last)
+    return _kb(rows)
 
 
 def admin_cancel_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\u2B05\uFE0F Admin panelga qaytish", callback_data="adm:refresh", style=STYLE_DANGER)],
-    ])
+    return _kb([_admin_back("Admin panel", "adm:refresh")])
 
 
 def stats_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return _kb([
         [
             InlineKeyboardButton(text="\U0001F3C6 Top userlar", callback_data="adm:topusers", style=STYLE_PRIMARY),
             InlineKeyboardButton(text="\U0001F30D Top davlatlar", callback_data="adm:topcountries", style=STYLE_PRIMARY),
         ],
         [InlineKeyboardButton(text="\U0001F4C8 Grafik (7 kun)", callback_data="adm:graph", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\u2B05\uFE0F Admin panelga qaytish", callback_data="adm:refresh", style=STYLE_DANGER)],
+        _admin_back("Admin panel", "adm:refresh"),
     ])
 
 
 def users_admin_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\U0001F50E Qidirish", callback_data="adm:find", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F4B0 Balans qo'shish/ayirish", callback_data="adm:balance", style=STYLE_PRIMARY)],
+    return _kb([
+        [
+            InlineKeyboardButton(text="\U0001F50E Qidirish", callback_data="adm:find", style=STYLE_PRIMARY),
+            InlineKeyboardButton(text="\U0001F4B0 Balans", callback_data="adm:balance", style=STYLE_PRIMARY),
+        ],
         [
             InlineKeyboardButton(text="\U0001F6AB Bloklash", callback_data="adm:ban", style=STYLE_DANGER),
             InlineKeyboardButton(text="\u2705 Blokdan chiqarish", callback_data="adm:unban", style=STYLE_SUCCESS),
         ],
-        [InlineKeyboardButton(text="\u2B05\uFE0F Orqaga", callback_data="adm:refresh", style=STYLE_DANGER)],
+        _admin_back("Orqaga", "adm:refresh"),
     ])
 
 
 def users_cancel_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\u2B05\uFE0F Foydalanuvchilar bo'limiga qaytish", callback_data="adm:menu:users", style=STYLE_DANGER)],
-    ])
+    return _kb([_admin_back("Foydalanuvchilar", "adm:menu:users")])
 
 
 def admin_user_actions_menu(user_id: int, banned: bool) -> InlineKeyboardMarkup:
@@ -2308,29 +2559,55 @@ def admin_user_actions_menu(user_id: int, banned: bool) -> InlineKeyboardMarkup:
         if banned else
         InlineKeyboardButton(text="\U0001F6AB Bloklash", callback_data=f"adm:quickban:{user_id}", style=STYLE_DANGER)
     )
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\U0001F4B0 Balans o'zgartirish", callback_data=f"adm:quickbalance:{user_id}", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F6D2 Buyurtmalari", callback_data=f"adm:orders:user:{user_id}", style=STYLE_PRIMARY)],
+    return _kb([
+        [
+            InlineKeyboardButton(text="\U0001F4B0 Balans", callback_data=f"adm:quickbalance:{user_id}", style=STYLE_PRIMARY),
+            InlineKeyboardButton(text="\U0001F6D2 Buyurtmalari", callback_data=f"adm:orders:user:{user_id}", style=STYLE_PRIMARY),
+        ],
         [ban_btn],
-        [InlineKeyboardButton(text="\u2B05\uFE0F Foydalanuvchilar bo'limiga qaytish", callback_data="adm:menu:users", style=STYLE_DANGER)],
+        _admin_back("Foydalanuvchilar", "adm:menu:users"),
     ])
 
 
 def settings_admin_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\U0001F511 API kalit", callback_data="adm:apikey", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F4C8 Narx ustamasi (%)", callback_data="adm:markup", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F4E2 Xarid kanali", callback_data="adm:channel", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F4B3 To'lov kartasi", callback_data="adm:card", style=STYLE_PRIMARY)],
+    return _kb([
+        [
+            InlineKeyboardButton(text="\U0001F511 API kalit", callback_data="adm:apikey", style=STYLE_PRIMARY),
+            InlineKeyboardButton(text="\U0001F4C8 Narx ustamasi", callback_data="adm:markup", style=STYLE_PRIMARY),
+        ],
+        [
+            InlineKeyboardButton(text="\U0001F4E2 Xarid kanali", callback_data="adm:channel", style=STYLE_PRIMARY),
+            InlineKeyboardButton(text="\U0001F4B3 To'lov kartasi", callback_data="adm:card", style=STYLE_PRIMARY),
+        ],
         [InlineKeyboardButton(text="\u23F1 Pul qaytarish vaqti", callback_data="adm:refundtime", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\u2B05\uFE0F Orqaga", callback_data="adm:refresh", style=STYLE_DANGER)],
+        _admin_back("Orqaga", "adm:refresh"),
     ])
 
 
 def settings_cancel_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\u2B05\uFE0F Sozlamalarga qaytish", callback_data="adm:menu:settings", style=STYLE_DANGER)],
+    return _kb([_admin_back("Sozlamalar", "adm:menu:settings")])
+
+
+def markup_admin_menu(overview: dict) -> InlineKeyboardMarkup:
+    """Narx ustamasi paneli: har bir bo'lim tugmasida JORIY foiz ko'rinib turadi (matnni o'qimasdan ham)."""
+    def category_button(category: str) -> InlineKeyboardButton:
+        percent, _custom = overview["items"][category]
+        return InlineKeyboardButton(
+            text=f"{MARKUP_LABELS[category]}: {percent:g}%",
+            callback_data=f"adm:mk:{category}",
+            style=STYLE_PRIMARY,
+        )
+
+    return _kb([
+        [category_button("number"), category_button("stars")],
+        [category_button("premium"), category_button("uc")],
+        [InlineKeyboardButton(text="\U0001F310 Hammasiga bir xil", callback_data="adm:mk:all", style=STYLE_PRIMARY)],
+        _admin_back("Sozlamalar", "adm:menu:settings"),
     ])
+
+
+def markup_cancel_menu() -> InlineKeyboardMarkup:
+    return _kb([_admin_back("Ustamalar", "adm:markup")])
 
 
 def forcesub_admin_menu(channels: list) -> InlineKeyboardMarkup:
@@ -2339,14 +2616,12 @@ def forcesub_admin_menu(channels: list) -> InlineKeyboardMarkup:
         for i, c in enumerate(channels)
     ]
     rows.append([InlineKeyboardButton(text="\u2795 Kanal qo'shish", callback_data="adm:fs:add", style=STYLE_PRIMARY)])
-    rows.append([InlineKeyboardButton(text="\u2B05\uFE0F Orqaga", callback_data="adm:refresh", style=STYLE_DANGER)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    rows.append(_admin_back("Orqaga", "adm:refresh"))
+    return _kb(rows)
 
 
 def fs_cancel_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\u2B05\uFE0F Kanallar ro'yxatiga qaytish", callback_data="adm:forcesub", style=STYLE_DANGER)],
-    ])
+    return _kb([_admin_back("Kanallar", "adm:forcesub")])
 
 
 def admins_admin_menu(extra_ids: list) -> InlineKeyboardMarkup:
@@ -2355,14 +2630,12 @@ def admins_admin_menu(extra_ids: list) -> InlineKeyboardMarkup:
         for uid in extra_ids
     ]
     rows.append([InlineKeyboardButton(text="\u2795 Admin qo'shish", callback_data="adm:adm:add", style=STYLE_PRIMARY)])
-    rows.append([InlineKeyboardButton(text="\u2B05\uFE0F Orqaga", callback_data="adm:refresh", style=STYLE_DANGER)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    rows.append(_admin_back("Orqaga", "adm:refresh"))
+    return _kb(rows)
 
 
 def admins_cancel_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\u2B05\uFE0F Adminlar ro'yxatiga qaytish", callback_data="adm:admins", style=STYLE_DANGER)],
-    ])
+    return _kb([_admin_back("Adminlar", "adm:admins")])
 
 
 USERS_MENU_TEXT = "\U0001F465 Foydalanuvchilar\n\nKerakli amalni tanlang:"
@@ -2748,20 +3021,6 @@ async def go_home(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-def nav_row(back_callback: Optional[str] = None) -> list:
-    """Foydalanuvchi so'ragan holatlargina "⬅️ Orqaga" tugmasini qaytaradi
-    (agar shu bosqichdan oldingi bosqich bo'lsa); aks holda bo'sh ro'yxat.
-    "🏠 Bosh sahifa" tugmasi endi hech qaerda ko'rsatilmaydi. DIQQAT: bu
-    bo'sh ro'yxat qaytarishi mumkin — chaqiruvchi tomonda uni to'g'ridan-to'g'ri
-    inline_keyboard ichiga QATOR sifatida qo'shishdan oldin albatta
-    tekshirish kerak (bo'sh qator Telegram tomonidan rad etiladi)."""
-    row = []
-    if back_callback:
-        row.append(InlineKeyboardButton(text="\u2B05\uFE0F Orqaga", callback_data=back_callback, style=STYLE_PRIMARY))
-    return row
-
-
-
 @router_common.callback_query(F.data == "cancel")
 async def cancel_any(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -2864,29 +3123,29 @@ def help_forward_text(user, text: str) -> str:
 
 
 def help_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\U0001F4DA Ko'p beriladigan savollar", callback_data="help:faq", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F4AC Admin bilan bog'lanish", callback_data="help:admin", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
-    ])
+    rows = [[
+        InlineKeyboardButton(text="\U0001F4DA Savollar", callback_data="help:faq", style=STYLE_PRIMARY),
+        InlineKeyboardButton(text="\U0001F4AC Adminga yozish", callback_data="help:admin", style=STYLE_PRIMARY),
+    ]]
+    rows.extend(nav_rows())
+    return _kb(rows)
 
 
 def faq_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\U0001F4F1 Qanday raqam sotib olaman?", callback_data="faq:buy_number", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\u2B50 Stars / \U0001F48E Premium qanday sotib olaman?", callback_data="faq:buy_stars", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\U0001F4B0 To'lov qanday qilinadi?", callback_data="faq:payment", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\u23F3 Kod qancha vaqtda keladi?", callback_data="faq:code_time", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\u274C Kod kelmasa nima qilaman?", callback_data="faq:code_missing", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text="\u2B05\uFE0F Orqaga", callback_data="help:menu", style=STYLE_PRIMARY)],
+    """Savollar ro'yxati: qisqa yorliqlar, ikki ustunda (to'liq savol javob xabarining boshida ko'rinadi)."""
+    def question(text: str, key: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(text=text, callback_data=f"faq:{key}", style=STYLE_PRIMARY)
+
+    return _kb([
+        [question("\U0001F4F1 Raqam olish", "buy_number"), question("\u2B50 Stars / Premium", "buy_stars")],
+        [question("\U0001F3AE PUBG UC", "buy_uc"), question("\U0001F4B0 To'lov", "payment")],
+        [question("\u23F3 Kod vaqti", "code_time"), question("\u274C Kod kelmasa", "code_missing")],
+        [InlineKeyboardButton(text=BTN_BACK, callback_data="help:menu", style=STYLE_PRIMARY)],
     ])
 
 
 def faq_answer_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\u2B05\uFE0F Savollarga qaytish", callback_data="help:faq", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
-    ])
+    return _kb(nav_rows("help:faq"))
 
 
 # Statik FAQ javoblari. "code_missing" bu yerda YO'Q — u refund kutish
@@ -2907,6 +3166,15 @@ FAQ_ANSWERS = {
         "2\uFE0F\u20E3 Kimga sotib olayotganingizni (@username) kiriting.\n"
         "3\uFE0F\u20E3 Miqdorni (Stars) yoki muddatni (Premium) tanlang.\n"
         "4\uFE0F\u20E3 Narxni tasdiqlang \u2014 buyurtma darhol yuboriladi."
+    ),
+    "buy_uc": (
+        "\U0001F3AE PUBG UC qanday sotib olaman?\n\n"
+        f"1\uFE0F\u20E3 Asosiy menyudan \u00ab{BTN_UC}\u00bb tugmasini bosing.\n"
+        "2\uFE0F\u20E3 Tarifni tanlang.\n"
+        "3\uFE0F\u20E3 PUBG Mobile ID raqamingizni kiriting (faqat raqam, 6\u201312 xona) \u2014 ID ni "
+        "diqqat bilan tekshiring, noto'g'ri ID ga yuborilgan UC qaytarilmaydi.\n"
+        "4\uFE0F\u20E3 Narxni tasdiqlang \u2014 UC avtomatik yuboriladi; biroz kechiksa, "
+        "tayyor bo'lganda o'zimiz xabar beramiz."
     ),
     "payment": (
         "\U0001F4B0 To'lov qanday qilinadi?\n\n"
@@ -2935,7 +3203,7 @@ async def faq_code_missing_text() -> str:
     )
 
 
-@router_start.message(F.text == BTN_HELP)
+@router_start.message(F.text.in_(MENU_HELP))
 async def help_start(message: Message, state: FSMContext):
     await state.clear()
     await hide_main_menu(message)
@@ -3045,7 +3313,7 @@ async def admin_support_reply(message: Message, bot, support_user_id: int):
 router_balance = Router(name="balance")
 
 
-@router_balance.message(F.text == BTN_BALANCE)
+@router_balance.message(F.text.in_(MENU_BALANCE))
 async def show_balance(message: Message, state: FSMContext):
     await state.clear()
     balance = await get_balance(message.from_user.id)
@@ -3147,7 +3415,7 @@ POLL_DELAY_SECONDS = 5
 _background_tasks: set = set()
 
 
-@router_numbers.message(F.text == BTN_NUMBER)
+@router_numbers.message(F.text.in_(MENU_NUMBER))
 async def start_number_flow(message: Message, state: FSMContext, bot):
     await state.clear()
     await clear_stale_flow_message(bot, message.from_user.id)
@@ -3157,7 +3425,7 @@ async def start_number_flow(message: Message, state: FSMContext, bot):
 
 @router_numbers.callback_query(F.data == "numwarn:confirm")
 async def number_warning_confirmed(callback: CallbackQuery):
-    await callback.message.edit_text("Qanday raqam kerak?", reply_markup=number_type_menu())
+    await callback.message.edit_text(NUMBER_TYPE_TEXT, reply_markup=number_type_menu())
     await callback.answer()
 
 
@@ -3167,14 +3435,14 @@ async def _fetch_countries_with_fallback(primary_server: int, fallback_server: O
         countries = data.get("countries") or {}
         if countries:
             return primary_server, countries
-    except SmmUpperError:
+    except _API_ERRORS:
         pass
 
     if fallback_server:
         try:
             data = await client.available_countries(fallback_server)
             return fallback_server, (data.get("countries") or {})
-        except SmmUpperError:
+        except _API_ERRORS:
             pass
 
     return primary_server, {}
@@ -3182,7 +3450,7 @@ async def _fetch_countries_with_fallback(primary_server: int, fallback_server: O
 
 @router_numbers.callback_query(F.data == "numback:type")
 async def number_back_to_type(callback: CallbackQuery):
-    await callback.message.edit_text("Qanday raqam kerak?", reply_markup=number_type_menu())
+    await callback.message.edit_text(NUMBER_TYPE_TEXT, reply_markup=number_type_menu())
     await callback.answer()
 
 
@@ -3193,35 +3461,38 @@ async def choose_regular(callback: CallbackQuery, state: FSMContext):
     if not countries:
         await callback.message.edit_text(
             "\u274C Hozircha mavjud davlat yo'q. Birozdan so'ng qayta urinib ko'ring.",
-            reply_markup=cancel_inline(),
+            reply_markup=cancel_inline(back_callback="numback:type"),
         )
         return
 
     await state.set_state(BuyNumber.choosing_country)
     await state.update_data(server=server, countries=countries)
-    percent = await get_markup_percent()
-    await callback.message.edit_text("Davlatni tanlang:", reply_markup=countries_menu(server, countries, markup_percent=percent))
+    percent = await get_markup_percent("number")
+    await callback.message.edit_text(PICK_COUNTRY_TEXT, reply_markup=countries_menu(server, countries, markup_percent=percent))
 
 
 @router_numbers.callback_query(F.data == "numtype:ready")
 async def choose_ready(callback: CallbackQuery, state: FSMContext):
+    """"Tayyor akkaunt" (server 3): oqim "Oddiy raqam" bilan bir xil (davlat -> tasdiq -> xarid -> kod),
+    faqat mahsulot boshqa. Narx ustamasi Raqam bilan bir xil ("number" bo'limi)."""
     await callback.answer("Yuklanmoqda...")
     try:
         data = await client.available_countries(3)
         countries = data.get("countries") or {}
-    except SmmUpperError as e:
-        await callback.message.edit_text(f"\u274C Tayyor akkauntlar hozircha mavjud emas: {e.message}",
-                                          reply_markup=cancel_inline())
+    except _API_ERRORS as e:
+        await callback.message.edit_text(f"\u274C Tayyor akkauntlar hozircha mavjud emas: {_err_text(e)}",
+                                          reply_markup=cancel_inline(back_callback="numback:type"))
         return
 
     if not countries:
-        await callback.message.edit_text("\u274C Hozircha tayyor akkaunt yo'q.", reply_markup=cancel_inline())
+        await callback.message.edit_text("\u274C Hozircha tayyor akkaunt yo'q.",
+                                          reply_markup=cancel_inline(back_callback="numback:type"))
         return
 
     await state.set_state(BuyNumber.choosing_country)
     await state.update_data(server=3, countries=countries)
-    percent = await get_markup_percent()
-    await callback.message.edit_text("Davlatni tanlang:", reply_markup=countries_menu(3, countries, markup_percent=percent))
+    percent = await get_markup_percent("number")
+    await callback.message.edit_text(PICK_COUNTRY_TEXT, reply_markup=countries_menu(3, countries, markup_percent=percent))
 
 
 # ---------- Davlatlar ro'yxatini varaqlash va qidirish ----------
@@ -3238,9 +3509,9 @@ async def country_change_page(callback: CallbackQuery, state: FSMContext):
     _, server_str, page_str = callback.data.split(":")
     data = await state.get_data()
     countries = data.get("countries", {})
-    percent = await get_markup_percent()
+    percent = await get_markup_percent("number")
     await callback.message.edit_text(
-        "Davlatni tanlang:",
+        PICK_COUNTRY_TEXT,
         reply_markup=countries_menu(int(server_str), countries, page=int(page_str), markup_percent=percent),
     )
     await callback.answer()
@@ -3253,9 +3524,9 @@ async def country_change_cheap_page(callback: CallbackQuery, state: FSMContext):
     _, server_str, page_str = callback.data.split(":")
     data = await state.get_data()
     countries = data.get("countries", {})
-    percent = await get_markup_percent()
+    percent = await get_markup_percent("number")
     await callback.message.edit_text(
-        "\U0001F4C9 Arzon davlatlar:",
+        "\U0001F4C9 Arzon davlatlar (so'mda):",
         reply_markup=countries_menu(int(server_str), countries, page=int(page_str), mode="cheap", markup_percent=percent),
     )
     await callback.answer()
@@ -3264,6 +3535,8 @@ async def country_change_cheap_page(callback: CallbackQuery, state: FSMContext):
 @router_numbers.callback_query(BuyNumber.choosing_country, F.data.startswith("ctytop:"))
 async def country_show_top(callback: CallbackQuery, state: FSMContext):
     """Buyurtmalar tarixidan eng ko'p sotib olingan 10 ta davlatni chiqaradi.
+    Faqat SHU tur (Oddiy raqam yoki Tayyor akkaunt — server bo'yicha) buyurtmalari sanaladi va faqat hozir
+    mavjud davlatlar ko'rsatiladi.
     Eslatma: bu hisoblash faqat shu ustun qo'shilgandan keyingi (yangi)
     buyurtmalarni sanaydi — eski buyurtmalarda davlat alohida saqlanmagan
     edi, shuning uchun bot yangilangandan keyingi xaridlar asosida
@@ -3271,26 +3544,24 @@ async def country_show_top(callback: CallbackQuery, state: FSMContext):
     server = int(callback.data.split(":")[1])
     data = await state.get_data()
     countries = data.get("countries", {})
-    top = await top_countries(10)
-    matched = [(code, cnt) for code, cnt in top if code in countries]
+    # Ko'proq olib, mavjudlarini saralaymiz: eng ommabop davlat hozir tugab qolgan bo'lsa ham ro'yxat to'lib turadi.
+    top = await top_countries(30, ready=(server == 3))
+    matched = [(code, cnt) for code, cnt in top if code in countries][:10]
 
-    back_and_cancel = [
-        [InlineKeyboardButton(text="\U0001F519 Ro'yxatga qaytish", callback_data=f"ctyback:{server}", style=STYLE_PRIMARY)],
-        [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
-    ]
+    back_and_cancel = nav_rows(f"ctyback:{server}")
 
     if not matched:
         await callback.message.edit_text(
             "\U0001F3C6 Hozircha statistika yo'q. Birinchi xaridlardan so'ng "
             "shu yerda eng ko'p sotib olingan davlatlar chiqadi.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=back_and_cancel),
+            reply_markup=_kb(back_and_cancel),
         )
         await callback.answer()
         return
 
     rows = []
     row = []
-    percent = await get_markup_percent()
+    percent = await get_markup_percent("number")
     for code, _cnt in matched:
         info = countries[code]
         row.append(InlineKeyboardButton(text=_country_button_label(code, info, percent), callback_data=f"cty:{server}:{code}", style=STYLE_PRIMARY))
@@ -3302,8 +3573,8 @@ async def country_show_top(callback: CallbackQuery, state: FSMContext):
     rows.extend(back_and_cancel)
 
     await callback.message.edit_text(
-        "\U0001F3C6 Eng ko'p sotib olingan davlatlar:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        "\U0001F3C6 Eng ko'p sotib olingan davlatlar (so'mda):",
+        reply_markup=_kb(rows),
     )
     await callback.answer()
 
@@ -3313,7 +3584,7 @@ async def country_change_search_page(callback: CallbackQuery, state: FSMContext)
     _, server_str, page_str = callback.data.split(":")
     data = await state.get_data()
     results = data.get("search_results", {})
-    percent = await get_markup_percent()
+    percent = await get_markup_percent("number")
     await callback.message.edit_text(
         "\U0001F50D Qidiruv natijalari:",
         reply_markup=countries_menu(int(server_str), results, page=int(page_str), mode="search", markup_percent=percent),
@@ -3340,8 +3611,8 @@ async def country_search_exit(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     countries = data.get("countries", {})
     await state.set_state(BuyNumber.choosing_country)
-    percent = await get_markup_percent()
-    await callback.message.edit_text("Davlatni tanlang:", reply_markup=countries_menu(server, countries, markup_percent=percent))
+    percent = await get_markup_percent("number")
+    await callback.message.edit_text(PICK_COUNTRY_TEXT, reply_markup=countries_menu(server, countries, markup_percent=percent))
     await callback.answer()
 
 
@@ -3361,20 +3632,33 @@ async def country_search_run(message: Message, state: FSMContext):
         await message.answer(
             "Hech narsa topilmadi. Boshqa nom bilan qayta urinib ko'ring, "
             "yoki ro'yxatga qayting.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="\U0001F519 Ro'yxatga qaytish", callback_data=f"ctyback:{server}", style=STYLE_PRIMARY)],
-                [InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)],
-            ]),
+            reply_markup=_kb(nav_rows(f"ctyback:{server}")),
         )
         return  # holat searching_country'da qoladi — darhol qayta yozish mumkin
 
     await state.update_data(search_results=results)
     await state.set_state(BuyNumber.choosing_country)
-    percent = await get_markup_percent()
+    percent = await get_markup_percent("number")
     await message.answer(
         f"\U0001F50D Qidiruv natijalari ({len(results)} ta):",
         reply_markup=countries_menu(server, results, mode="search", markup_percent=percent),
     )
+
+
+def _number_confirm_text(server: int, country: str, price: int, balance: int) -> str:
+    """Raqam/akkaunt xaridini tasdiqlash ekrani matni (davlat tanlagandan keyin ham, "Qayta buyurtma"da ham)."""
+    kind_line = "\U0001F510 Tur: Tayyor akkaunt\n" if server == 3 else ""
+    return (
+        f"{kind_line}"
+        f"\U0001F30D Davlat: {country_flag(country)} {country_display_name(country)}\n"
+        f"\U0001F4B5 Narx: {fmt_money(price)} so'm\n"
+        f"\U0001F4B0 Balansingiz: {fmt_money(balance)} so'm"
+    )
+
+
+def _number_confirm_question(server: int) -> str:
+    what = "akkauntni" if server == 3 else "raqamni"
+    return f"\U0001F4F1 Ushbu {what} sotib olishni tasdiqlaysizmi?"
 
 
 @router_numbers.callback_query(BuyNumber.choosing_country, F.data.startswith("cty:"))
@@ -3384,19 +3668,20 @@ async def choose_country(callback: CallbackQuery, state: FSMContext):
 
     data = await state.get_data()
     countries = data.get("countries", {})
-    info = countries.get(country, {})
-    base_price = info.get("price", 0)
-    price = await with_markup(base_price)
+    info = countries.get(country) or {}
+    price = await with_markup(info.get("price"), "number")
+
+    # Himoya: tugma eskirgan (boshqa ro'yxatdan qolgan), davlat endi ro'yxatda yo'q yoki provayder narx
+    # bermagan bo'lsa — 0 so'mlik ("tekin") xaridga YO'L QO'YILMAYDI (avval bunday holatda narx 0 bo'lib qolardi).
+    if price <= 0 or data.get("server") != server:
+        await callback.answer("Bu davlat hozir mavjud emas \u2014 ro'yxatni yangilab, qayta tanlang.", show_alert=True)
+        return
 
     balance = await get_balance(callback.from_user.id)
     await state.update_data(country=country, price=price)
     await state.set_state(BuyNumber.confirming)
 
-    text = (
-        f"\U0001F30D Davlat: {country_flag(country)} {country_display_name(country)}\n"
-        f"\U0001F4B5 Narx: {fmt_money(price)} so'm\n"
-        f"\U0001F4B0 Balansingiz: {fmt_money(balance)} so'm"
-    )
+    text = _number_confirm_text(server, country, price, balance)
 
     if balance < price:
         sent = await callback.message.edit_text(text + "\n\n" + insufficient_balance(price, balance),
@@ -3406,7 +3691,10 @@ async def choose_country(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    await callback.message.edit_text(text + "\n\n\U0001F4F1 Ushbu raqamni sotib olishni tasdiqlaysizmi?", reply_markup=confirm_menu("buynum:confirm", back_callback="numback:country"))
+    await callback.message.edit_text(
+        text + "\n\n" + _number_confirm_question(server),
+        reply_markup=confirm_menu("buynum:confirm", back_callback="numback:country"),
+    )
     await callback.answer()
 
 
@@ -3419,8 +3707,8 @@ async def number_back_to_country(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Ro'yxatga qaytib bo'lmadi, qaytadan tanlang.", show_alert=True)
         return
     await state.set_state(BuyNumber.choosing_country)
-    percent = await get_markup_percent()
-    await callback.message.edit_text("Davlatni tanlang:", reply_markup=countries_menu(server, countries, markup_percent=percent))
+    percent = await get_markup_percent("number")
+    await callback.message.edit_text(PICK_COUNTRY_TEXT, reply_markup=countries_menu(server, countries, markup_percent=percent))
     await callback.answer()
 
 
@@ -3465,9 +3753,7 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
         await state.clear()
         return
 
-    actual_price = await with_markup(result.get("price", 0))
-    # Farq hisob-kitob qilinadi; buyurtmaga foydalanuvchidan HAQIQATDA yechilgan summa yoziladi.
-    charged_price = await settle_price_difference(callback.from_user.id, est_price, actual_price)
+    charged_price = await final_price(callback.from_user.id, result, est_price, "number")
 
     ref = result.get("hash_code") or result.get("number") or (
         str(result["id"]) if result.get("id") is not None else None)
@@ -3675,7 +3961,7 @@ USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{4,31}$")
 MIN_STARS = 50
 
 
-@router_stars.message(F.text == BTN_STARS)
+@router_stars.message(F.text.in_(MENU_STARS))
 async def start_stars_flow(message: Message, state: FSMContext, bot):
     await state.clear()
     await clear_stale_flow_message(bot, message.from_user.id)
@@ -3697,6 +3983,14 @@ async def stars_back_to_username(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+async def _stars_per_unit_text() -> str:
+    """Stars uchun narx: SmmUpper'ning har bir Star narxi + "stars" bo'limi ustamasi."""
+    prices = await client.get_prices()
+    percent = await get_markup_percent("stars")
+    per_star = prices["stars"]["price_per_star"] * _markup_multiplier(percent)
+    return f"Nechta Stars? (min {MIN_STARS}, yoki summani yozib yuboring)\n\U0001F4B5 Narx: {per_star:.1f} so'm/Star"
+
+
 @router_stars.callback_query(BuyStars.confirming, F.data == "starsback:amount")
 async def stars_back_to_amount(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -3705,18 +3999,12 @@ async def stars_back_to_amount(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Orqaga qaytib bo'lmadi, qaytadan boshlang.", show_alert=True)
         return
     try:
-        prices = await client.get_prices()
-        percent = await get_markup_percent()
-        per_star = prices["stars"]["price_per_star"] * _markup_multiplier(percent)
-    except (SmmUpperError, KeyError) as e:
-        await callback.answer(f"Narxlarni olib bo'lmadi: {e}", show_alert=True)
+        text = await _stars_per_unit_text()
+    except _FETCH_ERRORS as e:
+        await callback.answer(f"Narxlarni olib bo'lmadi: {_err_text(e)}", show_alert=True)
         return
     await state.set_state(BuyStars.amount)
-    await callback.message.edit_text(
-        f"Nechta Stars? (min {MIN_STARS}, yoki summani yozib yuboring)\n"
-        f"\U0001F4B5 Narx: {per_star:.1f} so'm/Star",
-        reply_markup=stars_amount_menu(),
-    )
+    await callback.message.edit_text(text, reply_markup=stars_amount_menu())
     await callback.answer()
 
 
@@ -3728,20 +4016,14 @@ async def stars_username(message: Message, state: FSMContext):
         return
 
     try:
-        prices = await client.get_prices()
-        percent = await get_markup_percent()
-        per_star = prices["stars"]["price_per_star"] * _markup_multiplier(percent)
-    except (SmmUpperError, KeyError) as e:
-        await message.answer(f"\u274C Narxlarni olib bo'lmadi: {e}")
+        text = await _stars_per_unit_text()
+    except _FETCH_ERRORS as e:
+        await message.answer(f"\u274C Narxlarni olib bo'lmadi: {_err_text(e)}")
         return
 
     await state.update_data(username=username)
     await state.set_state(BuyStars.amount)
-    await message.answer(
-        f"Nechta Stars? (min {MIN_STARS}, yoki summani yozib yuboring)\n"
-        f"\U0001F4B5 Narx: {per_star:.1f} so'm/Star",
-        reply_markup=stars_amount_menu(),
-    )
+    await message.answer(text, reply_markup=stars_amount_menu())
 
 
 @router_stars.callback_query(BuyStars.amount, F.data.startswith("starsamt:"))
@@ -3778,11 +4060,11 @@ async def _process_stars_amount(message: Message, state: FSMContext, amount: int
     try:
         prices = await client.get_prices()
         price_per_star = prices["stars"]["price_per_star"]
-    except (SmmUpperError, KeyError) as e:
-        await message.answer(f"\u274C Narxlarni olib bo'lmadi: {e}")
+    except _FETCH_ERRORS as e:
+        await message.answer(f"\u274C Narxlarni olib bo'lmadi: {_err_text(e)}")
         return
 
-    price = await with_markup(price_per_star * amount)
+    price = await with_markup(price_per_star * amount, "stars")
     balance = await get_balance(user_id)
     data = await state.get_data()
     username = data.get("username")
@@ -3844,9 +4126,7 @@ async def confirm_stars(callback: CallbackQuery, state: FSMContext, bot):
         await state.clear()
         return
 
-    actual_price = await with_markup(result.get("price", 0))
-    # Farq hisob-kitob qilinadi; buyurtmaga foydalanuvchidan HAQIQATDA yechilgan summa yoziladi.
-    charged_price = await settle_price_difference(callback.from_user.id, est_price, actual_price)
+    charged_price = await final_price(callback.from_user.id, result, est_price, "stars")
     order_pk = await create_order(
         user_id=callback.from_user.id,
         order_type="stars",
@@ -3882,21 +4162,12 @@ async def confirm_stars(callback: CallbackQuery, state: FSMContext, bot):
 router_premium = Router(name="premium")
 
 
-@router_premium.message(F.text == BTN_PREMIUM)
-async def start_premium_flow(message: Message, state: FSMContext, bot):
-    await state.clear()
-    await clear_stale_flow_message(bot, message.from_user.id)
-
-    try:
-        raw_prices = (await client.get_prices())["premium"]
-        prices: Dict[int, int] = {}
-        for m in (3, 6, 12):
-            prices[m] = await with_markup(raw_prices[str(m)]["price"])
-    except (SmmUpperError, KeyError) as e:
-        await message.answer(f"\u274C Narxlarni olib bo'lmadi: {e}")
-        return
-
-    await state.set_state(BuyPremium.months)
+async def _premium_prices_text() -> tuple:
+    """Premium narxlari: SmmUpper narxi + "premium" bo'limi ustamasi. (matn, {oy: narx}) qaytaradi."""
+    raw_prices = (await client.get_prices())["premium"]
+    prices: Dict[int, int] = {}
+    for m in (3, 6, 12):
+        prices[m] = await with_markup(raw_prices[str(m)]["price"], "premium")
     text = (
         "\U0001F48E Narxlar:\n"
         f"\u2022 3 oy: {fmt_money(prices[3])} so'm\n"
@@ -3904,6 +4175,21 @@ async def start_premium_flow(message: Message, state: FSMContext, bot):
         f"\u2022 12 oy: {fmt_money(prices[12])} so'm\n\n"
         "Necha oylik Premium kerak?"
     )
+    return text, prices
+
+
+@router_premium.message(F.text.in_(MENU_PREMIUM))
+async def start_premium_flow(message: Message, state: FSMContext, bot):
+    await state.clear()
+    await clear_stale_flow_message(bot, message.from_user.id)
+
+    try:
+        text, prices = await _premium_prices_text()
+    except _FETCH_ERRORS as e:
+        await message.answer(f"\u274C Narxlarni olib bo'lmadi: {_err_text(e)}")
+        return
+
+    await state.set_state(BuyPremium.months)
     await hide_main_menu(message)
     await message.answer(text, reply_markup=premium_months_menu(prices))
 
@@ -3921,21 +4207,11 @@ async def premium_months_choice(callback: CallbackQuery, state: FSMContext):
 @router_premium.callback_query(BuyPremium.username, F.data == "premback:months")
 async def premium_back_to_months(callback: CallbackQuery, state: FSMContext):
     try:
-        raw_prices = (await client.get_prices())["premium"]
-        prices: Dict[int, int] = {}
-        for m in (3, 6, 12):
-            prices[m] = await with_markup(raw_prices[str(m)]["price"])
-    except (SmmUpperError, KeyError) as e:
-        await callback.answer(f"Narxlarni olib bo'lmadi: {e}", show_alert=True)
+        text, prices = await _premium_prices_text()
+    except _FETCH_ERRORS as e:
+        await callback.answer(f"Narxlarni olib bo'lmadi: {_err_text(e)}", show_alert=True)
         return
     await state.set_state(BuyPremium.months)
-    text = (
-        "\U0001F48E Narxlar:\n"
-        f"\u2022 3 oy: {fmt_money(prices[3])} so'm\n"
-        f"\u2022 6 oy: {fmt_money(prices[6])} so'm\n"
-        f"\u2022 12 oy: {fmt_money(prices[12])} so'm\n\n"
-        "Necha oylik Premium kerak?"
-    )
     await callback.message.edit_text(text, reply_markup=premium_months_menu(prices))
     await callback.answer()
 
@@ -3964,11 +4240,11 @@ async def _process_premium_choice(message: Message, state: FSMContext, username:
     try:
         prices = await client.get_prices()
         base_price = prices["premium"][str(months)]["price"]
-    except (SmmUpperError, KeyError) as e:
-        await message.answer(f"\u274C Narxni olib bo'lmadi: {e}")
+    except _FETCH_ERRORS as e:
+        await message.answer(f"\u274C Narxni olib bo'lmadi: {_err_text(e)}")
         return
 
-    price = await with_markup(base_price)
+    price = await with_markup(base_price, "premium")
     balance = await get_balance(user_id)
 
     await state.update_data(username=username, months=months, price=price)
@@ -4028,9 +4304,7 @@ async def confirm_premium(callback: CallbackQuery, state: FSMContext, bot):
         await state.clear()
         return
 
-    actual_price = await with_markup(result.get("price", 0))
-    # Farq hisob-kitob qilinadi; buyurtmaga foydalanuvchidan HAQIQATDA yechilgan summa yoziladi.
-    charged_price = await settle_price_difference(callback.from_user.id, est_price, actual_price)
+    charged_price = await final_price(callback.from_user.id, result, est_price, "premium")
     order_pk = await create_order(
         user_id=callback.from_user.id,
         order_type="premium",
@@ -4148,7 +4422,7 @@ async def load_uc_tariffs() -> list:
             continue
         if base <= 0 or total <= 0:
             continue                       # buzuq yoki "bepul" ko'rinadigan tarifni sotmaymiz
-        price = await with_markup(base)
+        price = await with_markup(base, "uc")
         if price <= 0:
             continue
         out.append({"tariff_id": tid, "uc_amount": amount, "bonus_uc": bonus, "total_uc": total, "price": price})
@@ -4166,14 +4440,14 @@ def uc_tariffs_menu(tariffs: list) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(
         text=f"\U0001F3AE {_uc_tariff_title(t)} \u2014 {fmt_money(t['price'])} so'm",
         callback_data=f"uctariff:{t['tariff_id']}", style=STYLE_PRIMARY)] for t in tariffs[:UC_MAX_TARIFF_BUTTONS]]
-    rows.append([InlineKeyboardButton(text=BTN_CANCEL, callback_data="cancel", style=STYLE_DANGER)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    rows.extend(nav_rows())
+    return _kb(rows)
 
 
 _UC_FETCH_ERRORS = (SmmUpperError, KeyError) + _NET_ERRORS
 
 
-@router_uc.message(F.text == BTN_UC)
+@router_uc.message(F.text.in_(MENU_UC))
 async def start_uc_flow(message: Message, state: FSMContext, bot):
     await state.clear()
     await clear_stale_flow_message(bot, message.from_user.id)
@@ -4414,13 +4688,7 @@ async def _uc_apply_buy_result(bot, order_pk: int, result: dict) -> Optional[dic
     details = _uc_details_from_row(row)
     user_id = row["user_id"]
     est_price = row["price"]
-    raw_price = result.get("price")
-    # Yakuniy narx javobda bo'lmasa/noto'g'ri bo'lsa — taxminiy narx (aks holda farq "bepul" qaytarilib ketardi)
-    if isinstance(raw_price, (int, float)) and raw_price > 0:
-        actual_price = await with_markup(raw_price)
-    else:
-        actual_price = est_price
-    charged_price = await settle_price_difference(user_id, est_price, actual_price)
+    charged_price = await final_price(user_id, result, est_price, "uc")
 
     total_uc = int(result.get("total_uc") or details.get("total_uc") or row["qty"] or 0)
     account_id = str(result.get("account_id") or details.get("account_id") or "")
@@ -4720,7 +4988,7 @@ _TYPE_LABEL = {
 }
 
 
-@router_orders.message(F.text == BTN_ORDERS)
+@router_orders.message(F.text.in_(MENU_ORDERS))
 async def show_my_orders(message: Message, state: FSMContext):
     await state.clear()
     rows = await list_orders(message.from_user.id, limit=10)
@@ -4831,7 +5099,7 @@ def _format_order_detail(row, include_buyer: bool = False) -> str:
     return "\n".join(lines)
 
 
-@router_orders.message(F.text == BTN_CHECK_ORDER)
+@router_orders.message(F.text.in_(MENU_CHECK_ORDER))
 async def start_check_order(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(CheckOrder.order_id)
@@ -4868,7 +5136,7 @@ async def check_order_by_id(message: Message, state: FSMContext):
     await message.answer(_format_order_detail(row), reply_markup=markup or main_menu())
 
 
-@router_orders.message(F.text == BTN_REPEAT_ORDER)
+@router_orders.message(F.text.in_(MENU_REPEAT_ORDER))
 async def repeat_last_order(message: Message, state: FSMContext, bot):
     """Foydalanuvchining eng oxirgi buyurtmasidagi davlat/mahsulotni
     qayta tanlab, to'g'ridan-to'g'ri tasdiqlash bosqichiga olib boradi —
@@ -4893,33 +5161,32 @@ async def repeat_last_order(message: Message, state: FSMContext, bot):
         try:
             data = await client.available_countries(row["server"])
             countries = data.get("countries") or {}
-        except SmmUpperError as e:
-            await message.answer(f"\u274C Narxlarni olib bo'lmadi: {e.message}")
+        except _API_ERRORS as e:
+            await message.answer(f"\u274C Narxlarni olib bo'lmadi: {_err_text(e)}")
             return
         info = countries.get(row["country"])
-        if not info:
+        server = row["server"]
+        price = await with_markup((info or {}).get("price"), "number")
+        # Himoya: davlat endi mavjud emas yoki provayder narx bermagan bo'lsa — 0 so'mlik xaridga yo'l qo'yilmaydi
+        # (choose_country'dagi bilan bir xil himoya; xabari ham davlat topilmagan holat bilan bir xil).
+        if not info or price <= 0:
             await message.answer(
                 f"\u274C {country_display_name(row['country'])} uchun hozircha raqam yo'q. "
                 f"\u00abRaqam sotib olish\u00bb orqali boshqa davlat tanlang."
             )
             return
 
-        price = await with_markup(info.get("price", 0))
         balance = await get_balance(user_id)
-        await state.update_data(server=row["server"], country=row["country"], countries=countries, price=price)
+        await state.update_data(server=server, country=row["country"], countries=countries, price=price)
         await state.set_state(BuyNumber.confirming)
 
-        text = (
-            f"\U0001F30D Davlat: {country_flag(row['country'])} {country_display_name(row['country'])}\n"
-            f"\U0001F4B5 Narx: {fmt_money(price)} so'm\n"
-            f"\U0001F4B0 Balansingiz: {fmt_money(balance)} so'm"
-        )
+        text = _number_confirm_text(server, row["country"], price, balance)
         if balance < price:
             sent = await message.answer(text + "\n\n" + insufficient_balance(price, balance), reply_markup=balance_menu())
             await track_flow_msg(sent)
             await state.clear()
             return
-        await message.answer(text + "\n\n\U0001F4F1 Ushbu raqamni sotib olishni tasdiqlaysizmi?", reply_markup=confirm_menu("buynum:confirm"))
+        await message.answer(text + "\n\n" + _number_confirm_question(server), reply_markup=confirm_menu("buynum:confirm"))
 
     elif order_type == "stars":
         if not row["target_username"] or not row["qty"]:
@@ -5009,14 +5276,14 @@ async def _panel_text() -> str:
 
 async def _settings_text() -> str:
     current_key = await get_setting(SETTINGS_KEY_API_KEY, default=SMMUPPER_API_KEY)
-    current_markup = await get_markup_percent()
+    markup_overview = await get_markup_overview()
     current_channel = await get_channel_id()
     card_number, card_holder = await get_card_info()
     refund_seconds = await get_refund_eligible_seconds()
     return (
         f"\u2699\uFE0F Sozlamalar\n\n"
         f"{current_api_key_line(_mask_key(current_key))}\n"
-        f"{current_markup_line(current_markup)}\n"
+        f"{markup_short_line(markup_overview)}\n"
         f"{current_channel_line(current_channel)}\n"
         f"{current_card_line(card_number, card_holder)}\n"
         f"{current_refund_seconds_line(refund_seconds)}"
@@ -5400,39 +5667,64 @@ async def admin_apikey_receive(message: Message, state: FSMContext, bot):
     await state.clear()
 
 
-# ---------- Narx ustamasini sozlash ----------
+# ---------- Narx ustamasini sozlash (bo'lim bo'yicha alohida) ----------
 
 @router_admin.callback_query(F.data == "adm:markup")
 async def admin_markup_start(callback: CallbackQuery, state: FSMContext):
     if not await _is_admin(callback.from_user.id):
         await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
-    current = await get_markup_percent()
-    await _ask(
-        callback, state, AdminPanel.markup_percent,
-        f"{current_markup_line(current)}\n\n{ASK_MARKUP_PERCENT}",
-        settings_cancel_menu(),
-    )
+    await state.clear()
+    overview = await get_markup_overview()
+    await callback.message.edit_text(markup_panel_text(overview), reply_markup=markup_admin_menu(overview))
+    await callback.answer()
+
+
+@router_admin.callback_query(F.data.startswith("adm:mk:"))
+async def admin_markup_pick(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    target = callback.data.split(":", 2)[2]
+    if target != "all" and target not in MARKUP_CATEGORIES:
+        await callback.answer()
+        return
+    await state.update_data(markup_target=target)
+    await _ask(callback, state, AdminPanel.markup_percent, ask_markup_percent(target), markup_cancel_menu())
 
 
 @router_admin.message(AdminPanel.markup_percent, is_free_text)
 async def admin_markup_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
-    text = message.text.strip().replace(",", ".")
+    data = await state.get_data()
+    target = data.get("markup_target", "all")
+    text = message.text.strip()
+
+    if target != "all" and text == "-":
+        # Bo'sh qiymat = "bu bo'lim uchun alohida ustama yo'q" (get_markup_percent avtomatik umumiyga tushadi) —
+        # alohida delete_setting funksiyasiz, xotira sxemasini o'zgartirmasdan.
+        await set_setting(_markup_key(target), "")
+        overview = await get_markup_overview()
+        await _panel_edit(bot, state, message, markup_reset_text(target, overview["items"][target][0]), markup_cancel_menu())
+        await state.clear()
+        return
+
     try:
-        percent = float(text)
+        percent = float(text.replace(",", "."))
     except ValueError:
-        await _panel_edit(bot, state, message, NOT_A_VALID_PERCENT, settings_cancel_menu())
+        await _panel_edit(bot, state, message, NOT_A_VALID_PERCENT, markup_cancel_menu())
         return
-    if percent <= -100:
-        await _panel_edit(bot, state, message, INVALID_MARKUP_RANGE, settings_cancel_menu())
+    if not math.isfinite(percent) or percent <= -100:
+        await _panel_edit(bot, state, message, INVALID_MARKUP_RANGE, markup_cancel_menu())
+        return
+    if percent > MAX_MARKUP_PERCENT:
+        await _panel_edit(bot, state, message, INVALID_MARKUP_MAX, markup_cancel_menu())
         return
 
-    await set_setting(SETTINGS_KEY_MARKUP, str(percent))
-    await _panel_edit(bot, state, message, markup_saved(percent), settings_cancel_menu())
+    await set_setting(_markup_key(None if target == "all" else target), str(percent))
+    await _panel_edit(bot, state, message, markup_saved(percent, target), markup_cancel_menu())
     await state.clear()
-
 
 # ---------- Xarid kanalini sozlash ----------
 
@@ -7642,6 +7934,7 @@ async def main():
             await AUTOPAY.stop()
         if _pool is not None:
             await _pool.close()
+        await client.close()
         await bot.session.close()
 
 
