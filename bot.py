@@ -53,6 +53,8 @@ load_dotenv()
 # ==============================================================
 # SOZLAMALAR (config)
 # ==============================================================
+
+LOCAL_TZ = timezone(timedelta(hours=5))   # Toshkent (UTC+5, yozgi vaqt yo'q): statistikada "kun" chegarasi shu vaqt bo'yicha
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 ADMIN_IDS = [
@@ -185,6 +187,16 @@ CREATE TABLE IF NOT EXISTS support_threads (
     PRIMARY KEY (admin_chat_id, message_id)
 );
 
+CREATE TABLE IF NOT EXISTS admin_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    target_id INTEGER,
+    amount INTEGER,
+    note TEXT,
+    created_at INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS ix_orders_user ON orders (user_id, id);
 CREATE INDEX IF NOT EXISTS ix_orders_status ON orders (status, id);
 CREATE INDEX IF NOT EXISTS ix_orders_type_status ON orders (order_type, status, country);
@@ -242,6 +254,16 @@ CREATE TABLE IF NOT EXISTS support_threads (
     message_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
     PRIMARY KEY (admin_chat_id, message_id)
+);
+
+CREATE TABLE IF NOT EXISTS admin_log (
+    id BIGSERIAL PRIMARY KEY,
+    admin_id BIGINT NOT NULL,
+    action TEXT NOT NULL,
+    target_id BIGINT,
+    amount BIGINT,
+    note TEXT,
+    created_at BIGINT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS ix_orders_user ON orders (user_id, id);
@@ -357,37 +379,6 @@ async def ensure_user(user_id: int, username: Optional[str], full_name: Optional
             await db.execute(
                 "UPDATE users SET username = ?, full_name = ? WHERE user_id = ?",
                 (username, full_name, user_id),
-            )
-            await db.commit()
-
-
-async def get_referrer(user_id: int) -> Optional[int]:
-    """Foydalanuvchini taklif qilgan kishining ID sini qaytaradi (bo'lmasa None)."""
-    if _PG:
-        async with _pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT referred_by FROM users WHERE user_id = $1", user_id)
-            return row["referred_by"] if row else None
-    else:
-        async with _db_sqlite() as db:
-            cur = await db.execute("SELECT referred_by FROM users WHERE user_id = ?", (user_id,))
-            row = await cur.fetchone()
-            return row[0] if row else None
-
-
-async def add_referral_earning(user_id: int, amount: int):
-    """Referal keshbek berilganda shu foydalanuvchining jami keshbek
-    hisobiga qo'shadi (statistika ko'rsatish uchun)."""
-    if _PG:
-        async with _pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET referral_earnings = referral_earnings + $1 WHERE user_id = $2",
-                amount, user_id,
-            )
-    else:
-        async with _db_sqlite() as db:
-            await db.execute(
-                "UPDATE users SET referral_earnings = referral_earnings + ? WHERE user_id = ?",
-                (amount, user_id),
             )
             await db.commit()
 
@@ -692,7 +683,9 @@ async def daily_revenue(days: int = 7) -> list:
     yangisigacha, [(kun_str, summa), ...] ro'yxati sifatida qaytaradi
     (kunlar Postgres/SQLite farqiga qaramay Python tomonida guruhlanadi,
     shunda ikkala baza uchun ham bir xil ishlaydi)."""
-    since = int(time.time()) - days * 86400
+    # "Kun" Toshkent vaqti bo'yicha (server UTC bo'lsa ham): birinchi kun ham TO'LIQ (mahalliy yarim tundan) olinadi.
+    now_local = datetime.now(LOCAL_TZ)
+    since = int((now_local - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     if _PG:
         async with _pool.acquire() as conn:
             rows = await conn.fetch(
@@ -710,37 +703,14 @@ async def daily_revenue(days: int = 7) -> list:
 
     buckets: Dict[str, int] = {}
     for created_at, price in pairs:
-        day = datetime.fromtimestamp(created_at).strftime("%m-%d")
+        day = datetime.fromtimestamp(created_at, LOCAL_TZ).strftime("%m-%d")
         buckets[day] = buckets.get(day, 0) + price
 
     result = []
-    now = int(time.time())
     for i in range(days - 1, -1, -1):
-        day = datetime.fromtimestamp(now - i * 86400).strftime("%m-%d")
+        day = (now_local - timedelta(days=i)).strftime("%m-%d")
         result.append((day, buckets.get(day, 0)))
     return result
-
-
-async def update_order_status(order_pk: int, status: str, details: Optional[dict] = None):
-    if _PG:
-        async with _pool.acquire() as conn:
-            if details is not None:
-                await conn.execute(
-                    "UPDATE orders SET status = $1, details = $2 WHERE id = $3",
-                    status, json.dumps(details, ensure_ascii=False), order_pk,
-                )
-            else:
-                await conn.execute("UPDATE orders SET status = $1 WHERE id = $2", status, order_pk)
-    else:
-        async with _db_sqlite() as db:
-            if details is not None:
-                await db.execute(
-                    "UPDATE orders SET status = ?, details = ? WHERE id = ?",
-                    (status, json.dumps(details, ensure_ascii=False), order_pk),
-                )
-            else:
-                await db.execute("UPDATE orders SET status = ? WHERE id = ?", (status, order_pk))
-            await db.commit()
 
 
 async def get_order_row(order_pk: int):
@@ -809,39 +779,90 @@ async def get_last_order(user_id: int):
             return await cur.fetchone()
 
 
-async def refund_order(order_pk: int, min_age_seconds: int = 0) -> Optional[dict]:
+async def refund_order(order_pk: int, min_age_seconds: int = 0, any_open: bool = False) -> Optional[dict]:
     """Buyurtmani 'refunded' holatiga o'tkazadi va puli balansga qaytariladi —
     FAQAT hali 'processing' holatida bo'lsa (shu tufayli ikki marta qaytarib
     bo'lmaydi — bu ham atomik shart bilan ta'minlanadi) va kamida
-    min_age_seconds vaqt o'tgan bo'lsa. Muvaffaqiyatli bo'lsa
-    {"user_id":.., "price":..} qaytaradi, aks holda None.
+    min_age_seconds vaqt o'tgan bo'lsa.
+
+    any_open=True — 'processing'dan tashqari, hali yakunlanmagan (refunded/done
+    EMAS) har qanday holatda ham qaytaradi. Stars/Premium buyurtmasiga provayder
+    holati ('pending', 'waiting'...) yozib qo'yilgan bo'lsa ham, keyin 'failed'
+    kelganda pul qaytishi uchun kerak.
+
+    Holatni o'zgartirish VA balansga qaytarish BITTA tranzaksiyada bajariladi:
+    orada jarayon to'xtasa, ikkalasi ham bekor bo'ladi (buyurtma 'refunded' bo'lib,
+    pul qaytmay qolmaydi). Muvaffaqiyatli bo'lsa {"user_id":.., "price":..}
+    qaytaradi, aks holda None.
     """
     row = await get_order_row(order_pk)
-    if not row or row["status"] != "processing":
+    if not row:
+        return None
+    current = row["status"]
+    if not (current == "processing" or (any_open and current not in ("refunded", "done"))):
         return None
     if min_age_seconds and (int(time.time()) - row["created_at"]) < min_age_seconds:
         return None
 
     if _PG:
         async with _pool.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE orders SET status = 'refunded' WHERE id = $1 AND status = 'processing'",
-                order_pk,
-            )
-            if result.split()[-1] == "0":
-                return None
+            async with conn.transaction():
+                result = await conn.execute(
+                    "UPDATE orders SET status = 'refunded' WHERE id = $1 AND status = $2",
+                    order_pk, current,
+                )
+                if result.split()[-1] == "0":
+                    return None                    # shu orada boshqa jarayon holatni o'zgartirib ulgurdi
+                await conn.execute(
+                    "UPDATE users SET balance = balance + $1 WHERE user_id = $2",
+                    row["price"], row["user_id"],
+                )
     else:
         async with _db_sqlite() as db:
             cur = await db.execute(
-                "UPDATE orders SET status = 'refunded' WHERE id = ? AND status = 'processing'",
-                (order_pk,),
+                "UPDATE orders SET status = 'refunded' WHERE id = ? AND status = ?",
+                (order_pk, current),
             )
-            await db.commit()
             if cur.rowcount == 0:
                 return None
-
-    await change_balance(row["user_id"], row["price"])
+            await db.execute(
+                "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+                (row["price"], row["user_id"]),
+            )
+            await db.commit()                      # holat + balans BIRGA saqlanadi
     return {"user_id": row["user_id"], "price": row["price"]}
+
+
+async def discard_unsent_order(order_pk: int) -> bool:
+    """Provayder xaridni ANIQ rad etganda: write-ahead buyurtma yozuvi o'chiriladi va pul balansga qaytariladi —
+    BITTA tranzaksiyada (orada jarayon to'xtasa, ikkalasi ham bekor bo'ladi). Rad etilgan urinish buyurtma
+    hisoblanmaydi (statistika va ro'yxatlarda ko'rinmaydi — write-ahead'dan oldingi xatti-harakat saqlanadi).
+    FAQAT buyurtma hali 'processing' bo'lsa va provayder javobi yozilmagan (ref yo'q, details.unsent) bo'lsagina;
+    aks holda False (natijasi allaqachon qo'llangan buyurtma hech qachon o'chirilmaydi)."""
+    row = await get_order_row(order_pk)
+    if not row or row["status"] != "processing" or row["ref"]:
+        return False
+    if _PG:
+        async with _pool.acquire() as conn:
+            async with conn.transaction():
+                res = await conn.execute(
+                    "DELETE FROM orders WHERE id = $1 AND status = 'processing' AND ref IS NULL "
+                    "AND details LIKE $2", order_pk, '%"unsent": true%')
+                if res.split()[-1] == "0":
+                    return False
+                await conn.execute(
+                    "UPDATE users SET balance = balance + $1 WHERE user_id = $2", row["price"], row["user_id"])
+    else:
+        async with _db_sqlite() as db:
+            cur = await db.execute(
+                "DELETE FROM orders WHERE id = ? AND status = 'processing' AND ref IS NULL "
+                "AND details LIKE ?", (order_pk, '%"unsent": true%'))
+            if cur.rowcount == 0:
+                return False
+            await db.execute(
+                "UPDATE users SET balance = balance + ? WHERE user_id = ?", (row["price"], row["user_id"]))
+            await db.commit()
+    return True
 
 
 async def create_topup(user_id: int, amount: int, photo_file_id: Optional[str]) -> int:
@@ -899,6 +920,33 @@ async def get_pending_topups(limit: int = 15) -> list:
                 (limit,),
             )
             return await cur.fetchall()
+
+
+async def approve_topup_atomic(topup_id: int) -> Optional[dict]:
+    """Qo'lda to'ldirishni tasdiqlash — BITTA tranzaksiyada: 'pending' -> 'approved' + foydalanuvchi balansi +
+    referal keshbek (Autopay._credit bilan bir xil mantiq). Orada xato yoki uzilish bo'lsa HAMMASI bekor bo'ladi
+    (so'rov 'pending' qoladi, admin qayta bosadi) — "tasdiqlandi, lekin balans qo'shilmadi" holati bo'lmaydi.
+    Ikki admin bir vaqtda bossa ham faqat bittasi yutadi (ikkinchisiga None).
+    Qaytadi: {"user_id", "amount", "referrer", "cashback"} yoki None (pending emas / topilmadi)."""
+    async with _ap_tx() as tx:
+        row = await tx.fetchone("SELECT id, user_id, amount FROM topups WHERE id = ? AND status = 'pending'", topup_id)
+        if not row:
+            return None
+        if await tx.execute("UPDATE topups SET status = 'approved' WHERE id = ? AND status = 'pending'", topup_id) == 0:
+            return None
+        user_id, amount = row["user_id"], row["amount"]
+        await tx.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", amount, user_id)
+        ref = await tx.fetchone("SELECT referred_by FROM users WHERE user_id = ?", user_id)
+        referrer = ref["referred_by"] if ref else None
+        cashback = 0
+        if referrer:
+            cashback = amount * REFERRAL_CASHBACK_PERCENT // 100
+            if cashback > 0:
+                await tx.execute(
+                    "UPDATE users SET balance = balance + ?, referral_earnings = referral_earnings + ? "
+                    "WHERE user_id = ?", cashback, cashback, referrer)
+    return {"user_id": user_id, "amount": amount,
+            "referrer": referrer if cashback > 0 else None, "cashback": cashback}
 
 
 async def set_topup_status(topup_id: int, status: str, expected_current: Optional[str] = None) -> bool:
@@ -960,6 +1008,48 @@ async def set_topup_amount(topup_id: int, new_amount: int) -> bool:
             )
             await db.commit()
             return cur.rowcount > 0
+
+
+async def log_admin_action(admin_id: int, action: str, target_id: Optional[int] = None,
+                           amount: Optional[int] = None, note: Optional[str] = None) -> None:
+    """Admin amallari jurnali (admin_log jadvali): kim, qachon, nima qildi, kimga, qancha.
+    Jurnal xatosi asosiy amalni to'xtatmasligi uchun HECH QACHON xato ko'tarmaydi.
+    `note`ga sir (API kalit, to'liq karta raqami) YOZMANG."""
+    logging.info(f"ADMIN_LOG admin={admin_id} action={action} target={target_id} amount={amount} note={note}")
+    try:
+        now = int(time.time())
+        if _PG:
+            async with _pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO admin_log (admin_id, action, target_id, amount, note, created_at) "
+                    "VALUES ($1, $2, $3, $4, $5, $6)",
+                    admin_id, action, target_id, amount, note, now,
+                )
+        else:
+            async with _db_sqlite() as db:
+                await db.execute(
+                    "INSERT INTO admin_log (admin_id, action, target_id, amount, note, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (admin_id, action, target_id, amount, note, now),
+                )
+                await db.commit()
+    except Exception:
+        logging.exception("admin_log ga yozib bo'lmadi (asosiy amal bajarildi)")
+
+
+async def get_admin_log(limit: int = 25) -> list:
+    """Admin jurnalining oxirgi `limit` ta yozuvi (yangisi birinchi)."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT id, admin_id, action, target_id, amount, note, created_at "
+                "FROM admin_log ORDER BY id DESC LIMIT $1", limit)
+    async with _db_sqlite() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT id, admin_id, action, target_id, amount, note, created_at "
+            "FROM admin_log ORDER BY id DESC LIMIT ?", (limit,))
+        return await cur.fetchall()
 
 
 async def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -1312,8 +1402,9 @@ class SmmUpperClient:
         return await get_setting(SETTINGS_KEY_API_KEY, default=self.api_key) or self.api_key
 
     async def _request(self, action: str, *, raise_on_error: bool = True,
-                        _retry_on_limit: bool = True, **params) -> dict:
-        current_key = await self._current_api_key()
+                        _retry_on_limit: bool = True, api_key: Optional[str] = None, **params) -> dict:
+        # api_key berilsa (masalan, yangi kalitni saqlashdan OLDIN tekshirish uchun) — o'sha ishlatiladi, aks holda joriy kalit
+        current_key = api_key or await self._current_api_key()
         query = {"action": action, "api_key": current_key}
         for key, value in params.items():
             if value is not None:
@@ -1329,7 +1420,7 @@ class SmmUpperClient:
                     pass
                 await asyncio.sleep(min(retry_after, 15))
                 return await self._request(
-                    action, raise_on_error=raise_on_error, _retry_on_limit=False, **params
+                    action, raise_on_error=raise_on_error, _retry_on_limit=False, api_key=api_key, **params
                 )
 
             try:
@@ -1344,8 +1435,8 @@ class SmmUpperClient:
             return data
 
     # 1. Balans (bizning hamkor hisobimizning SmmUpper'dagi balansi)
-    async def get_balance(self) -> dict:
-        return await self._request("getBalance")
+    async def get_balance(self, api_key: Optional[str] = None) -> dict:
+        return await self._request("getBalance", api_key=api_key)
 
     # 2. Narxlar (Stars / Premium)
     async def get_prices(self, *, force_refresh: bool = False) -> dict:
@@ -1570,6 +1661,16 @@ def single_flight_purchase(handler):
             _purchase_inflight.discard(uid)
     return wrapper
 
+async def _wait_purchases_finish(timeout: float) -> None:
+    """To'xtatishdan oldin jarayondagi xaridlar (pul yechilgan, provayder javobi kutilmoqda) tugashini kutadi.
+    Aks holda polling_task.cancel() ularni pul yechilgandan keyin uzib qo'yishi mumkin. Tugamaganlarning yozuvi
+    baribir bazada qoladi va fon jarayoni (recover_purchase_order) tiklaydi."""
+    deadline = time.monotonic() + timeout
+    while _purchase_inflight and time.monotonic() < deadline:
+        await asyncio.sleep(0.5)
+    if _purchase_inflight:
+        logging.warning(f"To'xtatishda {len(_purchase_inflight)} ta xarid tugamadi — yozuvlari bazada, fon jarayoni tiklaydi")
+
 
 async def _safe_answer(callback, text=None, show_alert: bool = False):
     """callback.answer — xato bersa (masalan, tugma eskirgan) e'tiborsiz: pul yechilgandan keyingi
@@ -1620,19 +1721,32 @@ async def _call_idempotent(fn, *args, request_id=None, attempts: int = 3, **kwar
     raise PurchaseUnknownError(request_id, last)
 
 
-async def _refund_unknown_purchase(bot, callback, state, est_price: int, label: str, err) -> None:
+async def _refund_unknown_purchase(bot, callback, state, est_price: int, label: str, err,
+                                   order_pk: Optional[int] = None) -> None:
     """Xarid natijasi noma'lum (Raqam/Stars/Premium): pul foydalanuvchiga qaytariladi, adminga request_id bilan
-    ogohlantirish yuboriladi (xarid SmmUpper'da amalga oshgan bo'lishi ham mumkin)."""
+    ogohlantirish yuboriladi (xarid SmmUpper'da amalga oshgan bo'lishi ham mumkin).
+    `order_pk` berilsa (write-ahead yozuvi) — pul refund_order orqali BIR MARTA va atomik qaytariladi; buyurtma
+    'refunded' bo'lib request_id bilan bazada qoladi (keyin SmmUpper panelida solishtirish uchun)."""
     user_id = callback.from_user.id
-    await change_balance(user_id, est_price)
+    if order_pk is not None:
+        if not await refund_order(order_pk):
+            # Yozuv shu orada boshqa jarayon tomonidan yakunlangan (masalan, fon jarayoni natijani topdi) —
+            # ikkinchi marta qaytarmaymiz.
+            logging.warning(f"{label} #{order_pk}: natija noma'lum edi, lekin buyurtma allaqachon yakunlangan "
+                            f"— pul qayta qaytarilmadi")
+            await state.clear()
+            return
+    else:
+        await change_balance(user_id, est_price)
     request_id = getattr(err, "request_id", "?")
+    order_line = f" Buyurtma: #{order_pk}." if order_pk is not None else ""
     logging.error(f"{label} xaridi: SmmUpper javobi olinmadi user={user_id} request_id={request_id}: {err}")
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
                 admin_id,
                 f"\u26A0\uFE0F {label} xaridi: SmmUpper javobi olinmadi (tarmoq).\n"
-                f"Foydalanuvchi ID: {user_id}, summa: {fmt_money(est_price)} so'm.\nrequest_id: {request_id}\n"
+                f"Foydalanuvchi ID: {user_id}, summa: {fmt_money(est_price)} so'm.{order_line}\nrequest_id: {request_id}\n"
                 f"Foydalanuvchi puli balansga qaytarildi. Xarid SmmUpper'da amalga oshgan bo'lishi ham mumkin "
                 f"\u2014 uni SmmUpper panelida tekshiring.")
         except Exception:
@@ -1644,6 +1758,304 @@ async def _refund_unknown_purchase(bot, callback, state, est_price: int, label: 
             reply_markup=main_menu(),
         )
     await state.clear()
+
+
+# ---------------- Write-ahead: Raqam / Stars / Premium ----------------
+# Buyurtma provayderga so'rov yuborilishidan OLDIN 'processing' holatida yoziladi (UC oqimidagi kabi).
+# Provayder javob bergach yakunlanadi. Javob olinmasa (jarayon to'xtasa, deploy, kutilmagan xato) yozuv
+# request_id bilan bazada qoladi va fon jarayoni (recover_purchase_order) XUDDI SHU request_id bilan qayta
+# yuboradi — SmmUpper takroriy so'rovni ikkinchi marta bajarmaydi, saqlangan natijani qaytaradi.
+_WA_TYPES = ("number", "stars", "premium")
+_WA_LABELS = {"number": "Raqam", "stars": "Stars", "premium": "Premium"}
+WA_RECOVER_AFTER = 180            # soniya: yuborilmay qolgan buyurtma shundan keyin qayta uriladi (handler ~66 s ichida tugaydi)
+WA_RECOVER_GIVE_UP = 2 * 3600     # shundan keyin ham natija noma'lum bo'lsa — pul qaytariladi va adminga xabar beriladi
+
+
+def _order_details_from_row(row) -> dict:
+    try:
+        details = json.loads(row["details"]) if row["details"] else {}
+        return details if isinstance(details, dict) else {}
+    except Exception:
+        return {}
+
+
+def _purchase_ref(order_type: str, result: dict) -> Optional[str]:
+    """Provayder javobidan buyurtma 'ref'i (getCode/getOrder uchun): Raqam — hash_code/number/id, Stars/Premium — order_id."""
+    if not isinstance(result, dict):
+        return None
+    if order_type == "number":
+        raw = result.get("hash_code") or result.get("number") or result.get("id")
+    else:
+        raw = result.get("order_id")
+    return str(raw) if raw not in (None, "") else None
+
+
+async def _claim_purchase_result(order_pk: int, expected_details: Optional[str], ref: Optional[str],
+                                 details: dict) -> bool:
+    """Provayder javobini buyurtmaga BIR MARTA yozadi (atomik "claim"): faqat buyurtma hali 'processing' bo'lsa va
+    'details' o'qilgandan beri o'zgarmagan bo'lsa. Handler va fon jarayoni bir vaqtda urinsa — faqat bittasi yutadi."""
+    details_json = json.dumps(details, ensure_ascii=False)
+    if _PG:
+        async with _pool.acquire() as conn:
+            res = await conn.execute(
+                "UPDATE orders SET ref = $1, details = $2 WHERE id = $3 AND status = 'processing' AND details = $4",
+                ref, details_json, order_pk, expected_details,
+            )
+            return res.split()[-1] != "0"
+    async with _db_sqlite() as db:
+        cur = await db.execute(
+            "UPDATE orders SET ref = ?, details = ? WHERE id = ? AND status = 'processing' AND details = ?",
+            (ref, details_json, order_pk, expected_details),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def _set_order_price(order_pk: int, price: int) -> None:
+    if _PG:
+        async with _pool.acquire() as conn:
+            await conn.execute("UPDATE orders SET price = $1 WHERE id = $2", price, order_pk)
+    else:
+        async with _db_sqlite() as db:
+            await db.execute("UPDATE orders SET price = ? WHERE id = ?", (price, order_pk))
+            await db.commit()
+
+
+async def _list_unsent_purchase_orders(created_before: int, limit: int) -> list:
+    """Pul yechilgan, lekin provayder javobi yozilmagan (details.unsent) Raqam/Stars/Premium buyurtmalari."""
+    sql = ("SELECT id FROM orders WHERE order_type IN ('number', 'stars', 'premium') AND status = 'processing' "
+           "AND ref IS NULL AND details LIKE ")
+    pattern = '%"unsent": true%'
+    if _PG:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(sql + "$1 AND created_at < $2 ORDER BY id LIMIT $3", pattern, created_before, limit)
+            return [r["id"] for r in rows]
+    async with _db_sqlite() as db:
+        cur = await db.execute(sql + "? AND created_at < ? ORDER BY id LIMIT ?", (pattern, created_before, limit))
+        rows = await cur.fetchall()
+        return [r[0] for r in rows]
+
+
+async def _open_purchase_order(callback, state, est_price: int, order_type: str, request_id: str, *,
+                               server=None, country=None, target_username=None, qty=None) -> Optional[int]:
+    """WRITE-AHEAD: pul yechilgach, provayderga so'rov yuborishdan OLDIN buyurtmani 'processing' holatida yozadi.
+    Yozib bo'lmasa — pul qaytariladi va None qaytadi (provayderga hali hech narsa yuborilmagan)."""
+    user_id = callback.from_user.id
+    try:
+        return await create_order(
+            user_id=user_id, order_type=order_type, ref=None, server=server, price=est_price,
+            details={"request_id": request_id, "unsent": True}, status="processing",
+            country=country, target_username=target_username, qty=qty,
+        )
+    except Exception:
+        logging.exception(f"{order_type}: buyurtmani yozib bo'lmadi — pul qaytarildi")
+        await change_balance(user_id, est_price)
+        with contextlib.suppress(Exception):
+            await callback.message.answer(
+                "\u274C Vaqtinchalik xatolik. \U0001F4B0 Pulingiz balansga qaytarildi, qayta urinib ko'ring.",
+                reply_markup=main_menu())
+        await state.clear()
+        return None
+
+
+async def _send_purchase_request(order_type: str, request_id: str, *, server=None, country=None,
+                                 target_username=None, qty=None, attempts: int = 3) -> dict:
+    """Provayderga xarid so'rovi (XUDDI SHU request_id bilan qayta urinish mumkin). Handler ham, tiklash ham shuni ishlatadi."""
+    if order_type == "number":
+        return await _call_idempotent(client.get_number, server, country, request_id=request_id, attempts=attempts)
+    if order_type == "stars":
+        return await _call_idempotent(client.buy_stars, target_username, qty, request_id=request_id, attempts=attempts)
+    return await _call_idempotent(client.buy_premium, target_username, qty, request_id=request_id, attempts=attempts)
+
+
+async def _reject_purchase(callback, state, order_pk: int, e) -> None:
+    """Provayder xaridni ANIQ rad etdi (balans/mavjud emas/noto'g'ri ma'lumot...): yozuv o'chiriladi va pul
+    qaytadi (atomik, bir marta)."""
+    if await discard_unsent_order(order_pk):
+        text = f"\u274C Xatolik: {e.message}\n\U0001F4B0 Pulingiz balansga qaytarildi."
+    else:
+        logging.warning(f"#{order_pk}: rad etilgan xaridni bekor qilib bo'lmadi (yozuv o'zgargan) — pul qaytarilmadi")
+        text = f"\u274C Xatolik: {e.message}"
+    await callback.message.answer(text, reply_markup=main_menu())
+    await state.clear()
+
+
+async def _park_purchase(bot, callback, state, order_pk: int, est_price: int, label: str, request_id: str, err) -> None:
+    """Kutilmagan xato (buzuq javob va h.k.): natija noma'lum, lekin pul YO'QOLMAYDI — buyurtma 'processing'
+    (yuborilmagan) holida qoladi, fon jarayoni shu request_id bilan qayta uradi va natijaga qarab yakunlaydi/qaytaradi."""
+    user_id = callback.from_user.id
+    logging.error(f"{label} #{order_pk}: xarid paytida kutilmagan xato user={user_id} request_id={request_id}: {err!r}",
+                  exc_info=err)
+    await _uc_alert_admins(
+        bot,
+        f"\u26A0\uFE0F {label} #{order_pk}: kutilmagan xato ({type(err).__name__}). request_id: {request_id}\n"
+        f"Foydalanuvchi ID: {user_id}, summa: {fmt_money(est_price)} so'm.\n"
+        f"Bot shu request_id bilan avtomatik qayta uradi (takroriy xarid bo'lmaydi).")
+    with contextlib.suppress(Exception):
+        await callback.message.answer(
+            f"\u23F3 Buyurtmangiz (#{order_pk}) qabul qilindi, lekin natija hali aniq emas.\n"
+            "Tez orada o'zimiz xabar qilamiz \u2014 pulingiz yo'qolmaydi.",
+            reply_markup=main_menu())
+    await state.clear()
+
+
+async def _apply_purchase_result(order_pk: int, result: dict) -> Optional[dict]:
+    """Provayderning muvaffaqiyatli javobini buyurtmaga qo'llaydi: ref, javob tafsilotlari, narx farqi (final_price).
+    BIR MARTA (atomik "claim") — handler va fon jarayoni bir vaqtda urinsa ham faqat bittasi bajaradi.
+    Qaytadi: {"price": haqiqatda yechilgan narx, "ref": ...} yoki None (allaqachon qo'llangan / 'processing' emas)."""
+    row = await get_order_row(order_pk)
+    if not row or row["order_type"] not in _WA_TYPES or row["status"] != "processing":
+        return None
+    details = _order_details_from_row(row)
+    if not details.get("unsent"):
+        return None                    # natija allaqachon qo'llangan (handler yoki fon jarayoni tomonidan)
+    order_type = row["order_type"]
+    ref = _purchase_ref(order_type, result)
+    new_details = {**details, **result, "unsent": False}
+    if not await _claim_purchase_result(order_pk, row["details"], ref, new_details):
+        return None
+    est_price = row["price"]
+    charged = await final_price(row["user_id"], result, est_price, order_type)
+    if charged != est_price:
+        await _set_order_price(order_pk, charged)      # AYNAN yechilgan summa buyurtmaga yoziladi
+    return {"price": charged, "ref": ref}
+
+
+def _log_task_exception(task) -> None:
+    """Fon vazifasi (SMS kuzatuvi) kutilmagan xato bilan tugasa — jimgina yo'qolmasin, logga yozilsin."""
+    _background_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logging.error("Fon vazifasi xato bilan tugadi", exc_info=task.exception())
+
+
+async def _announce_purchase(bot, order_pk: int, order, result: dict, info: dict, *, buyer: str, send) -> None:
+    """Muvaffaqiyatli xarid: foydalanuvchiga tasdiq + kanalga xabar (Raqam bo'lsa — SMS kod kuzatuvi ham boshlanadi).
+    `send(text, **kwargs)` — handlerda callback.message.answer, fon jarayonida bot.send_message orqali yuboradi."""
+    order_type = order["order_type"]
+    price = info["price"]
+    if order_type == "number":
+        number = result.get("number", "?")
+        sent = await send(
+            f"\u2705 Raqam muvaffaqiyatli olindi!\n"
+            f"\U0001F4F1 Raqam: <code>{html.escape(str(number))}</code>\n"
+            f"\U0001F4B5 Narx: {fmt_money(price)} so'm\n"
+            f"\u23F3 SMS tasdiqlash kodi kutilmoqda...\n"
+            f"Iltimos, biroz kuting.",
+            reply_markup=check_code_menu(order_pk, copy_number=number),
+            parse_mode="HTML",
+        )
+        with contextlib.suppress(Exception):
+            await notify_channel(bot, channel_number_notice(buyer, order["country"], price, number), order_type="number")
+        task = asyncio.create_task(
+            _poll_code(bot, order["user_id"], order_pk, order["server"], result, sent.message_id))
+        _background_tasks.add(task)
+        task.add_done_callback(_log_task_exception)
+        return
+
+    username, qty = order["target_username"], order["qty"]
+    if order_type == "stars":
+        notice = channel_stars_notice(buyer, username, qty, price)
+        what = f"\u2B50 {qty} Stars"
+    else:
+        notice = channel_premium_notice(buyer, username, qty, price)
+        what = f"\U0001F48E {qty} oy Premium"
+    await send(
+        f"\u2705 Buyurtma qabul qilindi!\n"
+        f"\U0001F464 @{username}\n"
+        f"{what}\n"
+        f"\U0001F4B5 {fmt_money(price)} so'm\n"
+        f"\U0001F522 Buyurtma raqami: {result.get('order_id')} (#{order_pk})\n\n"
+        f"Holatini \u00ab{BTN_ORDERS}\u00bb bo'limidan kuzatishingiz mumkin.",
+        reply_markup=main_menu(),
+    )
+    with contextlib.suppress(Exception):
+        await notify_channel(bot, notice, order_type=order_type)
+
+
+async def _finish_purchase(bot, callback, order_pk: int, order: dict, result: dict, est_price: int) -> None:
+    """Provayder muvaffaqiyatli javob berdi: natijani buyurtmaga yozadi (atomik), so'ng foydalanuvchi va kanalga xabar beradi."""
+    try:
+        info = await _apply_purchase_result(order_pk, result)
+    except Exception:
+        # Bazaga yozish yiqildi, lekin provayder xaridni ALLAQACHON bajargan: foydalanuvchi natijani (Raqam bo'lsa —
+        # raqamning o'zini) baribir olishi shart. Yozuv 'unsent' holida qolsa, fon jarayoni shu request_id bilan yakunlaydi.
+        logging.exception(f"{order['order_type']} #{order_pk}: natijani yozib bo'lmadi — foydalanuvchiga baribir yuboriladi")
+        info = {"price": est_price, "ref": _purchase_ref(order["order_type"], result)}
+    if info is None:
+        return                       # kamdan-kam: shu orada fon jarayoni natijani qo'llab, foydalanuvchiga xabar bergan
+    buyer = callback.from_user.full_name
+    if callback.from_user.username:
+        buyer += f" (@{callback.from_user.username})"
+    await _announce_purchase(bot, order_pk, order, result, info, buyer=buyer, send=callback.message.answer)
+
+
+async def _notify_purchase_refund(bot, order_pk: Optional[int], user_id: int, price: int, reason: str, label: str) -> None:
+    balance = await get_balance(user_id)
+    ref_part = f" (#{order_pk})" if order_pk else ""
+    with contextlib.suppress(Exception):
+        await bot.send_message(
+            user_id,
+            f"\u274C {label} buyurtmangiz{ref_part} bajarilmadi ({reason}).\n"
+            f"\U0001F4B0 {fmt_money(price)} so'm balansingizga qaytarildi.\n"
+            f"Yangi balans: {fmt_money(balance)} so'm")
+
+
+async def recover_purchase_order(bot, order_pk: int) -> Optional[str]:
+    """Pul yechilgan, lekin provayder javobi yozilmagan (jarayon so'rov paytida to'xtagan) Raqam/Stars/Premium
+    buyurtmasini XUDDI SHU request_id bilan qayta yuboradi. SmmUpper takroriy so'rovni ikkinchi marta bajarmaydi:
+    birinchisi o'tgan bo'lsa — saqlangan natijani qaytaradi.
+    Qaytadi: "sent" | "refunded" | "pending" | None (bu buyurtma tiklashga tegishli emas)."""
+    row = await get_order_row(order_pk)
+    if not row or row["order_type"] not in _WA_TYPES or row["status"] != "processing" or row["ref"]:
+        return None
+    details = _order_details_from_row(row)
+    if not details.get("unsent"):
+        return None
+    user_id = row["user_id"]
+    order_type = row["order_type"]
+    label = _WA_LABELS[order_type]
+    request_id = details.get("request_id")
+    age = int(time.time()) - int(row["created_at"] or 0)
+
+    result, definite_error = None, None
+    if request_id:
+        try:
+            result = await _send_purchase_request(
+                order_type, request_id, server=row["server"], country=row["country"],
+                target_username=row["target_username"], qty=row["qty"], attempts=1)
+        except SmmUpperError as e:
+            definite_error = e
+        except PurchaseUnknownError:
+            result = None
+        except Exception:
+            logging.exception(f"{label} #{order_pk}: qayta yuborishda kutilmagan xato")
+            result = None
+
+    if result:
+        info = await _apply_purchase_result(order_pk, result)
+        if info:
+            async def _send(text, **kwargs):
+                return await bot.send_message(user_id, text, **kwargs)
+            buyer = await _uc_buyer_name(bot, user_id)
+            await _announce_purchase(bot, order_pk, row, result, info, buyer=buyer, send=_send)
+            await _uc_alert_admins(bot, f"\u2705 {label} #{order_pk}: buyurtma qayta yuborildi va tasdiqlandi.")
+        return "sent"
+
+    if definite_error is not None:
+        # SmmUpper ANIQ rad etdi (birinchi urinish ham bajarilmagan): yozuv o'chiriladi va pul qaytadi
+        if await discard_unsent_order(order_pk):
+            await _notify_purchase_refund(bot, None, user_id, row["price"], definite_error.message, label)
+        return "refunded"
+    if not request_id or age > WA_RECOVER_GIVE_UP:
+        refund = await refund_order(order_pk)
+        if refund:
+            await _notify_purchase_refund(bot, order_pk, user_id, refund["price"], "SmmUpper javob bermadi", label)
+            await _uc_alert_admins(
+                bot,
+                f"\u26A0\uFE0F {label} #{order_pk}: natija aniqlanmadi, pul foydalanuvchiga qaytarildi "
+                f"(request_id: {request_id}). Xarid SmmUpper'da bo'lgan-bo'lmaganini tekshiring.")
+        return "refunded"
+    return "pending"
 
 
 # ==============================================================
@@ -1801,11 +2213,15 @@ def channel_premium_notice(buyer: str, target_username: str, months: int, price:
     )
 
 
+_EM_DASH = "\u2014"            # f-string ifodasida backslash bo'lmasligi uchun (Python 3.11 va undan eski)
+_UNKNOWN_EMOJI = "\u2754"
+
+
 def admin_user_card(user: dict, referral: Optional[dict] = None) -> str:
     banned = "\U0001F6AB Ha" if user.get("banned") else "Yo'q"
     username = f"@{user['username']}" if user.get("username") else "\u2014"
     lines = [
-        f"\U0001F464 {user.get('full_name') or '\u2014'} ({username})",
+        f"\U0001F464 {user.get('full_name') or _EM_DASH} ({username})",
         f"\U0001F522 ID: {user['user_id']}",
         f"\U0001F4B0 Balans: {fmt_money(user['balance'])} so'm",
         f"\U0001F4E6 Buyurtmalar soni: {user.get('order_count', 0)}",
@@ -3719,18 +4135,17 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
     server = data["server"]
     country = data["country"]
     est_price = data["price"]
+    user_id = callback.from_user.id
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
-    # Balansni SHU YERDA, bitta atomik amal bilan tekshirib-va-yechib qo'yamiz —
-    # SmmUpper'ga ketadigan (sekin) so'rovdan OLDIN. Aks holda ikkita xaridni bir
-    # vaqtda tasdiqlash orqali balansni race condition bilan minusga tushirish
-    # mumkin bo'lardi.
-    if not await try_deduct_balance(callback.from_user.id, est_price):
-        balance = await get_balance(callback.from_user.id)
+    # Balansni SHU YERDA, bitta atomik amal bilan tekshirib-va-yechib qo'yamiz: ikki marta tez bosish yoki parallel
+    # xaridlar balansni manfiyga tushira olmaydi. Provayderdan haqiqiy narx kelgach, farq final_price() bilan tuzatiladi.
+    if not await try_deduct_balance(user_id, est_price):
+        balance = await get_balance(user_id)
         sent = await callback.message.answer(insufficient_balance(est_price, balance), reply_markup=balance_menu())
         await track_flow_msg(sent)
         await state.clear()
@@ -3739,58 +4154,30 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
 
     await _safe_answer(callback, "Amalga oshirilmoqda...")
 
+    # WRITE-AHEAD: buyurtma provayderga so'rovdan OLDIN yoziladi (UC oqimidagi kabi) — so'rov/javob paytida jarayon
+    # to'xtasa ham pul va so'rov yo'qolmaydi (yozuv request_id bilan qoladi, fon jarayoni qayta yuboradi).
+    request_id = new_request_id()
+    order_pk = await _open_purchase_order(callback, state, est_price, "number", request_id,
+                                          server=server, country=country)
+    if order_pk is None:
+        return
+    await state.clear()          # pul yechilgan va yozuv bor: shu tugmani qayta bosib ikkinchi xarid qilib bo'lmaydi
+
     try:
-        result = await _call_idempotent(client.get_number, server, country)
+        result = await _send_purchase_request("number", request_id, server=server, country=country)
     except PurchaseUnknownError as e:
-        await _refund_unknown_purchase(bot, callback, state, est_price, "Raqam", e)
+        await _refund_unknown_purchase(bot, callback, state, est_price, "Raqam", e, order_pk=order_pk)
         return
     except SmmUpperError as e:
-        await change_balance(callback.from_user.id, est_price)
-        await callback.message.answer(
-            f"\u274C Xatolik: {e.message}\n\U0001F4B0 Pulingiz balansga qaytarildi.",
-            reply_markup=main_menu(),
-        )
-        await state.clear()
+        await _reject_purchase(callback, state, order_pk, e)
+        return
+    except Exception as e:
+        await _park_purchase(bot, callback, state, order_pk, est_price, "Raqam", request_id, e)
         return
 
-    charged_price = await final_price(callback.from_user.id, result, est_price, "number")
-
-    ref = result.get("hash_code") or result.get("number") or (
-        str(result["id"]) if result.get("id") is not None else None)
-    order_pk = await create_order(
-        user_id=callback.from_user.id,
-        order_type="number",
-        ref=ref,
-        server=server,
-        price=charged_price,
-        details=result,
-        status="processing",
-        country=country,
-    )
-
-    number = result.get("number", "?")
-
-    buyer = callback.from_user.full_name
-    if callback.from_user.username:
-        buyer += f" (@{callback.from_user.username})"
-    await notify_channel(bot, channel_number_notice(buyer, country, charged_price, number), order_type="number")
-
-    sent = await callback.message.answer(
-        f"\u2705 Raqam muvaffaqiyatli olindi!\n"
-        f"\U0001F4F1 Raqam: <code>{html.escape(str(number))}</code>\n"
-        f"\U0001F4B5 Narx: {fmt_money(charged_price)} so'm\n"
-        f"\u23F3 SMS tasdiqlash kodi kutilmoqda...\n"
-        f"Iltimos, biroz kuting.",
-        reply_markup=check_code_menu(order_pk, copy_number=number),
-        parse_mode="HTML",
-    )
-
-    await state.clear()
-    task = asyncio.create_task(
-        _poll_code(bot, callback.from_user.id, order_pk, server, result, sent.message_id)
-    )
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    order = {"order_type": "number", "user_id": user_id, "server": server, "country": country,
+             "target_username": None, "qty": None}
+    await _finish_purchase(bot, callback, order_pk, order, result, est_price)
 
 
 async def _try_get_code(server: int, result: dict) -> dict:
@@ -3821,8 +4208,8 @@ async def _poll_code(bot, user_id: int, order_pk: int, server: int, result: dict
         await asyncio.sleep(POLL_DELAY_SECONDS)
         try:
             data = await _try_get_code(server, result)
-        except SmmUpperError:
-            continue
+        except _API_ERRORS:
+            continue          # provayder xatosi YOKI tarmoq/timeout: keyingi urinishda qayta so'raymiz (vazifa o'lmasin)
 
         if data.get("success") and data.get("code"):
             code = data.get("code")
@@ -3830,7 +4217,11 @@ async def _poll_code(bot, user_id: int, order_pk: int, server: int, result: dict
             text = f"\u2705 SMS kodi qabul qilindi!\n\U0001F522 Kod: <code>{html.escape(str(code))}</code>"
             if password:
                 text += f"\n\U0001F510 2FA parol: <code>{html.escape(str(password))}</code>"
-            await update_order_status(order_pk, "done", {**result, "code": code, "password": password})
+            # 'done'ga FAQAT hali 'processing' bo'lsagina o'tamiz (atomik): shu orada foydalanuvchi pulni qaytarib
+            # olgan (yoki kodni qo'lda olgan) bo'lsa — kod qaytarilgan buyurtmaga ikkinchi marta berilmaydi.
+            if not await _set_order_status_if(order_pk, "processing", "done",
+                                              {**result, "code": code, "password": password}):
+                return
             await _clear_buttons(bot, user_id, purchase_message_id)
             try:
                 await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=_code_copy_menu(code, password))
@@ -3848,7 +4239,8 @@ async def _poll_code(bot, user_id: int, order_pk: int, server: int, result: dict
         pass
 
 
-async def _check_and_report_number_code(callback: CallbackQuery, order_pk: int, row, clear_markup: bool) -> None:
+async def _check_and_report_number_code(callback: CallbackQuery, order_pk: int, row, clear_markup: bool,
+                                        prefetched: Optional[dict] = None) -> None:
     """"Raqam" turidagi buyurtma uchun SMS kodni SmmUpper'dan so'raydi va
     natijani foydalanuvchiga ko'rsatadi. numcheck: (xariddan keyingi tugma)
     va ordercheck: (buyurtmalar ro'yxatidagi umumiy tugma) — ikkalasi ham
@@ -3858,16 +4250,28 @@ async def _check_and_report_number_code(callback: CallbackQuery, order_pk: int, 
     result = json.loads(row["details"]) if row["details"] else {}
     server = row["server"]
 
-    try:
-        data = await _try_get_code(server, result)
-    except SmmUpperError as e:
-        await callback.answer(f"Xatolik: {e.message}", show_alert=True)
-        return
+    if prefetched is not None:
+        data = prefetched                                   # qaytarishdan oldingi tekshiruv allaqachon so'ragan
+    else:
+        try:
+            data = await _try_get_code(server, result)
+        except SmmUpperError as e:
+            await callback.answer(f"Xatolik: {e.message}", show_alert=True)
+            return
+        except _NET_ERRORS:
+            await callback.answer("Tarmoq xatosi. Birozdan so'ng qayta tekshiring.", show_alert=True)
+            return
 
     if data.get("success") and data.get("code"):
         code = data.get("code")
         password = data.get("password") or ""
-        await update_order_status(order_pk, "done", {**result, "code": code, "password": password})
+        # 'done'ga FAQAT hali 'processing' bo'lsagina o'tamiz (atomik): "Tekshirish" va "Pulni qaytarish" bir vaqtda
+        # bosilsa ham kod va pul IKKALASI birga berilmaydi.
+        if not await _set_order_status_if(order_pk, "processing", "done",
+                                          {**result, "code": code, "password": password}):
+            await callback.answer("Bu buyurtma allaqachon yakunlangan (pul qaytarilgan bo'lishi mumkin).",
+                                  show_alert=True)
+            return
         if clear_markup:
             try:
                 await callback.message.edit_reply_markup(reply_markup=None)
@@ -3917,6 +4321,19 @@ async def refund_number_order(callback: CallbackQuery, bot):
             f"\u23F3 Hali erta \u2014 SMS kelishi mumkin. Yana ~{wait_min} daqiqadan so'ng qaytadan urinib ko'ring.",
             show_alert=True,
         )
+        return
+
+    # Pulni qaytarishdan OLDIN kodni oxirgi marta tekshiramiz: SMS kelib bo'lgan bo'lishi mumkin (kuzatuv oynasi
+    # qisqa, foydalanuvchi "Tekshirish"ni bosmagan bo'lishi mumkin). Kod bor bo'lsa — kod beriladi, pul qaytarilmaydi.
+    # Tekshirib bo'lmasa (provayder/tarmoq xatosi) — avvalgidek qaytariladi.
+    try:
+        details = json.loads(row["details"]) if row["details"] else {}
+        fresh = await _try_get_code(row["server"], details)
+    except (ValueError,) + _API_ERRORS:
+        fresh = None
+    if fresh and fresh.get("success") and fresh.get("code"):
+        await callback.message.answer("\u2139\uFE0F SMS kodi allaqachon kelgan ekan \u2014 pul qaytarilmaydi, kod quyida:")
+        await _check_and_report_number_code(callback, order_pk, row, clear_markup=True, prefetched=fresh)
         return
 
     refund = await refund_order(order_pk, min_age_seconds=refund_wait)
@@ -4096,14 +4513,16 @@ async def confirm_stars(callback: CallbackQuery, state: FSMContext, bot):
     username = data["username"]
     amount = data["amount"]
     est_price = data["price"]
+    user_id = callback.from_user.id
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
-    if not await try_deduct_balance(callback.from_user.id, est_price):
-        balance = await get_balance(callback.from_user.id)
+    # Atomik "tekshir-va-yech" — qo'sh bosish yoki parallel xarid balansni manfiyga tushira olmaydi.
+    if not await try_deduct_balance(user_id, est_price):
+        balance = await get_balance(user_id)
         sent = await callback.message.answer(insufficient_balance(est_price, balance), reply_markup=balance_menu())
         await track_flow_msg(sent)
         await state.clear()
@@ -4112,48 +4531,29 @@ async def confirm_stars(callback: CallbackQuery, state: FSMContext, bot):
 
     await _safe_answer(callback, "Amalga oshirilmoqda...")
 
+    # WRITE-AHEAD (qarang: confirm_number).
+    request_id = new_request_id()
+    order_pk = await _open_purchase_order(callback, state, est_price, "stars", request_id,
+                                          target_username=username, qty=amount)
+    if order_pk is None:
+        return
+    await state.clear()
+
     try:
-        result = await _call_idempotent(client.buy_stars, username, amount)
+        result = await _send_purchase_request("stars", request_id, target_username=username, qty=amount)
     except PurchaseUnknownError as e:
-        await _refund_unknown_purchase(bot, callback, state, est_price, "Stars", e)
+        await _refund_unknown_purchase(bot, callback, state, est_price, "Stars", e, order_pk=order_pk)
         return
     except SmmUpperError as e:
-        await change_balance(callback.from_user.id, est_price)
-        await callback.message.answer(
-            f"\u274C Xatolik: {e.message}\n\U0001F4B0 Pulingiz balansga qaytarildi.",
-            reply_markup=main_menu(),
-        )
-        await state.clear()
+        await _reject_purchase(callback, state, order_pk, e)
+        return
+    except Exception as e:
+        await _park_purchase(bot, callback, state, order_pk, est_price, "Stars", request_id, e)
         return
 
-    charged_price = await final_price(callback.from_user.id, result, est_price, "stars")
-    order_pk = await create_order(
-        user_id=callback.from_user.id,
-        order_type="stars",
-        ref=result.get("order_id"),
-        server=None,
-        price=charged_price,
-        details=result,
-        status="processing",
-        target_username=username,
-        qty=amount,
-    )
-
-    buyer = callback.from_user.full_name
-    if callback.from_user.username:
-        buyer += f" (@{callback.from_user.username})"
-    await notify_channel(bot, channel_stars_notice(buyer, username, amount, charged_price), order_type="stars")
-
-    await callback.message.answer(
-        f"\u2705 Buyurtma qabul qilindi!\n"
-        f"\U0001F464 @{username}\n"
-        f"\u2B50 {amount} Stars\n"
-        f"\U0001F4B5 {fmt_money(charged_price)} so'm\n"
-        f"\U0001F522 Buyurtma raqami: {result.get('order_id')} (#{order_pk})\n\n"
-        f"Holatini «{BTN_ORDERS}» bo'limidan kuzatishingiz mumkin.",
-        reply_markup=main_menu(),
-    )
-    await state.clear()
+    order = {"order_type": "stars", "user_id": user_id, "server": None, "country": None,
+             "target_username": username, "qty": amount}
+    await _finish_purchase(bot, callback, order_pk, order, result, est_price)
 
 
 # ==============================================================
@@ -4274,14 +4674,16 @@ async def confirm_premium(callback: CallbackQuery, state: FSMContext, bot):
     username = data["username"]
     months = data["months"]
     est_price = data["price"]
+    user_id = callback.from_user.id
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
-    if not await try_deduct_balance(callback.from_user.id, est_price):
-        balance = await get_balance(callback.from_user.id)
+    # Atomik "tekshir-va-yech" — qo'sh bosish yoki parallel xarid balansni manfiyga tushira olmaydi.
+    if not await try_deduct_balance(user_id, est_price):
+        balance = await get_balance(user_id)
         sent = await callback.message.answer(insufficient_balance(est_price, balance), reply_markup=balance_menu())
         await track_flow_msg(sent)
         await state.clear()
@@ -4290,48 +4692,29 @@ async def confirm_premium(callback: CallbackQuery, state: FSMContext, bot):
 
     await _safe_answer(callback, "Amalga oshirilmoqda...")
 
+    # WRITE-AHEAD (qarang: confirm_number).
+    request_id = new_request_id()
+    order_pk = await _open_purchase_order(callback, state, est_price, "premium", request_id,
+                                          target_username=username, qty=months)
+    if order_pk is None:
+        return
+    await state.clear()
+
     try:
-        result = await _call_idempotent(client.buy_premium, username, months)
+        result = await _send_purchase_request("premium", request_id, target_username=username, qty=months)
     except PurchaseUnknownError as e:
-        await _refund_unknown_purchase(bot, callback, state, est_price, "Premium", e)
+        await _refund_unknown_purchase(bot, callback, state, est_price, "Premium", e, order_pk=order_pk)
         return
     except SmmUpperError as e:
-        await change_balance(callback.from_user.id, est_price)
-        await callback.message.answer(
-            f"\u274C Xatolik: {e.message}\n\U0001F4B0 Pulingiz balansga qaytarildi.",
-            reply_markup=main_menu(),
-        )
-        await state.clear()
+        await _reject_purchase(callback, state, order_pk, e)
+        return
+    except Exception as e:
+        await _park_purchase(bot, callback, state, order_pk, est_price, "Premium", request_id, e)
         return
 
-    charged_price = await final_price(callback.from_user.id, result, est_price, "premium")
-    order_pk = await create_order(
-        user_id=callback.from_user.id,
-        order_type="premium",
-        ref=result.get("order_id"),
-        server=None,
-        price=charged_price,
-        details=result,
-        status="processing",
-        target_username=username,
-        qty=months,
-    )
-
-    buyer = callback.from_user.full_name
-    if callback.from_user.username:
-        buyer += f" (@{callback.from_user.username})"
-    await notify_channel(bot, channel_premium_notice(buyer, username, months, charged_price), order_type="premium")
-
-    await callback.message.answer(
-        f"\u2705 Buyurtma qabul qilindi!\n"
-        f"\U0001F464 @{username}\n"
-        f"\U0001F48E {months} oy Premium\n"
-        f"\U0001F4B5 {fmt_money(charged_price)} so'm\n"
-        f"\U0001F522 Buyurtma raqami: {result.get('order_id')} (#{order_pk})\n\n"
-        f"Holatini «{BTN_ORDERS}» bo'limidan kuzatishingiz mumkin.",
-        reply_markup=main_menu(),
-    )
-    await state.clear()
+    order = {"order_type": "premium", "user_id": user_id, "server": None, "country": None,
+             "target_username": username, "qty": months}
+    await _finish_purchase(bot, callback, order_pk, order, result, est_price)
 
 
 # ==============================================================
@@ -4917,6 +5300,15 @@ async def uc_sweep_once(bot) -> int:
         handled += 1
         await asyncio.sleep(0.3)
 
+    # Raqam / Stars / Premium: pul yechilgan, lekin provayder javobi yozilmagan buyurtmalar (write-ahead yozuvi)
+    for order_pk in await _list_unsent_purchase_orders(now - WA_RECOVER_AFTER, 20):
+        try:
+            await recover_purchase_order(bot, order_pk)
+        except Exception:
+            logging.exception(f"Buyurtma #{order_pk} ni qayta yuborishda xato")
+        handled += 1
+        await asyncio.sleep(0.3)
+
     # Navbat kursori ID bo'yicha: buyurtmalar tugab ketsa ham hech biri o'tkazib yuborilmaydi va eskilari
     # yangilarini to'smaydi (har buyurtma ko'pi bilan ceil(n / UC_POLL_BATCH) aylanishda tekshiriladi).
     cursor = _uc_sweep_cursor["last_id"]
@@ -5001,7 +5393,7 @@ async def show_my_orders(message: Message, state: FSMContext):
     for row in rows:
         status = row["status"]
         lines.append(
-            f"\n{_STATUS_EMOJI.get(status, '\u2754')} {_TYPE_LABEL.get(row['order_type'], row['order_type'])} "
+            f"\n{_STATUS_EMOJI.get(status, _UNKNOWN_EMOJI)} {_TYPE_LABEL.get(row['order_type'], row['order_type'])} "
             f"— {fmt_money(row['price'])} so'm — #{row['id']} ({status})"
         )
         if status not in FINAL_STATUSES and row["ref"]:
@@ -5056,12 +5448,19 @@ async def check_order(callback: CallbackQuery, bot):
     if str(status).lower() in ("failed", "error"):
         # Bajarilmagan Stars/Premium: hujjatga ko'ra pul SIZNING SmmUpper balansingizga qaytariladi, shuning uchun
         # foydalanuvchi puli ham qaytariladi (atomik, faqat bir marta) — aks holda foydalanuvchi puldan ayrilib qolardi.
-        refund = await refund_order(order_pk)
-        await callback.answer(
-            "\u274C Buyurtma bajarilmadi \u2014 pul balansingizga qaytarildi." if refund else "Holat: refunded",
-            show_alert=True)
+        # any_open: provayder oraliq holati ('pending', 'waiting'...) bazaga yozilgan bo'lsa ham pul qaytadi
+        # (avval faqat 'processing' qaytarilardi — pul qotib qolardi, javob esa "refunded" der edi).
+        refund = await refund_order(order_pk, any_open=True)
+        if refund:
+            text = "\u274C Buyurtma bajarilmadi \u2014 pul balansingizga qaytarildi."
+        else:
+            fresh = await get_order_row(order_pk)          # qaytarilmadi: haqiqiy joriy holatni ko'rsatamiz
+            text = f"Holat: {fresh['status'] if fresh else status}"
+        await callback.answer(text, show_alert=True)
         return
-    await update_order_status(order_pk, status, result)
+    # Provayder holatini FAQAT bazadagi holat biz o'qigan holatda turgan bo'lsa yozamiz (atomik): parallel qaytarish
+    # 'refunded'ni ustidan yozib, keyin ikkinchi marta qaytarishga yo'l ochmasin.
+    await _set_order_status_if(order_pk, row["status"], str(status), result)
     await callback.answer(f"Holat: {status}", show_alert=True)
 
 
@@ -5073,7 +5472,7 @@ def _format_order_detail(row, include_buyer: bool = False) -> str:
     ham (user_id) qo'shadi."""
     status = row["status"]
     lines = [
-        f"{_STATUS_EMOJI.get(status, '\u2754')} {_TYPE_LABEL.get(row['order_type'], row['order_type'])} \u2014 #{row['id']}",
+        f"{_STATUS_EMOJI.get(status, _UNKNOWN_EMOJI)} {_TYPE_LABEL.get(row['order_type'], row['order_type'])} \u2014 #{row['id']}",
     ]
     if include_buyer:
         lines.append(f"\U0001F464 Foydalanuvchi ID: {row['user_id']}")
@@ -5225,6 +5624,20 @@ async def _is_admin(user_id: int) -> bool:
     return user_id in await get_extra_admin_ids()
 
 
+OWNER_ONLY_ALERT = "\U0001F512 Bu amal faqat asosiy admin (.env dagi ADMIN_IDS) uchun."
+
+
+async def _owner_gate(callback: CallbackQuery) -> bool:
+    """Nozik amallar (to'lov kartasi, API kalit, adminlarni boshqarish, balansni qo'lda o'zgartirish) FAQAT asosiy
+    adminlarga (.env ADMIN_IDS) ruxsat etiladi — panel orqali qo'shilgan qo'shimcha adminlarga YOPIQ.
+    Ruxsat bo'lmasa ogohlantirish ko'rsatadi va False qaytaradi."""
+    uid = callback.from_user.id
+    if _is_owner(uid):
+        return True
+    await callback.answer(OWNER_ONLY_ALERT if await _is_admin(uid) else "Ruxsat yo'q.", show_alert=True)
+    return False
+
+
 def _mask_key(key: str) -> str:
     if not key:
         return "\u2014 (o'rnatilmagan)"
@@ -5325,6 +5738,31 @@ async def admin_panel(message: Message, state: FSMContext):
     await _show_panel(message)
 
 
+@router_admin.message(Command("adminlog"))
+async def admin_log_view(message: Message):
+    """Admin amallari jurnali (oxirgi 25 ta): balans o'zgartirish, to'lov tasdiqlash, karta/API kalit/adminlar
+    o'zgarishi. FAQAT asosiy adminlar uchun; qo'shimcha adminlarga umuman javob bermaydi."""
+    if not _is_owner(message.from_user.id):
+        return
+    rows = await get_admin_log(25)
+    if not rows:
+        await message.answer("Jurnal hozircha bo'sh.")
+        return
+    tz = timezone(timedelta(hours=5))           # Toshkent
+    lines = ["\U0001F4DC Admin amallari jurnali (oxirgi 25 ta):"]
+    for r in rows:
+        when = datetime.fromtimestamp(r["created_at"], tz).strftime("%m-%d %H:%M")
+        parts = [f"#{r['id']} {when}", f"admin {r['admin_id']}", str(r["action"])]
+        if r["target_id"] is not None:
+            parts.append(f"user {r['target_id']}")
+        if r["amount"] is not None:
+            parts.append(f"{r['amount']:+,}".replace(",", " "))
+        if r["note"]:
+            parts.append(str(r["note"])[:60])
+        lines.append(" | ".join(parts))
+    await message.answer("\n".join(lines))
+
+
 @router_admin.callback_query(F.data == "adm:refresh")
 async def admin_refresh(callback: CallbackQuery, state: FSMContext):
     if not await _is_admin(callback.from_user.id):
@@ -5386,8 +5824,7 @@ async def admin_find_receive(message: Message, state: FSMContext, bot):
 
 @router_admin.callback_query(F.data == "adm:balance")
 async def admin_balance_start(callback: CallbackQuery, state: FSMContext):
-    if not await _is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
+    if not await _owner_gate(callback):
         return
     await _ask(callback, state, AdminPanel.balance_id, ASK_BALANCE_ID, users_cancel_menu())
 
@@ -5396,8 +5833,7 @@ async def admin_balance_start(callback: CallbackQuery, state: FSMContext):
 async def admin_quick_balance(callback: CallbackQuery, state: FSMContext):
     """Profil kartasidan to'g'ridan-to'g'ri — ID qayta kiritilmaydi,
     darhol summa so'raladi."""
-    if not await _is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
+    if not await _owner_gate(callback):
         return
     target_id = int(callback.data.split(":")[2])
     await state.update_data(target_id=target_id)
@@ -5436,7 +5872,7 @@ async def admin_quick_unban(callback: CallbackQuery):
 
 @router_admin.message(AdminPanel.balance_id, is_free_text)
 async def admin_balance_id_receive(message: Message, state: FSMContext, bot):
-    if not await _is_admin(message.from_user.id):
+    if not _is_owner(message.from_user.id):
         return
     text = message.text.strip()
     if not text.isdigit():
@@ -5460,7 +5896,7 @@ async def admin_balance_id_receive(message: Message, state: FSMContext, bot):
 
 @router_admin.message(AdminPanel.balance_amount, is_free_text)
 async def admin_balance_amount_receive(message: Message, state: FSMContext, bot):
-    if not await _is_admin(message.from_user.id):
+    if not _is_owner(message.from_user.id):
         return
     text = message.text.strip()
     if not text.lstrip("-").isdigit():
@@ -5473,6 +5909,8 @@ async def admin_balance_amount_receive(message: Message, state: FSMContext, bot)
 
     await change_balance(user_id, amount)
     new_balance = await get_balance(user_id)
+    await log_admin_action(message.from_user.id, "balance_adjust", target_id=user_id, amount=amount,
+                           note=f"yangi balans: {new_balance}")
     await _panel_edit(
         bot, state, message,
         f"\u2705 Bajarildi. {user_id} balansi endi: {fmt_money(new_balance)} so'm",
@@ -5628,8 +6066,7 @@ async def _run_broadcast(bot, chat_id: int, message_id: Optional[int], text: str
 
 @router_admin.callback_query(F.data == "adm:apikey")
 async def admin_apikey_start(callback: CallbackQuery, state: FSMContext):
-    if not await _is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
+    if not await _owner_gate(callback):
         return
     current_key = await get_setting(SETTINGS_KEY_API_KEY, default=SMMUPPER_API_KEY)
     await _ask(
@@ -5641,7 +6078,7 @@ async def admin_apikey_start(callback: CallbackQuery, state: FSMContext):
 
 @router_admin.message(AdminPanel.api_key, is_free_text)
 async def admin_apikey_receive(message: Message, state: FSMContext, bot):
-    if not await _is_admin(message.from_user.id):
+    if not _is_owner(message.from_user.id):
         return
     new_key = message.text.strip()
 
@@ -5651,15 +6088,28 @@ async def admin_apikey_receive(message: Message, state: FSMContext, bot):
                            settings_cancel_menu())
         return
 
-    await set_setting(SETTINGS_KEY_API_KEY, new_key)
-
-    # Yangi kalit ishlayotganini darhol tekshirib ko'ramiz
+    # Kalitni SAQLASHDAN OLDIN tekshiramiz: noto'g'ri kalit saqlanib qolsa, barcha xaridlar to'xtab qolardi.
+    # Rad etilsa yoki tekshirib bo'lmasa — ESKI kalit o'zgarishsiz qoladi va admin qayta kiritishi mumkin.
     try:
-        data = await client.get_balance()
-        balance = data["result"]["balance"]
-        check_line = f"\u2705 Kalit tekshirildi \u2014 SmmUpper balansi: {fmt_money(balance)} so'm"
-    except (SmmUpperError, KeyError) as e:
-        check_line = f"\u26A0\uFE0F Kalit saqlandi, lekin tekshirishda xatolik: {e}"
+        data = await client.get_balance(api_key=new_key)
+    except SmmUpperError as e:
+        await _panel_edit(bot, state, message,
+                           f"\u274C SmmUpper kalitni qabul qilmadi: {e.message}\nEski kalit o'zgarmadi. Qaytadan kiriting.",
+                           settings_cancel_menu())
+        return
+    except _NET_ERRORS:
+        await _panel_edit(bot, state, message,
+                           "\u26A0\uFE0F SmmUpper bilan bog'lanib bo'lmadi \u2014 kalit tekshirilmadi va saqlanmadi.\n"
+                           "Eski kalit o'zgarmadi. Birozdan so'ng qayta urinib ko'ring.",
+                           settings_cancel_menu())
+        return
+    try:
+        check_line = f"\u2705 Kalit tekshirildi \u2014 SmmUpper balansi: {fmt_money(data['result']['balance'])} so'm"
+    except (KeyError, TypeError):
+        check_line = "\u2705 Kalit qabul qilindi (balans ma'lumoti olinmadi)"
+
+    await set_setting(SETTINGS_KEY_API_KEY, new_key)
+    await log_admin_action(message.from_user.id, "apikey_change", note=_mask_key(new_key))
 
     await _panel_edit(bot, state, message,
                        api_key_saved(_mask_key(new_key)) + "\n\n" + check_line,
@@ -5773,8 +6223,7 @@ async def admin_channel_receive(message: Message, state: FSMContext, bot):
 
 @router_admin.callback_query(F.data == "adm:card")
 async def admin_card_start(callback: CallbackQuery, state: FSMContext):
-    if not await _is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
+    if not await _owner_gate(callback):
         return
     card_number, card_holder = await get_card_info()
     await _ask(
@@ -5786,7 +6235,7 @@ async def admin_card_start(callback: CallbackQuery, state: FSMContext):
 
 @router_admin.message(AdminPanel.card_number, is_free_text)
 async def admin_card_number_receive(message: Message, state: FSMContext, bot):
-    if not await _is_admin(message.from_user.id):
+    if not _is_owner(message.from_user.id):
         return
     card_number = message.text.strip()
     if not card_number:
@@ -5799,7 +6248,7 @@ async def admin_card_number_receive(message: Message, state: FSMContext, bot):
 
 @router_admin.message(AdminPanel.card_holder, is_free_text)
 async def admin_card_holder_receive(message: Message, state: FSMContext, bot):
-    if not await _is_admin(message.from_user.id):
+    if not _is_owner(message.from_user.id):
         return
     card_holder = message.text.strip()
     data = await state.get_data()
@@ -5807,6 +6256,8 @@ async def admin_card_holder_receive(message: Message, state: FSMContext, bot):
 
     await set_setting(SETTINGS_KEY_CARD_NUMBER, card_number)
     await set_setting(SETTINGS_KEY_CARD_HOLDER, card_holder)
+    _digits = re.sub(r"\D", "", card_number)
+    await log_admin_action(message.from_user.id, "card_change", note=f"karta ...{_digits[-4:]} ({card_holder})")
     await _panel_edit(bot, state, message, card_saved(card_number, card_holder), settings_cancel_menu())
     await state.clear()
 
@@ -5925,15 +6376,14 @@ async def admin_admins_list(callback: CallbackQuery, state: FSMContext):
 
 @router_admin.callback_query(F.data == "adm:adm:add")
 async def admin_add_admin_start(callback: CallbackQuery, state: FSMContext):
-    if not await _is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
+    if not await _owner_gate(callback):
         return
     await _ask(callback, state, AdminPanel.add_admin_id, ASK_ADD_ADMIN_ID, admins_cancel_menu())
 
 
 @router_admin.message(AdminPanel.add_admin_id, is_free_text)
 async def admin_add_admin_receive(message: Message, state: FSMContext, bot):
-    if not await _is_admin(message.from_user.id):
+    if not _is_owner(message.from_user.id):
         return
     text = message.text.strip()
     if not text.isdigit():
@@ -5948,6 +6398,8 @@ async def admin_add_admin_receive(message: Message, state: FSMContext, bot):
 
     added = await add_extra_admin(user_id)
     ids = await get_extra_admin_ids()
+    if added:
+        await log_admin_action(message.from_user.id, "admin_add", target_id=user_id)
     if not added:
         await _panel_edit(bot, state, message, ALREADY_ADMIN, admins_cancel_menu())
         await state.clear()
@@ -5958,8 +6410,7 @@ async def admin_add_admin_receive(message: Message, state: FSMContext, bot):
 
 @router_admin.callback_query(F.data.startswith("adm:adm:del:"))
 async def admin_remove_admin(callback: CallbackQuery, state: FSMContext):
-    if not await _is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
+    if not await _owner_gate(callback):
         return
     try:
         user_id = int(callback.data.split(":")[3])
@@ -5967,6 +6418,7 @@ async def admin_remove_admin(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
     await remove_extra_admin(user_id)
+    await log_admin_action(callback.from_user.id, "admin_remove", target_id=user_id)
     ids = await get_extra_admin_ids()
     await callback.message.edit_text(_admins_text(ids), reply_markup=admins_admin_menu(ids))
     await callback.answer("O'chirildi.")
@@ -6267,6 +6719,9 @@ async def topup_edit_amount_receive(message: Message, state: FSMContext, bot):
         )
         return
 
+    await log_admin_action(message.from_user.id, "topup_amount_edit", target_id=topup["user_id"],
+                           amount=new_amount, note=f"topup #{topup_id}: {old_amount} -> {new_amount}")
+
     # Bildirishnoma xabaridagi "Summa:" qatorini yangi summaga almashtiramiz,
     # avvalgi (foydalanuvchi ko'rsatgan) summani ham qavs ichida saqlab
     # qo'yamiz — shaffoflik/audit uchun.
@@ -6319,45 +6774,36 @@ async def approve_topup(callback: CallbackQuery, bot):
         await callback.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
         return
 
-    # Muhim: yuqoridagi tekshiruv (status != "pending") YOLG'IZ O'ZI yetarli
-    # emas — ikki admin xuddi shu so'rovni deyarli bir vaqtda bossa, ikkalasi
-    # ham shu tekshiruvdan "pending" holida o'tib ketishi mumkin edi. Shuning
-    # uchun status yangilashning O'ZI ham shartli va atomik: faqat topup HOZIR
-    # ham "pending" bo'lsagina "approved"ga o'tadi. Kimdir ulgurib bo'lgan
-    # bo'lsa (masalan boshqa admin), bu False qaytaradi va balans EKKI MARTA
-    # qo'shilmaydi.
-    if not await set_topup_status(topup_id, "approved", expected_current="pending"):
+    # Muhim: yuqoridagi tekshiruv (status != "pending") YOLG'IZ O'ZI yetarli emas — ikki admin xuddi shu so'rovni
+    # deyarli bir vaqtda bossa, ikkalasi ham shu tekshiruvdan "pending" holida o'tib ketishi mumkin. Shuning uchun
+    # tasdiqlash BITTA tranzaksiyada bajariladi: 'pending' -> 'approved' + balans + referal keshbek. Kimdir ulgurib
+    # bo'lgan bo'lsa None qaytadi va balans EKKI MARTA qo'shilmaydi; orada jarayon to'xtasa — hammasi bekor bo'ladi
+    # (so'rov 'pending' qoladi, admin qayta bosadi): "tasdiqlandi, lekin balans qo'shilmadi" holati bo'lmaydi.
+    done = await approve_topup_atomic(topup_id)
+    if not done:
         await callback.answer("Bu so'rovni aynan shu daqiqada boshqa admin ko'rib chiqdi.", show_alert=True)
         return
 
-    await change_balance(topup["user_id"], topup["amount"])
-    new_balance = await get_balance(topup["user_id"])
+    amount = done["amount"]                       # tranzaksiya ichida o'qilgan (tahrirlangan bo'lsa — yangi) summa
+    new_balance = await get_balance(done["user_id"])
+    await log_admin_action(callback.from_user.id, "topup_approve", target_id=done["user_id"],
+                           amount=amount, note=f"topup #{topup_id}")
 
     try:
-        await bot.send_message(
-            topup["user_id"],
-            topup_approved_text(topup["amount"], new_balance),
-        )
+        await bot.send_message(done["user_id"], topup_approved_text(amount, new_balance))
     except Exception:
         pass
 
-    # Referal keshbek: to'ldirgan foydalanuvchini kimdir taklif qilgan bo'lsa,
-    # to'ldirilgan summaning REFERRAL_CASHBACK_PERCENT foizi o'sha kishiga
-    # avtomatik qo'shiladi.
-    referrer_id = await get_referrer(topup["user_id"])
-    if referrer_id:
-        cashback = topup["amount"] * REFERRAL_CASHBACK_PERCENT // 100
-        if cashback > 0:
-            await change_balance(referrer_id, cashback)
-            await add_referral_earning(referrer_id, cashback)
-            try:
-                await bot.send_message(
-                    referrer_id,
-                    f"\U0001F381 Taklif qilgan do'stingiz balansini to'ldirdi!\n"
-                    f"Sizga {fmt_money(cashback)} so'm keshbek qo'shildi.",
-                )
-            except Exception:
-                pass
+    # Referal keshbek balansga shu tranzaksiya ichida qo'shilgan — taklif qilgan kishiga faqat xabar yuboramiz.
+    if done["referrer"]:
+        try:
+            await bot.send_message(
+                done["referrer"],
+                f"\U0001F381 Taklif qilgan do'stingiz balansini to'ldirdi!\n"
+                f"Sizga {fmt_money(done['cashback'])} so'm keshbek qo'shildi.",
+            )
+        except Exception:
+            pass
 
     await _finalize_topup_message(callback, "\n\n\u2705 TASDIQLANDI")
     await callback.answer("Tasdiqlandi \u2705")
@@ -7778,6 +8224,8 @@ class ThrottleMiddleware(BaseMiddleware):
                     await event.answer()
                 return None
             self._last_seen[user.id] = now
+            if len(self._last_seen) > 20000:          # xotira cheksiz o'smasin: eskirgan yozuvlarni tozalaymiz
+                self._last_seen = {uid: t for uid, t in self._last_seen.items() if now - t < 60}
         return await handler(event, data)
 
 
@@ -7831,6 +8279,7 @@ async def global_error_handler(event: ErrorEvent) -> bool:
 
 async def main():
     logging.basicConfig(level=logging.INFO)
+    _probe_button_style_support()
 
     if not BOT_TOKEN:
         raise RuntimeError(
@@ -7854,12 +8303,14 @@ async def main():
     ban_middleware = BanMiddleware()
     force_sub_middleware = ForceSubMiddleware()
     throttle_middleware = ThrottleMiddleware()
+    # Tartib muhim: THROTTLE birinchi — flood xotirada (bazasiz) to'xtatiladi; ban va majburiy obuna tekshiruvlari
+    # (har biri bazaga murojaat qiladi) faqat o'tgan so'rovlar uchun ishlaydi.
+    dp.message.outer_middleware(throttle_middleware)
+    dp.callback_query.outer_middleware(throttle_middleware)
     dp.message.outer_middleware(ban_middleware)
     dp.callback_query.outer_middleware(ban_middleware)
     dp.message.outer_middleware(force_sub_middleware)
     dp.callback_query.outer_middleware(force_sub_middleware)
-    dp.message.outer_middleware(throttle_middleware)
-    dp.callback_query.outer_middleware(throttle_middleware)
 
     # Diqqat: router_common (bosh menyu tugmalari uchun umumiy filtr) va
     # router_admin birinchi bo'lib qo'shiladi, keyin qolgan bo'limlar.
@@ -7918,6 +8369,9 @@ async def main():
         if not polling_task.done():
             logging.info("To'xtatish signali qabul qilindi — polling yakunlanmoqda...")
             await dp.stop_polling()
+            # Jarayondagi xaridlar tugashiga imkon beramiz — aks holda cancel() ularni pul yechilgandan keyin uzib
+            # qo'yishi mumkin. Render SIGTERMdan keyin ~30 soniya beradi, shuning uchun ko'pi bilan 25 soniya kutamiz.
+            await _wait_purchases_finish(25)
             polling_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await polling_task
