@@ -158,6 +158,15 @@ label{display:block;margin:14px 0 8px;font-weight:700;font-size:13px;color:var(-
 .drop svg{width:26px;flex:none;color:var(--link)}.drop small{display:block;color:var(--mut);font-weight:500;font-size:12px}
 .th2{width:64px;height:64px;border-radius:12px;object-fit:cover;flex:none}
 
+.sh.buy{display:flex;flex-direction:column;overflow:hidden;padding-bottom:0}
+.sh.buy .grab,.sh.buy .hd{flex:none}
+.sh.buy .sbody{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;margin:0 -18px;padding:0 18px 10px}
+.sh.buy .sfoot{flex:none;margin:0 -18px;padding:4px 18px calc(14px + env(safe-area-inset-bottom,0px));background:var(--panel);border-top:1px solid var(--line)}
+.sh.buy .sfoot .sum{margin-top:6px;padding:8px 0}
+.av{position:relative;overflow:hidden}.av img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.av.big{width:84px;height:84px;border-radius:28px;font-size:38px;margin:0 auto 10px;cursor:default}
+.pf{text-align:center;margin:6px 0 18px}.pf b{display:block;font-size:22px;font-weight:800;overflow-wrap:anywhere}.pf small{color:var(--link);font-size:15px;font-weight:600}
+.kv b{text-align:right;overflow-wrap:anywhere;margin-left:12px}
 /* ============ MUVAFFAQIYAT OYNASI ============ */
 .win{position:fixed;inset:0;z-index:20;background:var(--bg);display:none;place-items:center;padding:env(safe-area-inset-top,0px) 20px env(safe-area-inset-bottom,0px);overflow:auto}
 .win.on{display:grid}
@@ -379,13 +388,13 @@ const DEMO={bal:125000,pend:0,pay:null,num:{},ords:[{t:"stars",w:"500 Stars",d:"
 const DP={star:215,prem:{3:179000,6:239000,12:429000},uc:[[60,12000,1],[325,62000,2],[660,122000,3],[1800,305000,4]],
 cty:[["🇰🇬","Qirg'iziston",9500,"KG"],["🇬🇪","Gruziya",11500,"GE"],["🇦🇿","Ozarbayjon",8500,"AZ"],["🇰🇿","Qozog'iston",10000,"KZ"]]};
 async function demoApi(path,o){await new Promise(r=>setTimeout(r,200));const now=Math.floor(Date.now()/1000),b=o&&o.body;
-if(path.indexOf("/api/me")==0)return{ok:true,referral:{link:"https://t.me/demo_bot?start=ref0",invited:3,earned:12500,percent:1},user:{id:0,name:nm},balance:DEMO.bal,orders:DEMO.ords,orders_total:DEMO.ords.length,pending_topups:DEMO.pend,min_topup:5000,max_topup:100000000,autopay:{ready:true,ttl_min:20},support:{url:""},card:{number:"8600 0000 0000 0000",holder:"F.I.SH."},open_payment:null,server_time:now};
+if(path.indexOf("/api/me")==0)return{ok:true,referral:{link:"https://t.me/demo_bot?start=ref0",invited:3,earned:12500,percent:1},user:{id:0,name:nm,full_name:nm,username:"demo_user",phone:"+998901234567",joined:"01.09.2026",orders:4,spent:440500},balance:DEMO.bal,orders:DEMO.ords,orders_total:DEMO.ords.length,pending_topups:DEMO.pend,min_topup:5000,max_topup:100000000,autopay:{ready:true,ttl_min:20},support:{url:""},card:{number:"8600 0000 0000 0000",holder:"F.I.SH."},open_payment:null,server_time:now};
 if(path=="/api/topup/auto"){const x=b.amount+13;DEMO.pay={amount:x,t0:now,done:false};return{ok:true,payment:{id:1,amount:x,base:b.amount,extra:13,card_number:"8600 0000 0000 0000",card_raw:"8600000000000000",card_holder:"F.I.SH.",expires_at:now+1200,ttl_min:20,server_time:now,grace:120}}}
 if(path.indexOf("/api/topup/auto/status")==0){const p=DEMO.pay,paid=!!p&&now-p.t0>=6;if(paid&&!p.done){p.done=true;DEMO.bal+=p.amount}return{ok:true,id:1,status:paid?"paid":"pending",amount:p?p.amount:0,expires_at:p?p.t0+1200:0,server_time:now,grace:120,balance:DEMO.bal}}
 if(path=="/api/topup/auto/cancel"){DEMO.pay=null;return{ok:true,cancelled:true,status:"cancelled"}}
 if(path=="/api/topup/manual"){DEMO.pend++;return{ok:true,topup_id:1,pending_topups:DEMO.pend}}
 if(path.indexOf("/api/prices")==0){const k=path.split("k=")[1]||"";
-if(k=="number")return{ok:true,countries:DP.cty.map(c=>({f:c[0],n:c[1],p:c[2],c:c[3]}))};
+if(k=="number"||k=="ready")return{ok:true,countries:DP.cty.map(c=>({f:c[0],n:c[1],p:c[2],c:c[3]}))};
 if(k=="uc")return{ok:true,uc:DP.uc.map(x=>({uc:x[0],p:x[1],id:x[2]}))};
 return{ok:true,star:DP.star,premium:DP.prem,min_stars:50}}
 if(path=="/api/buy"){const k=b.kind,price=b.price,id=Date.now()%1e6;if(price>DEMO.bal)throw{code:"balance",message:"Balansingiz yetarli emas.",data:{}};
@@ -393,6 +402,7 @@ DEMO.bal-=price;const fast=k=="stars"||k=="premium",num=k=="number"?"+996 "+(500
 w=k=="stars"?fmt(b.amount)+" Stars":k=="premium"?"Premium, "+b.amount+" oy":k=="uc"?fmt(DP.uc.find(x=>x[2]==b.amount)[0])+" UC":"Raqam";
 DEMO.ords.unshift({t:k=="number"?"raqam":k,w,d:"Hozir",p:price,s:fast?"ok":"wait",id});if(num)DEMO.num[id]=now;
 return{ok:true,status:fast?"ok":"wait",order_id:id,price,balance:DEMO.bal,number:num}}
+if(path=="/api/order/check")return{ok:true,status:"wait",balance:DEMO.bal};
 if(path=="/api/number/check"){const o=DEMO.ords.find(x=>x.id==b.id);if(o&&o.s=="ok"||now-(DEMO.num[b.id]||now)>=4){if(o)o.s="ok";return{ok:true,status:"done",code:"48217",password:""}}return{ok:true,status:"wait"}}
 if(path=="/api/number/refund"){const o=DEMO.ords.find(x=>x.id==b.id);if(o)o.s="ref";DEMO.bal+=o?o.p:0;return{ok:true,status:"refunded",amount:o?o.p:0,balance:DEMO.bal}}
 throw{code:"demo",message:"Demo rejim"}}
@@ -422,7 +432,10 @@ const fxBtn=()=>`<button class="fxb" type="button" aria-label="Animatsiyalar" ar
 const setHTML=()=>`<h1 class="pg" style="margin-top:18px">Sozlamalar</h1><section class="pan"><div class="set t-premium"><span class="ico">${IC.fx}</span><div><b>Animatsiyalar</b><small>Telefon sekin ishlasa yoki qotsa, o'chirib qo'ying</small></div><button class="sw fxs" type="button" role="switch" aria-checked="${FX.on}" aria-label="Animatsiyalar"><i></i></button></div></section>`;
 const WAL='<svg class="wal" viewBox="0 0 150 130" aria-hidden="true"><defs><linearGradient id="wg1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#7A97FF"/><stop offset="1" stop-color="#7A3CF0"/></linearGradient><linearGradient id="wg2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#FFE27A"/><stop offset="1" stop-color="#F2A100"/></linearGradient></defs><ellipse cx="76" cy="120" rx="50" ry="7" fill="#000" opacity=".25"/><circle cx="62" cy="40" r="17" fill="url(#wg2)"/><circle cx="88" cy="32" r="15" fill="url(#wg2)"/><rect x="20" y="46" width="94" height="70" rx="17" fill="url(#wg1)"/><rect x="86" y="68" width="48" height="30" rx="13" fill="#5B34D6"/><circle cx="104" cy="83" r="5" fill="#F08CFF"/></svg>';
 let uid="—",tab="home",first=true;
-const ini=()=>esc([...nm][0].toUpperCase());
+const ini=()=>esc([...(nm||"?")][0].toUpperCase());
+const avH=c=>{const p=(ME&&ME.user&&ME.user.photo)||(tg&&tg.initDataUnsafe&&tg.initDataUnsafe.user&&tg.initDataUnsafe.user.photo_url)||"";return`<div class="av${c?" "+c:""}">${ini()}${/^https:\/\//.test(p)?`<img alt="" referrerpolicy="no-referrer" src="${esc(p)}" onerror="this.remove()">`:""}</div>`};
+const prof=()=>{const U=(ME&&ME.user)||{},r=(l,v)=>`<div class="kv"><span>${l}</span><b>${esc(v||"—")}</b></div>`;
+return`<h1 class="pg" style="margin-top:18px">Ma'lumotlar</h1><section class="pan">${r("Ism",U.full_name||nm)}${r("Username",U.username?"@"+U.username:"")}${r("Telefon raqami",U.phone)}${r("ID",String(U.id||uid))}${r("Jami harakat",(U.orders||0)+" ta buyurtma · "+fmt(U.spent||0)+" so'm")}${r("Ro'yxatdan o'tgan sana",U.joined)}</section>`};
 async function load(refresh){const n=++LS,m=await call("/api/me"+(refresh?"?refresh=1":""));if(n!==LS)return null;   /* orada yangiroq so'rov/yangilanish bo'ldi — bu javob eskirgan */
 if(m.open_payment)m.open_payment._t0=Date.now();
 ME=m;nm=m.user.name||nm;uid=m.user.id||uid;bal=m.balance;ords=m.orders||[];loadedAt=Date.now();return m}
@@ -435,12 +448,12 @@ renderOrd()}
 async function refresh(){if(Date.now()-loadedAt<1500)return;
 try{const old=bal;if(!await load())return;paint(old);if(bal>old&&!TP.run)toast("Balans +"+fmt(bal-old)+" so'm")}
 catch(e){gateErr(e)}}
-const hdr=()=>`<div class="top"><div class="av">${ini()}</div><div class="who"><b>${esc(nm)}</b><small>Xush kelibsiz! 👋</small></div>${fxBtn()}</div>`;
+const hdr=()=>`<div class="top">${avH()}<div class="who"><b>${esc(nm)}</b><small>Xush kelibsiz! 👋</small></div>${fxBtn()}</div>`;
 const V={
 home:()=>hdr()+`<section class="bal">${WAL}<div class="bl"><span class="wi">${IC.topup}</span>Balans</div><div class="amt"><span id="bal">0</span> <em>so'm</em></div>${actHTML()}<button class="btn" id="tu"><i class="pl">${IC.plus}</i>To'ldirish${IC.chev}</button></section><div class="grid">${Object.keys(SV).map((k,i)=>`<button class="tile deal t-${k}" style="--i:${i}" data-k="${k}"><div class="th"><div class="ico">${IC[k]}</div><span class="cv">${IC.chev}</span></div><h3>${SV[k].n}</h3><p>${SV[k].s}</p></button>`).join("")}</div><section class="pan"><div class="ph"><i class="ci">${IC.clock}</i><b>So'nggi buyurtmalar</b><button class="all" id="all">Barchasi${IC.chev}</button></div><div id="ords"></div></section>`,
 help:()=>`<h1 class="pg">Qo'llab-quvvatlash</h1><button class="btn" id="adm" style="width:100%;justify-content:center;margin:0 0 16px;padding:14px 18px">Admin bilan bog'lanish</button><section class="pan faq"><details open><summary>Balansni qanday to'ldiraman?</summary><p>«To'ldirish» tugmasini bosing, summani kiriting va ko'rsatilgan kartaga AYNAN shu summani o'tkazing. To'lov avtomatik aniqlanadi va balans o'zi to'ldiriladi. Avto-to'lov ishlamasa, to'lov chekining rasmini yuboring — admin tasdiqlagach balans to'ldiriladi.</p></details><details><summary>Xizmatni qanday sotib olaman?</summary><p>Bosh sahifadan kerakli xizmatni (Raqam, Stars, Premium, UC) tanlang va ko'rsatmalarga amal qiling. Buyurtma holatini «Buyurtmalar» bo'limidan kuzatasiz.</p></details><details><summary>Raqamga SMS kod kelmasa?</summary><p>Biroz kuting va «Buyurtmalar» bo'limida raqam buyurtmasini ochib, «Kodni tekshirish» tugmasini bosing. Kod baribir kelmasa, kutish vaqti tugagach shu yerdagi «Pulni qaytarish» tugmasi orqali pulingizni qaytarib olasiz.</p></details><details><summary>Pul qachon qaytariladi?</summary><p>Buyurtma xatolik bilan tugasa, pul balansingizga qaytariladi. Stars, Premium va UC buyurtmasi uzoq «Jarayonda» tursa, buyurtmani ochib «Holatini tekshirish» ni bosing — bot holatni tekshiradi. Boshqa muammo bo'lsa, botga yozing va buyurtma raqamini ko'rsating.</p></details><details><summary>Keshbek qanday olinadi?</summary><p>«Profil» bo'limidagi havolani do'stlaringizga yuboring. Ular balansini to'ldirgan har safar sizga keshbek avtomatik qo'shiladi.</p></details></section>`,
 orders:()=>`<h1 class="pg">Buyurtmalar</h1><section class="pan"><div id="ords"></div></section>`,
-me:()=>`<div class="top"><div class="av">${ini()}</div><div class="who"><b>${esc(nm)}</b><small>ID: ${esc(uid)}</small></div>${fxBtn()}</div><section class="pan"><div class="kv"><span>Balans</span><b>${fmt(bal)} so'm</b></div><div class="kv"><span>Buyurtmalar</span><b>${ME&&ME.orders_total!=null?ME.orders_total:ords.length} ta</b></div></section>${setHTML()}${spend()}${refHTML()}`
+me:()=>`<div class="pf">${avH("big")}<b>${esc(nm)}</b><small>${ME&&ME.user&&ME.user.username?"@"+esc(ME.user.username):"Username yo'q"}</small></div><section class="pan"><div class="kv"><span>Balans</span><b>${fmt(bal)} so'm</b></div><div class="kv"><span>Buyurtmalar</span><b>${ME&&ME.orders_total!=null?ME.orders_total:ords.length} ta</b></div></section>${prof()}${setHTML()}${spend()}${refHTML()}`
 };
 const refHTML=()=>{const r=ME&&ME.referral;return r?`<h1 class="pg" style="margin-top:18px">Do'stlarni taklif qiling</h1>${ring(r)}<section class="pan"><div class="kv"><span>Taklif qilinganlar</span><b>${r.invited} ta</b></div><div class="kv"><span>Keshbek (${r.percent}%)</span><b>${fmt(r.earned)} so'm</b></div></section><p class="hint">Do'stingiz balansini to'ldirsa, siz ${r.percent}% keshbek olasiz.</p><div style="display:flex;gap:10px;justify-content:center"><button class="btn" id="rc">Havolani nusxalash</button><button class="btn" id="rs">Ulashish</button></div>`:""};
 const ring=r=>{const n=r.invited||0,nx=[5,10,25,50,100].find(x=>x>n)||n||1,o=(213.6*(1-Math.min(1,n/nx))).toFixed(1),l=nx-n;
@@ -450,8 +463,8 @@ return k.length?`<h1 class="pg" style="margin-top:18px">Xarajatlar</h1><section 
 function ordSheet(o){hap();const s=$("#sh"),w=o.s=="wait",c=o.s=="bad"?" bad":o.s=="ref"?" ref":"",n=w?2:3;
 s.className="sh t-"+(SV[o.t]?o.t:"topup");
 const stp=["Yaratildi","Jarayonda",o.s=="bad"?"Bajarilmadi":o.s=="ref"?"Qaytarildi":"Bajarildi"];
-s.innerHTML=`<div class="grab"></div><div class="hd"><div class="ico">${IC[o.t]||IC.topup}</div><h2>${esc(o.w)}</h2></div><section class="pan" style="margin-top:12px"><div class="kv"><span>Narxi</span><b>${fmt(o.p)} so'm</b></div><div class="kv"><span>Sana</span><b>${esc(o.d)}</b></div></section><div class="tl">${stp.map((x,i)=>`<div class="ts${i<n?" d":""}${w&&i==1?" a":""}${i==2?c:""}" style="--k:${i}"><i></i>${x}</div>`).join("")}</div>${w&&o.t=="raqam"&&o.id?'<button class="btn2" id="nk">Kodni tekshirish</button>':""}${w?(o.t=="raqam"&&o.id?'<button class="btn2 dng" id="rf">Pulni qaytarish</button>':'<button class="btn2 two" id="rf">Holatini tekshirish<small>Botda bajariladi</small></button>'):""}<button class="btn2 ghost" id="oc">Yopish</button>`;
-$("#oc").onclick=()=>show(false);const rf=$("#rf"),nk=$("#nk"),nr=o.t=="raqam"&&o.id;if(nk)nk.onclick=()=>numAct("check",o,1);if(rf)rf.onclick=nr?()=>numAct("refund",o,1):handoff;show(true)}
+s.innerHTML=`<div class="grab"></div><div class="hd"><div class="ico">${IC[o.t]||IC.topup}</div><h2>${esc(o.w)}</h2></div><section class="pan" style="margin-top:12px"><div class="kv"><span>Narxi</span><b>${fmt(o.p)} so'm</b></div><div class="kv"><span>Sana</span><b>${esc(o.d)}</b></div></section><div class="tl">${stp.map((x,i)=>`<div class="ts${i<n?" d":""}${w&&i==1?" a":""}${i==2?c:""}" style="--k:${i}"><i></i>${x}</div>`).join("")}</div>${w&&o.t=="raqam"&&o.id?'<button class="btn2" id="nk">Kodni tekshirish</button>':""}${w&&o.t=="raqam"&&o.id?'<button class="btn2 dng" id="rf">Pulni qaytarish</button>':w&&o.id&&["stars","premium","uc"].indexOf(o.t)>=0?'<button class="btn2" id="rf">Holatini tekshirish</button>':""}<button class="btn2 ghost" id="oc">Yopish</button>`;
+$("#oc").onclick=()=>show(false);const rf=$("#rf"),nk=$("#nk"),nr=o.t=="raqam"&&o.id;if(nk)nk.onclick=()=>numAct("check",o,1);if(rf)rf.onclick=nr?()=>numAct("refund",o,1):()=>ordCheck(o);show(true)}
 document.addEventListener("keydown",e=>{if(e.key!="Enter"&&e.key!=" ")return;const r=e.target.closest&&e.target.closest(".ord");if(r&&r.dataset.i!=null&&ords[+r.dataset.i]){e.preventDefault();ordSheet(ords[+r.dataset.i])}});
 document.addEventListener("click",e=>{const r=e.target.closest&&e.target.closest(".ord");if(r&&r.dataset.i!=null&&ords[+r.dataset.i])ordSheet(ords[+r.dataset.i])});
 /* pastga tortib yangilash */
@@ -482,8 +495,13 @@ document.querySelectorAll(".tile").forEach(b=>b.onclick=()=>{hap();openSheet(b.d
 $("#tu").onclick=()=>topup();$("#all").onclick=()=>go("orders");
 $(".av").onclick=()=>go("me");$(".bal").onclick=e=>{if(e.target.closest("button"))return;hap();countTo($("#bal"),0,bal,700);const w=$(".wal");if(w&&FX.on)w.animate([{transform:"none"},{transform:"translateY(-16px) rotate(-12deg) scale(1.1)"},{transform:"translateY(0) rotate(5deg)"},{transform:"none"}],{duration:700,easing:"cubic-bezier(.2,1.2,.4,1)"})}}
 window.scrollTo(0,0)}
-/* Stars/Premium/UC buyurtmasi holatini tekshirish hozircha botda ("Buyurtmalarim" → «Holatini tekshirish») — foydalanuvchi botga qaytariladi. */
-function handoff(){hap();toast("Buyurtma holatini botda tekshiring");if(tg)setTimeout(()=>tg.close(),1000)}
+/* Stars/Premium/UC buyurtmasi holatini tekshirish (server: /api/order/check). Rad etilgan bo'lsa pul balansga o'zi qaytadi. */
+async function ordCheck(o){const b=$("#rf");if(b)b.disabled=true;
+try{const r=await call("/api/order/check",{body:{id:o.id}}),q=ords.find(x=>x.id==o.id);
+if(r.balance!=null&&r.balance!==bal){const old=bal;bal=r.balance;if(ME)ME.balance=bal;paint(old)}
+if(r.status=="wait"){toast("Hali jarayonda — birozdan so'ng qayta tekshiring");if(b)b.disabled=false;return}
+if(q)q.s=r.status;renderOrd();toast(r.status=="ok"?"Buyurtma bajarilgan":r.status=="ref"?"Pul balansga qaytarildi":"Buyurtma bajarilmadi");if(q)ordSheet(q)}
+catch(e){if(gateErr(e))return;toast(e.message);if(b)b.disabled=false}}
 function quick(){hap();const s=$("#sh");s.className="sh";
 s.innerHTML=`<div class="grab"></div><div class="hd"><h2>Yangi xarid</h2></div><div class="list" style="margin-top:12px">${Object.keys(SV).map(k=>`<button class="opt wide t-${k}" data-k="${k}"><span class="qk"><span class="ico">${IC[k]}</span>${SV[k].n}</span>${IC.chev}</button>`).join("")}</div>`;
 show(true);s.querySelectorAll(".opt").forEach(b=>b.onclick=()=>openSheet(b.dataset.k))}
@@ -494,49 +512,50 @@ function syncBack(){try{const o=$("#sh").classList.contains("on")||$("#win").cla
 try{if(tg&&tg.BackButton){tg.BackButton.onClick(()=>{const w=$("#win");if(w.classList.contains("on")){const c=$("#cl");if(c)c.click();else w.classList.remove("on")}else show(false)});
 const mo=new MutationObserver(syncBack);mo.observe($("#sh"),{attributes:true,attributeFilter:["class"]});mo.observe($("#win"),{attributes:true,attributeFilter:["class"]})}}catch(e){}
 
-async function openSheet(t){
-try{const r=await call("/api/prices?k="+(t=="raqam"?"number":t));
-if(r.countries){if(!r.countries.length)return toast("Hozircha davlatlar mavjud emas");P.cty=r.countries.map(c=>[c.f||"🌐",c.n,c.p,c.c])}
+async function openSheet(t,rd){
+try{const r=await call("/api/prices?k="+(t=="raqam"?(rd?"ready":"number"):t));
+if(r.countries){if(!r.countries.length)return toast("Hozircha davlatlar mavjud emas");P.cty=r.countries.map(c=>[c.f||"🌐",c.n,c.p,c.c]).sort((x,y)=>x[2]-y[2]||String(x[1]).localeCompare(String(y[1])))}
 else if(r.uc){if(!r.uc.length)return toast("Hozircha UC tariflari yo'q");P.uc=r.uc.map(x=>[x.uc,x.p,x.id])}
 else{P.star=r.star;P.prem={3:r.premium["3"],6:r.premium["6"],12:r.premium["12"]}}}catch(e){if(gateErr(e))return;return toast(e.message)}
-cur={t,u:"",a:null};const s=$("#sh");s.className="sh t-"+t;const h=SV[t];
-let b=`<div class="grab"></div><div class="hd"><div class="ico">${IC[t]}</div><h2>${h.n}</h2></div>`;
+cur={t,u:"",a:null,rd:!!rd};const s=$("#sh");s.className="sh buy t-"+t;const h=SV[t];
+let b=`<div class="grab"></div><div class="hd"><div class="ico">${IC[t]}</div><h2>${h.n}</h2></div><div class="sbody">`;
 if(h.u)b+=`<label>Telegram username (@ siz)</label><input class="in" id="u" placeholder="durov" autocapitalize="off" autocomplete="off">`;
 if(t=="stars")b+=`<label>Miqdor (eng kami 50)</label><div class="row">${[50,100,250,500,1000,2500].map(n=>`<button class="opt" data-a="${n}">${fmt(n)}</button>`).join("")}</div><input class="in" id="n" inputmode="numeric" placeholder="Boshqa miqdor">`;
 if(t=="premium")b+=`<label>Muddat</label><div class="row">${[3,6,12].map(m=>`<button class="opt" data-a="${m}">${m} oy<small>${fmt(P.prem[m])}</small></button>`).join("")}</div>`;
 if(t=="uc")b+=`<label>PUBG Mobile ID</label><input class="in" id="u" inputmode="numeric" placeholder="5123456789"><label>Tarif</label><div class="row two">${P.uc.map(x=>`<button class="opt" data-a="${x[0]}">${fmt(x[0])} UC<small>${fmt(x[1])} so'm</small></button>`).join("")}</div>`;
-if(t=="raqam")b+=`<label>Davlat</label><div class="list">${P.cty.map((c,i)=>`<button class="opt wide" data-a="${i}"><span>${c[0]} ${c[1]}</span><b>${fmt(c[2])} so'm</b></button>`).join("")}</div>`;
-b+=`<div class="sum"><span>Balansdan yechiladi</span><b id="pr">—</b></div><button class="hold" id="hold"><i></i><span id="hl"></span></button><p class="hint" id="hint"></p>`;
+if(t=="raqam")b+=`<div class="row two" style="margin-top:6px"><button class="opt${rd?"":" sel"}" data-r="0">📱 Oddiy raqam</button><button class="opt${rd?" sel":""}" data-r="1">🔐 Tayyor akkaunt</button></div><p class="note">⚠️ Raqam muzlashi yoki bloklanishi mumkin (Telegram siyosati tufayli, bizdan emas). Rasmiy Telegram ilovasidan emas, norasmiy ilovadan (masalan, Telegraph) foydalaning. Kod kelmasa — Wi-Fi ↔ mobil internetni almashtiring.</p><label>Davlat — arzonidan boshlab</label><div class="list">${P.cty.map((c,i)=>`<button class="opt wide" data-a="${i}"><span>${c[0]} ${c[1]}${P.cty.length>5&&i<5?' <span class="chip ok">Arzon</span>':""}</span><b>${fmt(c[2])} so'm</b></button>`).join("")}</div>`;
+b+=`</div><div class="sfoot"><div class="sum"><span>Balansdan yechiladi</span><b id="pr">—</b></div><button class="hold" id="hold"><i></i><span id="hl"></span></button><p class="hint" id="hint"></p></div>`;
 s.innerHTML=b;show(true);bindSheet();
 }
 const price=()=>{const{t,a}=cur;if(a==null)return 0;return t=="stars"?a*P.star:t=="premium"?P.prem[a]:t=="uc"?P.uc.find(x=>x[0]==a)[1]:P.cty[a][2]};
 function err(){const{t,a,u}=cur;
-if(a==null||(t=="stars"&&a<50))return t=="stars"&&a!=null?"Eng kami 50 ta":"Tanlang";
+if(a==null||(t=="stars"&&a<50))return t=="stars"&&a!=null?"Eng kami 50 ta":(t=="raqam"?"Davlatni tanlang":t=="uc"?"Tarifni tanlang":t=="premium"?"Muddatni tanlang":"Miqdorni tanlang");
 if(SV[t].u&&!/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(u)&&t!="uc")return "Username kiriting";
 if(t=="uc"&&!/^\d{6,12}$/.test(u))return "PUBG ID kiriting (6–12 xona)";return ""}
 function upd(){const e=err(),p=price(),h=$("#hold");
 $("#pr").textContent=p?fmt(p)+" so'm":"—";
 const low=!e&&p>bal&&!cur.tok;   /* token bor = xarid urinib ko'rilgan, natijani server hal qiladi (balans eskirgan bo'lishi mumkin) */h.disabled=!!e||low;
-$("#hl").textContent=e||(low?"Balans yetarli emas":"Bosib turing — to'lash");
-$("#hint").innerHTML=low?'<a id="tp">Balansni to\'ldirish</a>':"";
+$("#hl").textContent=e||(low?"Balans yetarli emas":"Sotib olish — bosib turing");
+$("#hint").innerHTML=low?'<a id="tp">Balansni to\'ldirish</a>':(e?"":"Tasdiqlash uchun tugmani 1 soniya bosib turing");
 if(low)$("#tp").onclick=()=>topup()}
 function bindSheet(){const s=$("#sh");
-s.querySelectorAll(".opt").forEach(b=>b.onclick=()=>{hap();s.querySelectorAll(".opt").forEach(x=>x.classList.remove("sel"));b.classList.add("sel");cur.a=+b.dataset.a;cur.tok=null;const n=$("#n");if(n)n.value="";upd()});
+s.querySelectorAll(".opt:not([data-r])").forEach(b=>b.onclick=()=>{hap();s.querySelectorAll(".opt:not([data-r])").forEach(x=>x.classList.remove("sel"));b.classList.add("sel");cur.a=+b.dataset.a;cur.tok=null;const n=$("#n");if(n)n.value="";upd()});
 const u=$("#u");if(u)u.oninput=()=>{if(cur.t=="uc")u.value=u.value.replace(/\D/g,"");cur.u=u.value.replace(/^@/,"").trim();cur.tok=null;upd()};
-const n=$("#n");if(n)n.oninput=()=>{s.querySelectorAll(".opt").forEach(x=>x.classList.remove("sel"));const v=n.value.replace(/\D/g,"").slice(0,7);if(v!==n.value)n.value=v;cur.a=v?+v:null;cur.tok=null;upd()};
+const n=$("#n");if(n)n.oninput=()=>{s.querySelectorAll(".opt:not([data-r])").forEach(x=>x.classList.remove("sel"));const v=n.value.replace(/\D/g,"").slice(0,7);if(v!==n.value)n.value=v;cur.a=v?+v:null;cur.tok=null;upd()};
+s.querySelectorAll("[data-r]").forEach(b=>b.onclick=()=>{if((b.dataset.r=="1")!==!!cur.rd){hap();openSheet("raqam",b.dataset.r=="1")}});
 holdBind($("#hold"));upd()}
 
 function holdBind(h){const f=h.querySelector("i");let t0=0,raf=0,done=false;
 const step=now=>{const p=Math.min((now-t0)/900,1);f.style.transform="scaleX("+p+")";if(p>=1){done=true;pay()}else raf=requestAnimationFrame(step)};
 h.addEventListener("pointerdown",e=>{if(h.disabled)return;e.preventDefault();done=false;f.style.transition="none";t0=performance.now();raf=requestAnimationFrame(step)});
-["pointerup","pointerleave","pointercancel"].forEach(ev=>h.addEventListener(ev,()=>{cancelAnimationFrame(raf);if(!done){f.style.transition="transform .25s";f.style.transform="scaleX(0)"}}));
+["pointerup","pointerleave","pointercancel"].forEach(ev=>h.addEventListener(ev,()=>{cancelAnimationFrame(raf);if(!done&&ev=="pointerup"&&t0&&!h.disabled)toast("Tugmani 1 soniya bosib turing");if(!done){f.style.transition="transform .25s";f.style.transform="scaleX(0)"}}));
 h.addEventListener("keydown",e=>{if((e.key==" "||e.key=="Enter")&&!h.disabled){e.preventDefault();pay()}})}
 
 const desc=()=>{const{t,a,u}=cur;return t=="stars"?fmt(a)+" Stars → @"+u:t=="premium"?"Premium, "+a+" oy → @"+u:t=="uc"?fmt(a)+" UC → ID "+u:P.cty[a][0]+" "+P.cty[a][1]+" raqami"};
 async function pay(){hap();const{t}=cur,w=desc(),h=$("#hold");let p=price(),st="wait",nb=null,rr;
 h.disabled=true;$("#hl").textContent="Bajarilmoqda…";
 const tok=cur.tok||(cur.tok=uuid());   /* bitta xarid = bitta token: tarmoq uzilib qayta yuborilsa, server ikkinchi marta yechmaydi */
-try{rr=await call("/api/buy",{body:{token:tok,kind:t=="raqam"?"number":t,username:cur.u,amount:t=="raqam"?P.cty[cur.a][3]:t=="uc"?P.uc.find(x=>x[0]==cur.a)[2]:cur.a,price:p},timeout:60000});cur.tok=null;p=rr.price||p;nb=rr.balance;if(t=="stars"||t=="premium")st=rr.status=="ok"?"ok":"wait"}
+try{rr=await call("/api/buy",{body:{token:tok,kind:t=="raqam"?"number":t,ready:t=="raqam"&&!!cur.rd,username:cur.u,amount:t=="raqam"?P.cty[cur.a][3]:t=="uc"?P.uc.find(x=>x[0]==cur.a)[2]:cur.a,price:p},timeout:60000});cur.tok=null;p=rr.price||p;nb=rr.balance;if(t=="stars"||t=="premium")st=rr.status=="ok"?"ok":"wait"}
 catch(e){if(gateErr(e))return;if(e.code=="price_changed"){cur.tok=null;toast("Narx o'zgardi, qayta oching");return show(false)}
 const hf=h.querySelector("i");if(hf){hf.style.transition="none";hf.style.transform="scaleX(0)"}
 if(e.data&&e.data.balance!=null){bal=e.data.balance;if(ME)ME.balance=bal}
