@@ -33,16 +33,20 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     CopyTextButton,
     ErrorEvent,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
+    MenuButtonWebApp,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     TelegramObject,
+    WebAppInfo,
 )
 from aiohttp import web
 from dotenv import load_dotenv
@@ -318,6 +322,7 @@ async def init_db():
             # tashlanadi — ekranda ishlamaydigan eski tugmalar "yopishib"
             # qolmasligi uchun.
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_flow_msg_id BIGINT")
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT")
     else:
         async with _db_sqlite() as db:
             # WAL rejimi baza faylida doimiy saqlanadi — shuning uchun bu
@@ -350,7 +355,21 @@ async def init_db():
                 await db.execute("ALTER TABLE users ADD COLUMN last_flow_msg_id INTEGER")
             except Exception:
                 pass
+            try:
+                await db.execute("ALTER TABLE users ADD COLUMN phone TEXT")
+            except Exception:
+                pass
             await db.commit()
+
+
+async def user_exists(user_id: int) -> bool:
+    """Foydalanuvchi bazada bormi (referal havolasidagi ID haqiqiy ekanini tekshirish uchun)."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            return await conn.fetchval("SELECT 1 FROM users WHERE user_id = $1", user_id) is not None
+    async with _db_sqlite() as db:
+        cur = await db.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
+        return await cur.fetchone() is not None
 
 
 async def ensure_user(user_id: int, username: Optional[str], full_name: Optional[str], referred_by: Optional[int] = None):
@@ -485,6 +504,63 @@ async def clear_stale_flow_message(bot, user_id: int) -> None:
     await set_last_flow_msg(user_id, None)
 
 
+# ---- Kichik xotira keshlari: har bir xabarda bazaga bir necha marta murojaat qilmaslik uchun ----
+_SETTINGS_CACHE: Dict[str, tuple] = {}     # kalit -> (qiymat, vaqt); set_setting() o'zi tozalaydi
+_SETTINGS_TTL = 15.0                       # soniya
+_BAN_CACHE: Dict[int, tuple] = {}          # user_id -> (bloklanganmi, vaqt); set_banned() o'zi yangilaydi
+_BAN_TTL = 20.0
+_registered_ids: set = set()               # telefon raqami tasdiqlangan foydalanuvchilar
+
+# .env: PHONE_PREFIXES=998  -> faqat +998 raqamlar qabul qilinadi (bo'sh bo'lsa — istalgan davlat)
+PHONE_PREFIXES = tuple("+" + p.strip().lstrip("+") for p in os.getenv("PHONE_PREFIXES", "").split(",") if p.strip())
+
+
+async def is_banned(user_id: int) -> bool:
+    now = time.monotonic()
+    hit = _BAN_CACHE.get(user_id)
+    if hit is not None and now - hit[1] < _BAN_TTL:
+        return hit[0]
+    value = await _is_banned_db(user_id)
+    if len(_BAN_CACHE) > 20000:
+        _BAN_CACHE.clear()
+    _BAN_CACHE[user_id] = (value, now)
+    return value
+
+
+async def get_phone(user_id: int) -> Optional[str]:
+    if _PG:
+        async with _pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT phone FROM users WHERE user_id = $1", user_id)
+    else:
+        async with _db_sqlite() as db:
+            cur = await db.execute("SELECT phone FROM users WHERE user_id = ?", (user_id,))
+            row = await cur.fetchone()
+    return (row[0] if row else None) or None
+
+
+async def is_registered(user_id: int) -> bool:
+    """Foydalanuvchi telefon raqamini tasdiqlaganmi (musbat natija xotirada saqlanadi)."""
+    if user_id in _registered_ids:
+        return True
+    if await get_phone(user_id):
+        if len(_registered_ids) > 50000:
+            _registered_ids.clear()
+        _registered_ids.add(user_id)
+        return True
+    return False
+
+
+async def set_phone(user_id: int, phone: str):
+    if _PG:
+        async with _pool.acquire() as conn:
+            await conn.execute("UPDATE users SET phone = $1 WHERE user_id = $2", phone, user_id)
+    else:
+        async with _db_sqlite() as db:
+            await db.execute("UPDATE users SET phone = ? WHERE user_id = ?", (phone, user_id))
+            await db.commit()
+    _registered_ids.add(user_id)
+
+
 async def try_deduct_balance(user_id: int, amount: int) -> bool:
     """Balansdan `amount`ni ayiradi, FAQAT yetarli mablag' bo'lsa — bitta atomik
     amal orqali (tekshirish va ayirish bir vaqtda). Bu ikki xaridni bir vaqtda
@@ -509,7 +585,7 @@ async def try_deduct_balance(user_id: int, amount: int) -> bool:
             return cur.rowcount > 0
 
 
-async def is_banned(user_id: int) -> bool:
+async def _is_banned_db(user_id: int) -> bool:
     if _PG:
         async with _pool.acquire() as conn:
             row = await conn.fetchrow("SELECT banned FROM users WHERE user_id = $1", user_id)
@@ -522,6 +598,7 @@ async def is_banned(user_id: int) -> bool:
 
 
 async def set_banned(user_id: int, banned: bool):
+    _BAN_CACHE[user_id] = (bool(banned), time.monotonic())
     if _PG:
         async with _pool.acquire() as conn:
             await conn.execute("UPDATE users SET banned = $1 WHERE user_id = $2", banned, user_id)
@@ -547,10 +624,14 @@ async def get_all_user_ids() -> list:
 
 async def find_user(identifier: str) -> Optional[dict]:
     """ID (raqam) yoki @username bo'yicha foydalanuvchini topadi."""
-    identifier = identifier.strip().lstrip("@")
+    raw_identifier = identifier.strip()
+    is_phone = raw_identifier.startswith("+")
+    identifier = re.sub(r"[\s\-()]", "", raw_identifier).lstrip("@+")
     if _PG:
         async with _pool.acquire() as conn:
-            if identifier.isdigit():
+            if is_phone:
+                row = await conn.fetchrow("SELECT * FROM users WHERE phone = $1", "+" + identifier)
+            elif identifier.isdigit():
                 row = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", int(identifier))
             else:
                 row = await conn.fetchrow(
@@ -570,7 +651,9 @@ async def find_user(identifier: str) -> Optional[dict]:
     else:
         async with _db_sqlite() as db:
             db.row_factory = aiosqlite.Row
-            if identifier.isdigit():
+            if is_phone:
+                cur = await db.execute("SELECT * FROM users WHERE phone = ?", ("+" + identifier,))
+            elif identifier.isdigit():
                 cur = await db.execute("SELECT * FROM users WHERE user_id = ?", (int(identifier),))
             else:
                 cur = await db.execute(
@@ -1056,15 +1139,21 @@ async def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
     """Botning ichki sozlamalarini (masalan SmmUpper API kaliti) o'qiydi —
     admin panel orqali .env'ga qayta kirmasdan o'zgartirish mumkin bo'lishi
     uchun. Baza bo'sh bo'lsa `default` qaytariladi."""
+    now = time.monotonic()
+    hit = _SETTINGS_CACHE.get(key)
+    if hit is not None and now - hit[1] < _SETTINGS_TTL:
+        return hit[0] if hit[0] is not None else default
     if _PG:
         async with _pool.acquire() as conn:
             row = await conn.fetchrow("SELECT value FROM settings WHERE key = $1", key)
-            return row["value"] if row else default
+            value = row["value"] if row else None
     else:
         async with _db_sqlite() as db:
             cur = await db.execute("SELECT value FROM settings WHERE key = ?", (key,))
             row = await cur.fetchone()
-            return row[0] if row else default
+            value = row[0] if row else None
+    _SETTINGS_CACHE[key] = (value, now)
+    return value if value is not None else default
 
 
 async def set_setting(key: str, value: str):
@@ -1083,6 +1172,7 @@ async def set_setting(key: str, value: str):
                 (key, value, value),
             )
             await db.commit()
+    _SETTINGS_CACHE.pop(key, None)      # keyingi o'qish yangi qiymatni oladi
 
 
 # ==============================================================
@@ -2061,16 +2151,6 @@ async def recover_purchase_order(bot, order_pk: int) -> Optional[str]:
 # ==============================================================
 # MATNLAR (texts)
 # ==============================================================
-WELCOME = (
-    "\U0001F44B Assalomu alaykum!\n\n"
-    "Bu bot orqali siz:\n"
-    "\U0001F4F1 Virtual raqam (SMS kod uchun)\n"
-    "\u2B50 Telegram Stars\n"
-    "\U0001F48E Telegram Premium\n"
-    "\U0001F3AE PUBG Mobile UC\n\n"
-    "sotib olishingiz mumkin. Quyidagi menyudan tanlang \U0001F447"
-)
-
 BTN_HELP = "\U0001F195 Yordam"
 BTN_BALANCE = "\U0001F4B0 Balans"
 BTN_TOPUP = "\U0001F4B3 Balansni to'ldirish"
@@ -2223,6 +2303,7 @@ def admin_user_card(user: dict, referral: Optional[dict] = None) -> str:
     lines = [
         f"\U0001F464 {user.get('full_name') or _EM_DASH} ({username})",
         f"\U0001F522 ID: {user['user_id']}",
+        f"\U0001F4DE Telefon: {user.get('phone') or _EM_DASH}",
         f"\U0001F4B0 Balans: {fmt_money(user['balance'])} so'm",
         f"\U0001F4E6 Buyurtmalar soni: {user.get('order_count', 0)}",
         f"\U0001F4B5 Jami xarid: {fmt_money(user.get('total_spent', 0))} so'm",
@@ -2254,7 +2335,7 @@ def duplicate_topup_warning(count: int) -> str:
 
 ADMIN_TITLE = "\U0001F527 Admin panel"
 
-ASK_FIND_USER = "Qidirmoqchi bo'lgan foydalanuvchi ID raqamini yoki @username'ini yuboring:"
+ASK_FIND_USER = "Qidirmoqchi bo'lgan foydalanuvchi ID raqamini, @username'ini yoki telefon raqamini (+998...) yuboring:"
 ASK_BALANCE_ID = "Balansini o'zgartirmoqchi bo'lgan foydalanuvchi ID raqamini yuboring:"
 ASK_BALANCE_AMOUNT = (
     "Endi miqdorni yuboring.\n"
@@ -2572,25 +2653,57 @@ def _copy_button(label: str, value) -> Optional[InlineKeyboardButton]:
     return InlineKeyboardButton(text=label, copy_text=CopyTextButton(text=text))
 
 
-def main_menu() -> ReplyKeyboardMarkup:
-    """Asosiy menyu: 4 qator x 2 ustun (avval 6 qator edi). Xarid bo'limlari tepada."""
+_NEWS_URL = ""     # "Yangiliklar kanali" tugmasi havolasi (ishga tushganda va admin o'zgartirganda yangilanadi)
+
+
+def main_menu() -> InlineKeyboardMarkup:
+    """Bosh menyu (inline): "Xaridni boshlash" + "Yangiliklar kanali". Pastki (reply) klaviatura endi yo'q;
+    main_menu() chaqiriladigan barcha joylar o'zgarishsiz ishlaydi."""
+    rows = [[InlineKeyboardButton(text="\U0001F6CD Xaridni boshlash \U0001F6CD", callback_data="menu:shop", style=STYLE_PRIMARY)]]
+    if _is_valid_button_url(_NEWS_URL):
+        rows.append([InlineKeyboardButton(text="\U0001F4E2 Yangiliklar kanali", url=_NEWS_URL)])
+    return _kb(rows)
+
+
+def shop_menu() -> InlineKeyboardMarkup:
+    """"Xaridni boshlash" bosilganda xabarning tugmalari shu bilan almashadi (xabar o'zi o'zgarmaydi)."""
+    def b(text: str, data: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(text=text, callback_data=data, style=STYLE_PRIMARY)
+
+    rows = [
+        [b(BTN_NUMBER, "menu:number"), b(BTN_STARS, "menu:stars")],
+        [b(BTN_PREMIUM, "menu:premium"), b(BTN_UC, "menu:uc")],
+        [b(BTN_BALANCE, "menu:balance"), b(BTN_ORDERS, "menu:orders")],
+        [b(BTN_REPEAT_ORDER, "menu:repeat"), b("\U0001F464 Profil", "menu:profile")],
+        [b("\U0001F381 Do'stlarni taklif qilish", "referral:info"), b(BTN_HELP, "menu:help")],
+    ]
+    mini_url = miniapp_url()
+    if mini_url:
+        rows.append([InlineKeyboardButton(text="\U0001F4F1 Mini App", web_app=WebAppInfo(url=mini_url), style=STYLE_SUCCESS)])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="menu:start", style=STYLE_DANGER)])
+    return _kb(rows)
+
+
+def phone_request_menu() -> ReplyKeyboardMarkup:
+    """Yagona reply-klaviatura: telefon raqamini yuborish (Telegram buni faqat reply-tugma orqali beradi)."""
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_NUMBER, style=STYLE_PRIMARY), KeyboardButton(text=BTN_STARS, style=STYLE_PRIMARY)],
-            [KeyboardButton(text=BTN_PREMIUM, style=STYLE_PRIMARY), KeyboardButton(text=BTN_UC, style=STYLE_PRIMARY)],
-            [KeyboardButton(text=BTN_BALANCE), KeyboardButton(text=BTN_ORDERS)],
-            [KeyboardButton(text=BTN_REPEAT_ORDER), KeyboardButton(text=BTN_HELP)],
-        ],
-        resize_keyboard=True,
-        input_field_placeholder="Bo'limni tanlang \U0001F447",
+        keyboard=[[KeyboardButton(text="\U0001F4F2 Raqamni yuborish", request_contact=True)]],
+        resize_keyboard=True, one_time_keyboard=True,
+        input_field_placeholder="Tugmani bosing \U0001F447",
     )
 
 
 def balance_menu() -> InlineKeyboardMarkup:
-    return _kb([
+    rows = [
         [InlineKeyboardButton(text=BTN_TOPUP, callback_data="topup:start", style=STYLE_PRIMARY)],
         [InlineKeyboardButton(text="\U0001F381 Do'stlarni taklif qilish", callback_data="referral:info", style=STYLE_PRIMARY)],
-    ])
+    ]
+    mini_url = miniapp_url()      # Mini App sozlanmagan bo'lsa "" — tugma qo'shilmaydi (pastdagi MINIAPP bo'limi)
+    if mini_url:
+        # DIQQAT: faqat INLINE tugma — reply-klaviaturadagi web_app tugmasida Telegram initData bermaydi.
+        rows.insert(0, [InlineKeyboardButton(text="\U0001F4F1 Mini App'da to'ldirish", web_app=WebAppInfo(url=mini_url),
+                                             style=STYLE_SUCCESS)])
+    return _kb(rows)
 
 
 def cancel_inline(back_callback: Optional[str] = None) -> InlineKeyboardMarkup:
@@ -2995,7 +3108,12 @@ def settings_admin_menu() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="\U0001F4E2 Xarid kanali", callback_data="adm:channel", style=STYLE_PRIMARY),
             InlineKeyboardButton(text="\U0001F4B3 To'lov kartasi", callback_data="adm:card", style=STYLE_PRIMARY),
         ],
-        [InlineKeyboardButton(text="\u23F1 Pul qaytarish vaqti", callback_data="adm:refundtime", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="⏱ Pul qaytarish vaqti", callback_data="adm:refundtime", style=STYLE_PRIMARY)],
+        [InlineKeyboardButton(text="\U0001F4AC Qo'llab-quvvatlash admini", callback_data="adm:support", style=STYLE_PRIMARY)],
+        [
+            InlineKeyboardButton(text="\U0001F5BC Welcome rasmi", callback_data="adm:wphoto", style=STYLE_PRIMARY),
+            InlineKeyboardButton(text="\U0001F4E2 Yangiliklar havolasi", callback_data="adm:news", style=STYLE_PRIMARY),
+        ],
         _admin_back("Orqaga", "adm:refresh"),
     ])
 
@@ -3150,6 +3268,9 @@ class AdminPanel(StatesGroup):
     apay_card_number = State()
     apay_card_holder = State()
     apay_ttl = State()
+    welcome_photo = State()
+    news_url = State()
+    support_contact = State()
 
 
 # ==============================================================
@@ -3374,6 +3495,8 @@ async def is_subscribed(bot, user_id: int, force_refresh: bool = False) -> bool:
         except Exception:
             continue
 
+    if len(_sub_cache) > 20000:
+        _sub_cache.clear()          # xotira cheksiz o'smasin
     _sub_cache[user_id] = (result, now)
     return result
 
@@ -3408,8 +3531,9 @@ async def force_sub_check(callback: CallbackQuery, bot):
             await callback.message.edit_reply_markup(reply_markup=None)
         except Exception:
             pass
-        await callback.message.answer(FORCE_SUB_OK, reply_markup=main_menu())
+        await callback.message.answer(FORCE_SUB_OK)
         await callback.answer()
+        await continue_after_gates(bot, callback.from_user, callback.message.chat.id)
     else:
         await callback.answer(FORCE_SUB_STILL_NOT, show_alert=True)
 
@@ -3463,7 +3587,22 @@ async def cancel_any(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+_kb_cleaned: set = set()     # eski pastki klaviaturasi allaqachon olib tashlangan foydalanuvchilar
+
+
 async def hide_main_menu(message: Message) -> None:
+    """Eski pastki klaviatura qolib ketgan foydalanuvchilar uchun: HAR BIR foydalanuvchida faqat bir marta ishlaydi
+    (har bir bo'limga kirishda ko'rinmas xabar yuborib-o'chirish endi yo'q)."""
+    uid = message.chat.id
+    if uid in _kb_cleaned:
+        return
+    if len(_kb_cleaned) > 50000:
+        _kb_cleaned.clear()
+    _kb_cleaned.add(uid)
+    await _hide_main_menu_raw(message)
+
+
+async def _hide_main_menu_raw(message: Message) -> None:
     """Pastdagi doimiy menyuni (asosiy reply-klaviatura) yashiradi, lekin
     suhbatda ortiqcha xabar qoldirmaydi. Telegram'da reply-klaviaturani olib
     tashlash faqat YANGI xabar bilan mumkin (mavjud xabarni tahrirlab emas)
@@ -3499,7 +3638,9 @@ async def cmd_start(message: Message, state: FSMContext, command: CommandObject,
         ref_id_str = payload[3:]
         if ref_id_str.isdigit():
             candidate = int(ref_id_str)
-            if candidate != message.from_user.id:
+            # Taklif qilgan odam haqiqatan botda ro'yxatdan o'tgan bo'lishi shart: aks holda keshbek "yo'q odamga"
+            # hisoblanib, xabar ham, balans ham bekor ketardi (va soxta ID bilan havola yasash mumkin edi).
+            if candidate != message.from_user.id and await user_exists(candidate):
                 referred_by = candidate
 
     # MUHIM: ensure_user() (demak — referal ID'ni saqlash) doim, majburiy
@@ -3514,7 +3655,123 @@ async def cmd_start(message: Message, state: FSMContext, command: CommandObject,
         await send_force_sub_prompt(bot, message.chat.id)
         return
 
-    await message.answer(WELCOME, reply_markup=main_menu())
+    if await is_registered(message.from_user.id):
+        await hide_main_menu(message)      # eski pastki klaviatura qolgan bo'lsa — bir marta olib tashlanadi
+    await continue_after_gates(bot, message.from_user, message.chat.id)
+
+
+# ---------- Ro'yxatdan o'tish (telefon raqami) va bosh sahifa ----------
+SETTINGS_KEY_WELCOME_PHOTO = "welcome_photo"      # admin paneldan yuklangan rasm (file_id)
+SETTINGS_KEY_NEWS_URL = "news_url"                # "Yangiliklar kanali" havolasi ("" — tugma yashirin)
+WELCOME_PHOTO_ENV = os.getenv("WELCOME_PHOTO", "").strip()   # .env: rasm havolasi yoki file_id
+
+PHONE_ASK = (
+    "\U0001F4DE Ro'yxatdan o'tish\n\n"
+    "Botdan foydalanish uchun telefon raqamingizni tasdiqlang — pastdagi "
+    "«\U0001F4F2 Raqamni yuborish» tugmasini bosing.\n\n"
+    "\U0001F512 Raqam faqat hisobingizni himoyalash uchun saqlanadi."
+)
+
+
+async def ask_phone(bot, chat_id: int) -> None:
+    await bot.send_message(chat_id, PHONE_ASK, reply_markup=phone_request_menu())
+
+
+def welcome_text(name: str) -> str:
+    return (
+        f"\U0001F44B Xush kelibsiz, <b>{html.escape(name)}</b>! ✌️\n\n"
+        "Raqam, Telegram Stars, Premium va PUBG UC — hammasi bir joyda, tez va qulay.\n\n"
+        "✨ Hisobni to'ldiring, kerakli xizmatni tanlang — qolganini o'zimiz bajaramiz.\n\n"
+        "\U0001F64F Bizni tanlaganingiz uchun <b>rahmat</b>!"
+    )
+
+
+async def _welcome_photo():
+    """Tartib: admin paneldan yuklangan rasm -> .env WELCOME_PHOTO -> bot.py yonidagi welcome.jpg -> rasmsiz."""
+    fid = await get_setting(SETTINGS_KEY_WELCOME_PHOTO, default="")
+    if fid:
+        return fid
+    if WELCOME_PHOTO_ENV:
+        return WELCOME_PHOTO_ENV
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "welcome.jpg")
+    if os.path.isfile(path):
+        return FSInputFile(path)
+    return None
+
+
+SETTINGS_KEY_SUPPORT = "support_contact"          # Qo'llab-quvvatlash admini havolasi (Mini App'dagi "Adminga yozish" tugmasi)
+
+
+def normalize_support_url(raw: str) -> str:
+    """"@user", "user", "t.me/user" yoki "https://t.me/user" -> "https://t.me/user". Yaroqsiz bo'lsa — "" qaytaradi."""
+    raw = (raw or "").strip()
+    raw = re.sub(r"^(https?://)?(www\.)?t\.me/", "", raw, flags=re.I).lstrip("@").strip("/")
+    return f"https://t.me/{raw}" if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", raw) else ""
+
+
+async def get_support_url() -> str:
+    """Admin sozlamasi -> .env SUPPORT_USERNAME. Bo'sh bo'lsa — Mini App eski usulda botga qaytaradi."""
+    raw = await get_setting(SETTINGS_KEY_SUPPORT, default=None)
+    if raw is None:
+        raw = os.getenv("SUPPORT_USERNAME", "")
+    return normalize_support_url(raw)
+
+
+async def refresh_news_url() -> None:
+    """"Yangiliklar kanali" havolasini yangilaydi: admin sozlamasi -> .env NEWS_CHANNEL_URL -> birinchi majburiy obuna kanali."""
+    global _NEWS_URL
+    raw = await get_setting(SETTINGS_KEY_NEWS_URL, default=None)
+    if raw is None:
+        raw = os.getenv("NEWS_CHANNEL_URL", "").strip()
+        if not raw:
+            channels = await get_force_sub_channels()
+            raw = next((c.get("url") for c in channels if c and c.get("url")), "")
+    _NEWS_URL = raw or ""
+
+
+async def send_welcome(bot, chat_id: int, name: str) -> None:
+    await refresh_news_url()
+    text = welcome_text(name)
+    photo = await _welcome_photo()
+    if photo is not None:
+        try:
+            await bot.send_photo(chat_id, photo, caption=text, parse_mode="HTML", reply_markup=main_menu())
+            return
+        except Exception:
+            logging.exception("welcome rasmini yuborib bo'lmadi — matn yuboriladi")
+    await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=main_menu())
+
+
+async def continue_after_gates(bot, user, chat_id: int) -> None:
+    """Majburiy obunadan o'tgach: telefon tasdiqlanmagan bo'lsa raqam so'raydi, aks holda bosh sahifani ko'rsatadi."""
+    if not await is_registered(user.id):
+        await ask_phone(bot, chat_id)
+        return
+    await send_welcome(bot, chat_id, user.first_name or user.full_name)
+
+
+@router_start.message(F.contact)
+async def phone_received(message: Message, state: FSMContext, bot):
+    contact = message.contact
+    if contact.user_id != message.from_user.id:
+        await message.answer("❌ Iltimos, faqat O'ZINGIZNING raqamingizni yuboring — pastdagi tugmani bosing.",
+                             reply_markup=phone_request_menu())
+        return
+    digits = re.sub(r"\D", "", contact.phone_number or "")
+    phone = "+" + digits
+    if not (8 <= len(digits) <= 15):
+        await message.answer("❌ Raqam noto'g'ri ko'rinadi. Qayta urinib ko'ring.", reply_markup=phone_request_menu())
+        return
+    if PHONE_PREFIXES and not phone.startswith(PHONE_PREFIXES):
+        await message.answer("❌ Hozircha faqat O'zbekiston raqamlari (+998) qabul qilinadi.",
+                             reply_markup=phone_request_menu())
+        return
+    await ensure_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
+    await set_phone(message.from_user.id, phone)
+    await state.clear()
+    _kb_cleaned.add(message.chat.id)
+    await message.answer(f"✅ Raqamingiz tasdiqlandi: {phone}", reply_markup=ReplyKeyboardRemove())
+    await send_welcome(bot, message.chat.id, message.from_user.first_name or message.from_user.full_name)
 
 
 ASK_HELP_MESSAGE = (
@@ -3522,8 +3779,13 @@ ASK_HELP_MESSAGE = (
     "Iloji boricha batafsil yozing (masalan, buyurtma raqami yoki skrinshot bilan)."
 )
 HELP_SENT_TO_USER = "\u2705 Xabaringiz adminlarga yuborildi. Tez orada javob berishadi."
-HELP_INTRO = "\U0001F195 Yordam\n\nQuyidagilardan birini tanlang:"
-FAQ_INTRO = "\U0001F4DA Ko'p beriladigan savollar:"
+HELP_INTRO = (
+    "\U0001F195 Yordam markazi\n\n"
+    "\U0001F4DA «Savollar» — har bir xizmat bo'yicha qadam-baqadam qo'llanma.\n"
+    "\U0001F4AC «Adminga yozish» — javob topilmasa, savolingizni adminga yuboring.\n\n"
+    "Qaysi biri kerak? \U0001F447"
+)
+FAQ_INTRO = "\U0001F4DA Qaysi mavzu bo'yicha tushuntirish kerak?"
 
 
 def help_forward_text(user, text: str) -> str:
@@ -3554,14 +3816,18 @@ def faq_menu() -> InlineKeyboardMarkup:
 
     return _kb([
         [question("\U0001F4F1 Raqam olish", "buy_number"), question("\u2B50 Stars / Premium", "buy_stars")],
-        [question("\U0001F3AE PUBG UC", "buy_uc"), question("\U0001F4B0 To'lov", "payment")],
+        [question("\U0001F3AE PUBG UC", "buy_uc"), question("\U0001F4B0 Balansni to'ldirish", "payment")],
         [question("\u23F3 Kod vaqti", "code_time"), question("\u274C Kod kelmasa", "code_missing")],
+        [question("\U0001F4B8 Pul qaytarish", "refund"), question("\U0001F4CB Buyurtmalarim", "orders")],
+        [question("\U0001F381 Referal / keshbek", "referral"), question("\U0001F4F2 Mini App", "miniapp")],
         [InlineKeyboardButton(text=BTN_BACK, callback_data="help:menu", style=STYLE_PRIMARY)],
     ])
 
 
 def faq_answer_menu() -> InlineKeyboardMarkup:
-    return _kb(nav_rows("help:faq"))
+    """Javob yordam bermasa — foydalanuvchi shu yerning o'zidan adminga yozishi mumkin."""
+    ask_admin = [InlineKeyboardButton(text="\U0001F4AC Javob topilmadi — adminga yozish", callback_data="help:admin", style=STYLE_PRIMARY)]
+    return _kb([ask_admin, *nav_rows("help:faq")])
 
 
 # Statik FAQ javoblari. "code_missing" bu yerda YO'Q — u refund kutish
@@ -3593,11 +3859,42 @@ FAQ_ANSWERS = {
         "tayyor bo'lganda o'zimiz xabar beramiz."
     ),
     "payment": (
-        "\U0001F4B0 To'lov qanday qilinadi?\n\n"
-        f"\u00ab{BTN_TOPUP}\u00bb tugmasini bosing, summani kiriting (kamida "
-        f"{fmt_money(MIN_TOPUP)} so'm), ko'rsatilgan karta raqamiga o'tkazing "
-        "va to'lov chekining skrinshotini yuboring. Admin tasdiqlagach, "
-        "balansingiz avtomatik to'ldiriladi."
+        "\U0001F4B0 Balansni qanday to'ldiraman?\n\n"
+        f"1\uFE0F\u20E3 \u00ab{BTN_TOPUP}\u00bb tugmasini bosing va summani kiriting "
+        f"(kamida {fmt_money(MIN_TOPUP)} so'm).\n"
+        "2\uFE0F\u20E3 Bot sizga karta raqamini beradi. Avto-to'lov yoqilgan bo'lsa, "
+        "summa o'zgartirib beriladi (masalan 50 000 o'rniga 50 013) \u2014 "
+        "aynan SHU summani o'tkazing, aks holda to'lov topilmaydi.\n"
+        "3\uFE0F\u20E3 Avto-to'lovda balans o'zi to'ldiriladi (odatda bir necha daqiqada). "
+        "Agar bot chek so'rasa \u2014 to'lov skrinshotini rasm qilib yuboring, "
+        "admin tasdiqlagach balans to'ldiriladi."
+    ),
+    "refund": (
+        "\U0001F4B8 Pul qachon qaytariladi?\n\n"
+        "\u2022 Buyurtma xatolik bilan tugasa yoki natijasi aniqlanmasa \u2014 pul balansingizga "
+        "avtomatik qaytariladi.\n"
+        f"\u2022 Raqam uchun SMS kod kelmasa \u2014 buyurtma ichidagi \U0001F4B8 \u00abPulni qaytarish\u00bb "
+        "tugmasi orqali o'zingiz qaytarib olasiz (tugma biroz kutgandan keyin ochiladi).\n"
+        "\u2022 Boshqa muammo bo'lsa \u2014 pastdagi tugma orqali adminga yozing, buyurtma raqamini ko'rsating."
+    ),
+    "orders": (
+        "\U0001F4CB Buyurtmalarim bo'limi\n\n"
+        f"\u00ab{BTN_ORDERS}\u00bb \u2014 barcha xaridlaringiz va ularning holati (jarayonda / bajarildi / "
+        "bajarilmadi / qaytarildi) shu yerda.\n"
+        f"\u00ab{BTN_REPEAT_ORDER}\u00bb \u2014 oxirgi xaridni bir bosishda takrorlaydi.\n"
+        "Buyurtma jarayonda bo'lsa \u2014 tayyor bo'lganda o'zimiz xabar beramiz."
+    ),
+    "referral": (
+        "\U0001F381 Referal va keshbek\n\n"
+        "1\uFE0F\u20E3 Asosiy menyudagi \U0001F381 \u00abDo'stlarni taklif qilish\u00bb tugmasidan shaxsiy havolangizni oling.\n"
+        "2\uFE0F\u20E3 Uni do'stlaringizga yuboring \u2014 ular shu havola orqali botga kirsin.\n"
+        f"3\uFE0F\u20E3 Do'stingiz balansini to'ldirgan har safar, summaning {REFERRAL_CASHBACK_PERCENT}% "
+        "keshbek sifatida sizning balansingizga avtomatik qo'shiladi."
+    ),
+    "miniapp": (
+        "\U0001F4F2 Mini App nima?\n\n"
+        "Bu botning qulay oynasi: balans, buyurtmalar tarixi, balansni to'ldirish va referal havolangiz "
+        "bir joyda. Ochish uchun /app buyrug'ini yuboring yoki botning menyu tugmasini bosing."
     ),
     "code_time": (
         "\u23F3 Kod qancha vaqtda keladi?\n\n"
@@ -3619,6 +3916,7 @@ async def faq_code_missing_text() -> str:
     )
 
 
+@router_start.message(Command("help"))
 @router_start.message(F.text.in_(MENU_HELP))
 async def help_start(message: Message, state: FSMContext):
     await state.clear()
@@ -3833,8 +4131,12 @@ _background_tasks: set = set()
 
 @router_numbers.message(F.text.in_(MENU_NUMBER))
 async def start_number_flow(message: Message, state: FSMContext, bot):
+    await open_number_flow(message, state, bot, message.from_user.id)
+
+
+async def open_number_flow(message: Message, state: FSMContext, bot, user_id: int):
     await state.clear()
-    await clear_stale_flow_message(bot, message.from_user.id)
+    await clear_stale_flow_message(bot, user_id)
     await hide_main_menu(message)
     await message.answer(NUMBER_PURCHASE_WARNING, reply_markup=number_warning_menu())
 
@@ -4230,9 +4532,15 @@ async def _poll_code(bot, user_id: int, order_pk: int, server: int, result: dict
             return
 
     try:
+        _row = await get_order_row(order_pk)
+        if not _row or _row["status"] != "processing":
+            return          # shu orada kod olingan yoki pul qaytarilgan — ortiqcha xabar yuborilmaydi
+    except Exception:
+        pass
+    try:
         await bot.send_message(
             user_id,
-            "\u231B Kod hali kelmadi. Pastdagi tugma orqali istalgan vaqt tekshirishingiz mumkin.",
+            "⌛ Kod hali kelmadi. Pastdagi tugma orqali istalgan vaqt tekshirishingiz mumkin.",
             reply_markup=check_code_menu(order_pk, copy_number=result.get("number")),
         )
     except Exception:
@@ -4380,8 +4688,12 @@ MIN_STARS = 50
 
 @router_stars.message(F.text.in_(MENU_STARS))
 async def start_stars_flow(message: Message, state: FSMContext, bot):
+    await open_stars_flow(message, state, bot, message.from_user.id)
+
+
+async def open_stars_flow(message: Message, state: FSMContext, bot, user_id: int):
     await state.clear()
-    await clear_stale_flow_message(bot, message.from_user.id)
+    await clear_stale_flow_message(bot, user_id)
     await state.set_state(BuyStars.username)
     await hide_main_menu(message)
     await message.answer(
@@ -4580,8 +4892,12 @@ async def _premium_prices_text() -> tuple:
 
 @router_premium.message(F.text.in_(MENU_PREMIUM))
 async def start_premium_flow(message: Message, state: FSMContext, bot):
+    await open_premium_flow(message, state, bot, message.from_user.id)
+
+
+async def open_premium_flow(message: Message, state: FSMContext, bot, user_id: int):
     await state.clear()
-    await clear_stale_flow_message(bot, message.from_user.id)
+    await clear_stale_flow_message(bot, user_id)
 
     try:
         text, prices = await _premium_prices_text()
@@ -4832,8 +5148,12 @@ _UC_FETCH_ERRORS = (SmmUpperError, KeyError) + _NET_ERRORS
 
 @router_uc.message(F.text.in_(MENU_UC))
 async def start_uc_flow(message: Message, state: FSMContext, bot):
+    await open_uc_flow(message, state, bot, message.from_user.id)
+
+
+async def open_uc_flow(message: Message, state: FSMContext, bot, user_id: int):
     await state.clear()
-    await clear_stale_flow_message(bot, message.from_user.id)
+    await clear_stale_flow_message(bot, user_id)
     try:
         tariffs = await load_uc_tariffs()
     except _UC_FETCH_ERRORS as e:
@@ -5349,6 +5669,61 @@ async def uc_sweeper(bot):
             logging.exception("UC kuzatuvchisida xato")
 
 
+# ---- SmmUpper balansi kuzatuvchisi: balans tugab, xaridlar to'xtab qolmasin ----
+PROVIDER_LOW_DEFAULT = int(os.getenv("PROVIDER_LOW_BALANCE", "50000"))     # so'm; 0 = ogohlantirish o'chiq
+PROVIDER_CHECK_SECONDS = 600                                               # har 10 daqiqada tekshiriladi
+PROVIDER_REALERT_SECONDS = 6 * 3600                                        # past tursa — har 6 soatda eslatiladi
+SETTINGS_KEY_PROVIDER_LOW = "provider_low_balance"
+
+
+async def _provider_balance() -> Optional[int]:
+    try:
+        data = await client.get_balance()
+        return int(float(data["result"]["balance"]))
+    except Exception:
+        return None
+
+
+async def _provider_low_limit() -> int:
+    raw = await get_setting(SETTINGS_KEY_PROVIDER_LOW, default=None)
+    try:
+        return max(0, int(raw)) if raw is not None else PROVIDER_LOW_DEFAULT
+    except (TypeError, ValueError):
+        return PROVIDER_LOW_DEFAULT
+
+
+async def provider_balance_watch(bot):
+    """Fon jarayoni: SmmUpper hisobi chegaradan pastga tushsa asosiy adminlarga xabar beradi (6 soatda bir marta)."""
+    last_alert = 0.0
+    while True:
+        try:
+            await asyncio.sleep(PROVIDER_CHECK_SECONDS)
+            limit = await _provider_low_limit()
+            if limit <= 0:
+                continue
+            bal = await _provider_balance()
+            if bal is None:
+                continue
+            if bal >= limit:
+                last_alert = 0.0                      # tiklandi — keyingi pasayishda darhol xabar beramiz
+                continue
+            if time.monotonic() - last_alert < PROVIDER_REALERT_SECONDS and last_alert:
+                continue
+            last_alert = time.monotonic()
+            for admin_id in ADMIN_IDS:
+                with contextlib.suppress(Exception):
+                    await bot.send_message(
+                        admin_id,
+                        f"\u26A0\uFE0F SmmUpper balansi kam!\n"
+                        f"\U0001F4B0 Hozir: {fmt_money(bal)} so'm (chegara: {fmt_money(limit)} so'm)\n"
+                        f"Balans tugasa Raqam/Stars/Premium/UC xaridlari bajarilmay, foydalanuvchilarga pul qaytariladi. "
+                        f"Hisobni to'ldiring.")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("SmmUpper balans kuzatuvchisida xato")
+
+
 async def _check_uc_order_callback(callback: CallbackQuery, bot, order_pk: int):
     """Buyurtmalarim -> "holatini tekshirish" tugmasi (UC uchun)."""
     status = await uc_sync_order(bot, order_pk)
@@ -5382,10 +5757,14 @@ _TYPE_LABEL = {
 
 @router_orders.message(F.text.in_(MENU_ORDERS))
 async def show_my_orders(message: Message, state: FSMContext):
+    await open_orders(message, state, message.from_user.id)
+
+
+async def open_orders(message: Message, state: FSMContext, user_id: int):
     await state.clear()
-    rows = await list_orders(message.from_user.id, limit=10)
+    rows = await list_orders(user_id, limit=10)
     if not rows:
-        await message.answer(NO_ORDERS_YET)
+        await message.answer(NO_ORDERS_YET, reply_markup=main_menu())
         return
 
     lines = ["\U0001F4CB Oxirgi buyurtmalaringiz:"]
@@ -5402,8 +5781,8 @@ async def show_my_orders(message: Message, state: FSMContext):
                 callback_data=f"ordercheck:{row['id']}",
             )])
 
-    markup = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-    await message.answer("\n".join(lines), reply_markup=markup)
+    buttons.append([InlineKeyboardButton(text="\U0001F3E0 Bosh menyu", callback_data="home")])
+    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
 @router_orders.callback_query(F.data.startswith("ordercheck:"))
@@ -5537,6 +5916,10 @@ async def check_order_by_id(message: Message, state: FSMContext):
 
 @router_orders.message(F.text.in_(MENU_REPEAT_ORDER))
 async def repeat_last_order(message: Message, state: FSMContext, bot):
+    await open_repeat(message, state, bot, message.from_user.id)
+
+
+async def open_repeat(message: Message, state: FSMContext, bot, user_id: int):
     """Foydalanuvchining eng oxirgi buyurtmasidagi davlat/mahsulotni
     qayta tanlab, to'g'ridan-to'g'ri tasdiqlash bosqichiga olib boradi —
     ogohlantirish/tur tanlash/ro'yxat bosqichlarini qayta bosish shart
@@ -5544,14 +5927,14 @@ async def repeat_last_order(message: Message, state: FSMContext, bot):
     eski buyurtmadagi narx emas, chunki narxlar/ustama o'shandan beri
     o'zgargan bo'lishi mumkin."""
     await state.clear()
-    await clear_stale_flow_message(bot, message.from_user.id)
-    row = await get_last_order(message.from_user.id)
+    await clear_stale_flow_message(bot, user_id)
+    row = await get_last_order(user_id)
     if not row:
-        await message.answer("Sizda hali buyurtmalar tarixi yo'q. Avval biror narsa sotib oling.")
+        await message.answer("Sizda hali buyurtmalar tarixi yo'q. Avval biror narsa sotib oling.",
+                             reply_markup=main_menu())
         return
 
     order_type = row["order_type"]
-    user_id = message.from_user.id
 
     if order_type == "number":
         if not row["server"] or not row["country"]:
@@ -5736,6 +6119,34 @@ async def admin_panel(message: Message, state: FSMContext):
         return
     await state.clear()
     await _show_panel(message)
+
+
+@router_admin.message(Command("provbal"))
+async def provider_balance_cmd(message: Message):
+    """SmmUpper hisobidagi hozirgi balans va ogohlantirish chegarasi. FAQAT asosiy adminlar uchun."""
+    if not _is_owner(message.from_user.id):
+        return
+    bal = await _provider_balance()
+    limit = await _provider_low_limit()
+    now_line = f"{fmt_money(bal)} so'm" if bal is not None else "olib bo'lmadi (SmmUpper javob bermadi)"
+    limit_line = f"{fmt_money(limit)} so'm" if limit > 0 else "o'chiq"
+    await message.answer(
+        f"\U0001F4B0 SmmUpper balansi: {now_line}\n"
+        f"\u26A0\uFE0F Ogohlantirish chegarasi: {limit_line}\n\n"
+        f"Chegarani o'zgartirish: /setlow 100000  (0 \u2014 o'chirish)")
+
+
+@router_admin.message(Command("setlow"))
+async def provider_low_set_cmd(message: Message, command: CommandObject):
+    if not _is_owner(message.from_user.id):
+        return
+    arg = (command.args or "").strip().replace(" ", "")
+    if not arg.isdigit():
+        await message.answer("Masalan: /setlow 100000  (0 \u2014 ogohlantirishni o'chirish)")
+        return
+    await set_setting(SETTINGS_KEY_PROVIDER_LOW, str(int(arg)))
+    await message.answer("\u2705 Ogohlantirish o'chirildi." if int(arg) == 0
+                         else f"\u2705 Chegara: {fmt_money(int(arg))} so'm. Balans shundan pastga tushsa xabar beraman.")
 
 
 @router_admin.message(Command("adminlog"))
@@ -6289,6 +6700,129 @@ async def admin_refundtime_receive(message: Message, state: FSMContext, bot):
     seconds = int(text)
     await set_setting(SETTINGS_KEY_REFUND_SECONDS, str(seconds))
     await _panel_edit(bot, state, message, refund_seconds_saved(seconds), settings_cancel_menu())
+    await state.clear()
+
+
+# ---------- Welcome rasmi va "Yangiliklar kanali" havolasi ----------
+
+@router_admin.callback_query(F.data == "adm:wphoto")
+async def admin_wphoto_start(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    cur = await get_setting(SETTINGS_KEY_WELCOME_PHOTO, default="")
+    status = "✅ Hozir: admin yuklagan rasm ishlatilmoqda." if cur else "ℹ️ Hozir: admin rasmi yo'q (.env / welcome.jpg ishlatiladi)."
+    await _ask(
+        callback, state, AdminPanel.welcome_photo,
+        f"\U0001F5BC Welcome rasmi\n\n{status}\n\n"
+        "Bosh sahifa uchun yangi rasmni (surat sifatida) yuboring.\n"
+        "O'chirish uchun: 0 deb yozing.",
+        settings_cancel_menu(),
+    )
+
+
+@router_admin.message(AdminPanel.welcome_photo, F.photo)
+async def admin_wphoto_receive(message: Message, state: FSMContext, bot):
+    if not await _is_admin(message.from_user.id):
+        return
+    file_id = message.photo[-1].file_id
+    await set_setting(SETTINGS_KEY_WELCOME_PHOTO, file_id)
+    await log_admin_action(message.from_user.id, "welcome_photo", note="yangilandi")
+    await _panel_edit(bot, state, message, "✅ Welcome rasmi saqlandi.", settings_cancel_menu())
+    await state.clear()
+
+
+@router_admin.message(AdminPanel.welcome_photo, is_free_text)
+async def admin_wphoto_text(message: Message, state: FSMContext, bot):
+    if not await _is_admin(message.from_user.id):
+        return
+    if message.text.strip() == "0":
+        await set_setting(SETTINGS_KEY_WELCOME_PHOTO, "")
+        await log_admin_action(message.from_user.id, "welcome_photo", note="o'chirildi")
+        await _panel_edit(bot, state, message, "✅ Admin rasmi o'chirildi.", settings_cancel_menu())
+        await state.clear()
+        return
+    await _panel_edit(bot, state, message, "❌ Rasm (surat) yuboring yoki o'chirish uchun 0 yozing.", settings_cancel_menu())
+
+
+@router_admin.callback_query(F.data == "adm:news")
+async def admin_news_start(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    await refresh_news_url()
+    cur = _NEWS_URL or "— (tugma yashirin)"
+    await _ask(
+        callback, state, AdminPanel.news_url,
+        f"\U0001F4E2 Yangiliklar kanali\n\nJoriy havola: {cur}\n\n"
+        "Yangi havolani yuboring (masalan: https://t.me/kanal_nomi).\n"
+        "Tugmani yashirish uchun: 0 deb yozing.",
+        settings_cancel_menu(),
+    )
+
+
+@router_admin.message(AdminPanel.news_url, is_free_text)
+async def admin_news_receive(message: Message, state: FSMContext, bot):
+    if not await _is_admin(message.from_user.id):
+        return
+    text = message.text.strip()
+    if text == "0":
+        await set_setting(SETTINGS_KEY_NEWS_URL, "")
+        await refresh_news_url()
+        await log_admin_action(message.from_user.id, "news_url", note="yashirildi")
+        await _panel_edit(bot, state, message, "✅ «Yangiliklar kanali» tugmasi yashirildi.", settings_cancel_menu())
+        await state.clear()
+        return
+    if text.startswith("@"):
+        text = "https://t.me/" + text[1:]
+    if not _is_valid_button_url(text):
+        await _panel_edit(bot, state, message,
+                          "❌ Havola noto'g'ri. https://t.me/... ko'rinishida yuboring yoki 0 yozing.",
+                          settings_cancel_menu())
+        return
+    await set_setting(SETTINGS_KEY_NEWS_URL, text)
+    await refresh_news_url()
+    await log_admin_action(message.from_user.id, "news_url", note=text[:100])
+    await _panel_edit(bot, state, message, f"✅ Saqlandi: {text}", settings_cancel_menu())
+    await state.clear()
+
+
+@router_admin.callback_query(F.data == "adm:support")
+async def admin_support_start(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    cur = await get_support_url() or "— (ulanmagan)"
+    await _ask(
+        callback, state, AdminPanel.support_contact,
+        f"\U0001F4AC Qo'llab-quvvatlash admini\n\nJoriy: {cur}\n\n"
+        "Mini App'dagi «Adminga yozish» tugmasi shu foydalanuvchiga ochiladi.\n"
+        "Admin username'ini yuboring (masalan: @admin_username).\n"
+        "Uzish uchun: 0 deb yozing.",
+        settings_cancel_menu(),
+    )
+
+
+@router_admin.message(AdminPanel.support_contact, is_free_text)
+async def admin_support_receive(message: Message, state: FSMContext, bot):
+    if not await _is_admin(message.from_user.id):
+        return
+    text = message.text.strip()
+    if text == "0":
+        await set_setting(SETTINGS_KEY_SUPPORT, "")
+        await log_admin_action(message.from_user.id, "support_contact", note="uzildi")
+        await _panel_edit(bot, state, message, "✅ Admin ulanishi o'chirildi.", settings_cancel_menu())
+        await state.clear()
+        return
+    url = normalize_support_url(text)
+    if not url:
+        await _panel_edit(bot, state, message,
+                          "❌ Username noto'g'ri. Masalan: @admin_username (5–32 belgi, lotin harflari/raqam/_) yoki 0 yozing.",
+                          settings_cancel_menu())
+        return
+    await set_setting(SETTINGS_KEY_SUPPORT, url)
+    await log_admin_action(message.from_user.id, "support_contact", note=url[:100])
+    await _panel_edit(bot, state, message, f"✅ Saqlandi: {url}", settings_cancel_menu())
     await state.clear()
 
 
@@ -8229,19 +8763,1066 @@ class ThrottleMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 
+# ==============================================================
+# MINI APP (Telegram WebApp) — balansni to'ldirish va xaridlar (Stars / Premium / Raqam / UC) API'si
+# ==============================================================
+# Mini App (miniapp.html) shu bot serverining o'zidan /app manzilida ochiladi va /api/... orqali ishlaydi.
+# Kirish: Telegram initData imzosi (BOT_TOKEN bilan HMAC) — alohida login/parol yo'q.
+#
+# MUHIM: initData faqat MENYU tugmasi, INLINE tugma (web_app), to'g'ridan-to'g'ri havola yoki "Main Mini App"
+# orqali ochilganda keladi. Pastki (reply) klaviaturadagi web_app tugmasida u BO'SH bo'ladi — shuning uchun
+# Mini App'ni reply-klaviaturaga QO'SHMANG.
+#
+# Ikki to'ldirish usuli — botdagi bilan BIR XIL mantiq (yangi pul mantiqi yozilmagan, mavjud funksiyalar ishlatiladi):
+#   1. Avto-to'lov  -> AUTOPAY.create_payment / payment_info / cancel. Userbot to'lovni o'zi topadi, balans va
+#                      keshbek Autopay._credit orqali bitta tranzaksiyada qo'shiladi (Mini App faqat holatni so'raydi).
+#   2. Chek (qo'lda)-> topups jadvaliga yoziladi, rasm barcha adminlarga topup_review_menu tugmalari bilan boradi;
+#                      tasdiqlash / rad etish / summani tuzatish — botdagi mavjud topup:* handlerlari.
+#
+# Xaridlar: /api/prices (narxlar) -> /api/buy (Stars / Premium / Raqam / UC; narx serverda qayta hisoblanadi) ->
+#   Raqam uchun /api/number/check va /api/number/refund (SMS kod va pulni qaytarish).
+#
+# Sozlamalar (.env / Render Environment) — hammasi ixtiyoriy:
+#   MINIAPP_URL          Mini App'ning to'liq https manzili. Bo'sh bo'lsa RENDER_EXTERNAL_URL + "/app" olinadi
+#   MINIAPP_FILE         HTML fayl yo'li; standart: bot.py yonidagi miniapp.html
+#   MINIAPP_ORIGINS      HTML BOSHQA domenda turgan bo'lsa, ruxsat etilgan origin'lar (vergul bilan) — CORS uchun
+#   MINIAPP_MENU_BUTTON  "0" bo'lsa, botning menyu tugmasi Mini App'ga almashtirilmaydi
+#
+# >>> MINIAPP BEGIN
+import hashlib
+import hmac
+from urllib.parse import parse_qsl
+
+MINIAPP_FILE = (os.getenv("MINIAPP_FILE", "").strip()
+                or os.path.join(os.path.dirname(os.path.abspath(__file__)), "miniapp.html"))
+MINIAPP_ORIGINS = {o.strip().rstrip("/") for o in os.getenv("MINIAPP_ORIGINS", "").split(",") if o.strip()}
+MINIAPP_AUTH_MAX_AGE = 24 * 3600      # initData shuncha vaqtdan keyin eskirgan hisoblanadi
+MINIAPP_MAX_TOPUP = 100_000_000       # bitta to'ldirish so'rovi uchun eng katta summa (so'm)
+MINIAPP_MAX_PHOTO = 8 * 1024 * 1024   # chek rasmi hajmi (bayt)
+MINIAPP_RECENT_ORDERS = 20            # Mini App'da ko'rsatiladigan oxirgi buyurtmalar soni
+MINIAPP_GRACE = 120                   # avto-to'lov: muddat tugagach ham shuncha soniya xabar qabul qilinadi (Autopay._match bilan bir xil)
+_MA_BOT_KEY = web.AppKey("bot", Bot) if hasattr(web, "AppKey") else "bot"
+
+
+def miniapp_url() -> str:
+    """Mini App'ning ochiladigan https manzili. Sozlanmagan (yoki https bo'lmagan) bo'lsa "" \u2014 Mini App tugmalari
+    umuman ko'rsatilmaydi (https bo'lmagan havolali tugma Telegram'da BUTUN xabarni rad ettirib yuboradi)."""
+    url = os.getenv("MINIAPP_URL", "").strip()
+    if not url:
+        base = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+        if base and os.path.isfile(MINIAPP_FILE):
+            url = base + "/app"
+    return url if url.lower().startswith("https://") else ""
+
+
+def miniapp_verify_init_data(init_data: str, token: str = "", max_age: int = MINIAPP_AUTH_MAX_AGE,
+                             now: Optional[float] = None) -> Optional[dict]:
+    """Telegram Mini App `initData` imzosini BOT_TOKEN bilan tekshiradi (core.telegram.org/bots/webapps#validating-data).
+    Yaroqli bo'lsa Telegram foydalanuvchisi (dict: id, first_name, username...), aks holda None."""
+    token = token or BOT_TOKEN
+    if not init_data or not token or len(init_data) > 8192:
+        return None
+    try:
+        pairs = parse_qsl(init_data, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return None
+    data = dict(pairs)
+    if len(data) != len(pairs):
+        return None                                       # takroriy kalit \u2014 shubhali
+    got = data.pop("hash", "")
+    if not got:
+        return None
+    check = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+    secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc.encode(), got.encode()):
+        return None
+    try:
+        auth_date = int(data.get("auth_date", ""))
+        user = json.loads(data.get("user", ""))
+    except (ValueError, TypeError):
+        return None
+    t = time.time() if now is None else now
+    if auth_date <= 0 or t - auth_date > max_age or auth_date - t > 300:
+        return None                                       # eskirgan yoki kelajakdagi imzo
+    if not isinstance(user, dict) or not isinstance(user.get("id"), int) or isinstance(user.get("id"), bool):
+        return None
+    return user
+
+
+class _MaError(Exception):
+    def __init__(self, status: int, code: str, message: str, **extra):
+        super().__init__(message)
+        self.status, self.code, self.message, self.extra = status, code, message, extra
+
+
+def _ma_json(data: dict, status: int = 200) -> web.Response:
+    return web.json_response(data, status=status, headers={"Cache-Control": "no-store"},
+                             dumps=lambda o: json.dumps(o, ensure_ascii=False))
+
+
+def _ma_full_name(u: dict) -> str:
+    return " ".join(x for x in (u.get("first_name"), u.get("last_name")) if x) or (u.get("username") or "")
+
+
+async def _ma_auth(request: web.Request) -> dict:
+    """initData'ni tekshiradi, so'ng botdagi middleware'lar bilan BIR XIL cheklovlarni qo'llaydi:
+    bloklangan foydalanuvchi va majburiy obuna (adminlar obunadan ozod) \u2014 Mini App ularni chetlab o'tmasin."""
+    user = miniapp_verify_init_data(request.headers.get("X-Init-Data", ""))
+    if user is None:
+        raise _MaError(401, "auth", "Mini App'ni Telegram'da botning menyu tugmasi orqali qayta oching.")
+    uid = user["id"]
+    if await is_banned(uid):
+        raise _MaError(403, "banned", "Hisobingiz bloklangan.")
+    if not await is_registered(uid) and not await _is_admin(uid):
+        raise _MaError(403, "phone", "Avval botda /start bosib, telefon raqamingizni tasdiqlang.")
+    bot = request.app.get(_MA_BOT_KEY)
+    channels = await get_force_sub_channels()
+    if channels and bot is not None and not await _is_admin(uid):
+        if not await is_subscribed(bot, uid, force_refresh=request.query.get("refresh") == "1"):
+            raise _MaError(403, "subscribe", "Botdan foydalanish uchun avval kanalga a'zo bo'ling.",
+                           channels=[{"url": c["url"]} for c in channels if c and c.get("url")])
+    return {**user, "full_name": _ma_full_name(user)}
+
+
+def _ma_route(fn):
+    """API handler o'rami: autentifikatsiya + xatolarni (kutilmaganlarini ham) JSON ko'rinishida qaytarish."""
+    @functools.wraps(fn)
+    async def wrapper(request: web.Request) -> web.StreamResponse:
+        try:
+            user = await _ma_auth(request)
+            return await fn(request, user)
+        except _MaError as e:
+            return _ma_json({"ok": False, "error": e.code, "message": e.message, **e.extra}, e.status)
+        except web.HTTPException:
+            raise
+        except Exception:
+            logging.exception("miniapp: %s %s", request.method, request.path)
+            return _ma_json({"ok": False, "error": "server",
+                             "message": "Server xatosi. Birozdan so'ng qayta urinib ko'ring."}, 500)
+    return wrapper
+
+
+@web.middleware
+async def _ma_cors_middleware(request: web.Request, handler):
+    """CORS faqat MINIAPP_ORIGINS'da ko'rsatilgan origin'lar uchun (HTML boshqa domenda turgan holat). Bo'sh bo'lsa
+    hech narsa qo'shilmaydi \u2014 sahifa va API bir domenda (same-origin) ishlaydi."""
+    is_api = request.path.startswith("/api/")
+    exc: Optional[web.HTTPException] = None
+    if is_api and request.method == "OPTIONS":
+        resp = web.Response(status=204)
+    else:
+        try:
+            resp = await handler(request)
+        except web.HTTPException as e:       # 404/405 kabi javoblarga ham CORS sarlavhalari qo'shiladi
+            resp, exc = e, e
+    origin = request.headers.get("Origin", "").rstrip("/")
+    if is_api and origin and origin in MINIAPP_ORIGINS:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Init-Data"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Max-Age"] = "600"
+    if exc is not None:
+        raise exc
+    return resp
+
+
+# ---- yordamchilar: so'rov cheklovi, takroriy yuborishdan himoya ----
+_MA_HITS: Dict[tuple, list] = {}
+_MA_IDEM: Dict[tuple, tuple] = {}
+_MA_BUY_IDEM: Dict[tuple, dict] = {}   # (user_id, token) -> {"fp", "fut", "ts"}: /api/buy ni qayta yuborishdan himoya
+_MA_BUY_TOKEN_RE = re.compile(r"[A-Za-z0-9\-]{8,64}")
+_MA_BUY_IDEM_TTL = 900                 # soniya: shundan keyin token eskiradi (chek tokenidagi bilan bir xil)
+_MA_LOCKS: Dict[int, asyncio.Lock] = {}
+_MA_BOT_NAME: list = []              # botning username'i (bir marta olinadi) — referal havolasi uchun
+
+
+def _ma_rate_ok(uid: int, bucket: str, limit: int, window: float) -> bool:
+    """Bir foydalanuvchidan `window` soniyada ko'pi bilan `limit` ta so'rov (xotirada; qayta ishga tushsa tozalanadi)."""
+    now = time.monotonic()
+    hits = [t for t in _MA_HITS.get((uid, bucket), ()) if now - t < window]
+    ok = len(hits) < limit
+    if ok:
+        hits.append(now)
+    _MA_HITS[(uid, bucket)] = hits
+    if len(_MA_HITS) > 5000:
+        for k in [k for k, v in _MA_HITS.items() if not v or now - v[-1] > 3600]:
+            _MA_HITS.pop(k, None)
+    return ok
+
+
+async def _ma_touch(user: dict) -> None:
+    """Foydalanuvchi bazada bo'lishi SHART: aks holda balans qo'shish (UPDATE users ...) hech narsani o'zgartirmaydi \u2014
+    pul "yo'qolib" qoladi. Botda buni /start qiladi; Mini App /start'siz ochilishi mumkin."""
+    await ensure_user(user["id"], user.get("username"), user["full_name"])
+
+
+async def _ma_body(request: web.Request) -> dict:
+    try:
+        data = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        data = None
+    if not isinstance(data, dict):
+        raise _MaError(400, "bad_json", "So'rov noto'g'ri.")
+    return data
+
+
+def _ma_amount(value) -> int:
+    if isinstance(value, bool):
+        raise _MaError(400, "amount", "Summani to'g'ri kiriting.")
+    try:
+        n = int(str(value).strip().replace(" ", ""))
+    except (TypeError, ValueError):
+        raise _MaError(400, "amount", "Summani to'g'ri kiriting.")
+    if n < MIN_TOPUP:
+        raise _MaError(400, "amount_min", f"Eng kam summa: {fmt_money(MIN_TOPUP)} so'm.")
+    if n > MINIAPP_MAX_TOPUP:
+        raise _MaError(400, "amount_max", f"Eng ko'p summa: {fmt_money(MINIAPP_MAX_TOPUP)} so'm.")
+    return n
+
+
+def _ma_pay_json(p: "ApPayment") -> dict:
+    return {"id": p.id, "amount": p.amount, "base": p.base, "extra": p.amount - p.base,
+            "card_number": ap_fmt_card(p.card_number), "card_raw": re.sub(r"\D", "", p.card_number) or p.card_number,
+            "card_holder": p.card_holder, "expires_at": p.expires_at, "ttl_min": p.ttl_min,
+            "server_time": int(time.time()), "grace": MINIAPP_GRACE}
+
+
+_MA_ORDER_TYPE = {"number": "raqam", "stars": "stars", "premium": "premium", "uc": "uc"}
+_MA_ORDER_STATUS = {"done": "ok", "refunded": "ref", "failed": "bad", "error": "bad"}   # qolgani \u2014 "wait" (jarayonda)
+
+
+def _ma_when(ts: int) -> str:
+    now = datetime.now(LOCAL_TZ)
+    dt = datetime.fromtimestamp(int(ts), LOCAL_TZ)
+    hm = dt.strftime("%H:%M")
+    if dt.date() == now.date():
+        return f"Bugun, {hm}"
+    if dt.date() == (now - timedelta(days=1)).date():
+        return f"Kecha, {hm}"
+    return dt.strftime("%d.%m.%Y, ") + hm
+
+
+def _ma_order(row) -> dict:
+    keys = list(row.keys())
+    otype = row["order_type"]
+    qty = row["qty"] if "qty" in keys else None
+    if otype == "stars":
+        label = f"{fmt_money(qty)} Stars" if qty else "Stars"
+    elif otype == "premium":
+        label = f"Premium, {qty} oy" if qty else "Premium"
+    elif otype == "uc":
+        label = f"{fmt_money(qty)} UC" if qty else "PUBG UC"
+    else:
+        country = row["country"] if "country" in keys else None
+        label = f"Raqam, {country_display_name(country)}" if country else "Raqam"
+    return {"id": row["id"], "t": _MA_ORDER_TYPE.get(otype, "topup"), "w": label, "d": _ma_when(row["created_at"]),
+            "p": int(row["price"]), "s": _MA_ORDER_STATUS.get(row["status"], "wait")}
+
+
+def _ma_sniff_image(data: bytes) -> Optional[str]:
+    """Haqiqiy rasm ekanini fayl sarlavhasidan aniqlaydi (mijoz aytgan turga ishonilmaydi). Telegram sendPhoto qabul qiladiganlar."""
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return None
+
+
+# ---- sahifa ----
+_MA_PAGE_CACHE: list = [None, 0.0, b""]      # [fayl yo'li, o'zgargan vaqti, mazmuni] - fayl o'zgarsagina qayta o'qiladi
+
+
+async def _ma_page(request: web.Request) -> web.Response:
+    try:
+        mtime = os.path.getmtime(MINIAPP_FILE)
+        if _MA_PAGE_CACHE[0] != MINIAPP_FILE or _MA_PAGE_CACHE[1] != mtime:
+            with open(MINIAPP_FILE, "rb") as f:
+                _MA_PAGE_CACHE[:] = [MINIAPP_FILE, mtime, f.read()]
+        body = _MA_PAGE_CACHE[2]
+    except OSError:
+        return web.Response(status=404, text="miniapp.html topilmadi (bot.py yoniga qo'ying yoki MINIAPP_FILE ni sozlang).")
+    resp = web.Response(body=body, content_type="text/html", charset="utf-8",
+                        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+                                 "Referrer-Policy": "no-referrer"})
+    resp.enable_compression()                # telefon sekin tarmoqda ham sahifa tez ochiladi
+    return resp
+
+
+# ---- API ----
+@_ma_route
+async def _ma_api_me(request: web.Request, user: dict) -> web.Response:
+    uid = user["id"]
+    await _ma_touch(user)
+    now = int(time.time())
+    balance = await get_balance(uid)
+    orders = []
+    for row in await list_orders(uid, limit=MINIAPP_RECENT_ORDERS):
+        try:
+            orders.append(_ma_order(row))
+        except Exception:
+            logging.exception("miniapp: buyurtma qatorini o'qib bo'lmadi")
+    open_payment = None
+    async with _ap_conn() as tx:
+        total = int(await tx.scalar("SELECT COUNT(*) FROM orders WHERE user_id = ?", uid) or 0)
+        pending = int(await tx.scalar("SELECT COUNT(*) FROM topups WHERE user_id = ? AND status = 'pending'", uid) or 0)
+        try:        # avto-to'lov jadvallari yaratilmagan bo'lsa (AUTOPAY.init() xato bergan) \u2014 shunchaki yo'q deb olinadi
+            row = await tx.fetchone(
+                "SELECT p.id, p.exact_amount, p.base_amount, p.expires_at, c.number AS card_number, c.holder AS card_holder "
+                "FROM autopay_payments p LEFT JOIN autopay_cards c ON c.id = p.card_id "
+                "WHERE p.user_id = ? AND p.status = 'pending' AND p.expires_at > ? ORDER BY p.id DESC LIMIT 1", uid, now)
+        except Exception:
+            row = None
+    if row and row["card_number"]:
+        open_payment = {"id": row["id"], "amount": row["exact_amount"], "base": row["base_amount"],
+                        "extra": row["exact_amount"] - row["base_amount"],
+                        "card_number": ap_fmt_card(row["card_number"]),
+                        "card_raw": re.sub(r"\D", "", row["card_number"]) or row["card_number"],
+                        "card_holder": row["card_holder"] or "", "expires_at": row["expires_at"],
+                        "ttl_min": AUTOPAY_DEFAULT_TTL_MIN, "server_time": now, "grace": MINIAPP_GRACE}
+    try:
+        ap_ready, ttl = await AUTOPAY.is_ready(), await AUTOPAY.ttl_minutes()
+    except Exception:
+        ap_ready, ttl = False, AUTOPAY_DEFAULT_TTL_MIN
+    if open_payment:
+        open_payment["ttl_min"] = ttl
+    card_number, card_holder = await get_card_info()
+    referral = None
+    try:
+        bot = request.app.get(_MA_BOT_KEY)
+        if bot is not None:
+            if not _MA_BOT_NAME:
+                _MA_BOT_NAME.append((await bot.get_me()).username or "")
+            if _MA_BOT_NAME[0]:
+                stats = await get_referral_stats(uid)
+                referral = {"link": f"https://t.me/{_MA_BOT_NAME[0]}?start=ref{uid}", "invited": stats["invited"],
+                            "earned": stats["earned"], "percent": REFERRAL_CASHBACK_PERCENT}
+    except Exception:
+        logging.exception("miniapp: referal ma'lumotini olib bo'lmadi")
+    return _ma_json({
+        "ok": True,
+        "referral": referral,
+        "user": {"id": uid, "name": user.get("first_name") or user.get("username") or "Foydalanuvchi",
+                 "username": user.get("username") or ""},
+        "balance": balance, "orders": orders, "orders_total": total, "pending_topups": pending,
+        "min_topup": MIN_TOPUP, "max_topup": MINIAPP_MAX_TOPUP,
+        "autopay": {"ready": ap_ready, "ttl_min": ttl},
+        "card": {"number": card_number, "holder": card_holder},
+        "support": {"url": await get_support_url()},
+        "open_payment": open_payment, "server_time": now})
+
+
+@_ma_route
+async def _ma_api_auto_create(request: web.Request, user: dict) -> web.Response:
+    """Avto-to'lov so'rovi: unikal summa + karta (botdagi _autopay_offer bilan bir xil AUTOPAY.create_payment)."""
+    uid = user["id"]
+    amount = _ma_amount((await _ma_body(request)).get("amount"))
+    if not _ma_rate_ok(uid, "auto", 12, 600):
+        raise _MaError(429, "rate", "Juda ko'p urinish. Bir necha daqiqadan so'ng qayta urinib ko'ring.")
+    await _ma_touch(user)
+    try:
+        if not await AUTOPAY.is_ready():
+            raise _MaError(409, "autopay_unavailable", "Avto-to'lov hozir mavjud emas. Chek yuborish usulidan foydalaning.")
+        pay = await AUTOPAY.create_payment(uid, amount)
+    except ApTooBusy:
+        raise _MaError(503, "busy", "Hozir band. Birozdan so'ng qayta urinib ko'ring yoki chek yuboring.")
+    except _MaError:
+        raise
+    except Exception:
+        logging.exception("miniapp: avto-to'lov yaratib bo'lmadi")
+        raise _MaError(409, "autopay_unavailable", "Avto-to'lov hozir mavjud emas. Chek yuborish usulidan foydalaning.")
+    return _ma_json({"ok": True, "payment": _ma_pay_json(pay)})
+
+
+@_ma_route
+async def _ma_api_auto_status(request: web.Request, user: dict) -> web.Response:
+    try:
+        pid = int(request.query.get("id", ""))
+    except ValueError:
+        raise _MaError(400, "bad_id", "So'rov noto'g'ri.")
+    info = await AUTOPAY.payment_info(pid)
+    if not info or info["user_id"] != user["id"]:
+        raise _MaError(404, "not_found", "So'rov topilmadi.")
+    out = {"ok": True, "id": pid, "status": info["status"], "amount": info["exact_amount"],
+           "expires_at": info["expires_at"], "server_time": int(time.time()), "grace": MINIAPP_GRACE}
+    if info["status"] == "paid":
+        out["balance"] = await get_balance(user["id"])
+    return _ma_json(out)
+
+
+@_ma_route
+async def _ma_api_auto_cancel(request: web.Request, user: dict) -> web.Response:
+    try:
+        pid = int((await _ma_body(request)).get("id"))
+    except (TypeError, ValueError):
+        raise _MaError(400, "bad_id", "So'rov noto'g'ri.")
+    cancelled = await AUTOPAY.cancel(pid, user["id"])        # faqat o'zining 'pending' to'lovini; to'langan bo'lsa tegmaydi
+    info = await AUTOPAY.payment_info(pid)
+    status = info["status"] if info and info["user_id"] == user["id"] else "cancelled"
+    return _ma_json({"ok": True, "cancelled": cancelled, "status": status})
+
+
+async def _ma_read_part(part, limit: int, message: str) -> bytes:
+    buf = bytearray()
+    while True:
+        chunk = await part.read_chunk(64 * 1024)
+        if not chunk:
+            return bytes(buf)
+        buf += chunk
+        if len(buf) > limit:
+            raise _MaError(413, "too_big", message)
+
+
+async def _ma_send_receipt(bot, admin_id: int, data: bytes, ext: str, caption: str, markup):
+    """Chekni BIR adminga yuklab yuboradi; (file_id, "photo"|"document") qaytaradi. Telegram rasmni rad etsa
+    (masalan, o'lchami noto'g'ri) \u2014 fayl sifatida yuboriladi."""
+    try:
+        msg = await bot.send_photo(admin_id, BufferedInputFile(data, filename=f"check.{ext}"),
+                                   caption=caption, reply_markup=markup)
+        return msg.photo[-1].file_id, "photo"
+    except TelegramBadRequest as e:
+        if "PHOTO_" not in str(e).upper() and "IMAGE_PROCESS" not in str(e).upper():
+            raise
+    msg = await bot.send_document(admin_id, BufferedInputFile(data, filename=f"check.{ext}"),
+                                  caption=caption, reply_markup=markup)
+    return msg.document.file_id, "document"
+
+
+@_ma_route
+async def _ma_api_manual(request: web.Request, user: dict) -> web.Response:
+    """Qo'lda to'ldirish: chek rasmi Mini App orqali adminlarga boradi (botdagi topup_photo bilan bir xil natija)."""
+    uid = user["id"]
+    if "multipart/" not in request.headers.get("Content-Type", "").lower():
+        raise _MaError(400, "bad_request", "So'rov noto'g'ri.")
+    if not _ma_rate_ok(uid, "manual_in", 20, 600):      # katta fayllarni takror-takror yuklab, serverni band qilishdan himoya
+        raise _MaError(429, "rate", "Juda ko'p so'rov yubordingiz. Bir necha daqiqadan so'ng qayta urinib ko'ring.")
+    fields: Dict[str, str] = {}
+    photo = b""
+    reader = await request.multipart()
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == "photo":
+            photo = await _ma_read_part(part, MINIAPP_MAX_PHOTO, "Rasm hajmi 8 MB dan oshmasligi kerak.")
+        elif part.name in ("amount", "token", "payment_id"):
+            fields[part.name] = (await _ma_read_part(part, 64, "So'rov noto'g'ri.")).decode("utf-8", "ignore").strip()
+    amount = _ma_amount(fields.get("amount"))
+    ext = _ma_sniff_image(photo)
+    if not photo:
+        raise _MaError(400, "no_photo", "Chek rasmini yuklang.")
+    if ext is None:
+        raise _MaError(415, "bad_image", "Rasm formati mos emas. JPG yoki PNG rasm yuboring.")
+    token = fields.get("token", "")
+    token = token if re.fullmatch(r"[A-Za-z0-9\-]{8,64}", token) else ""
+
+    lock = _MA_LOCKS.setdefault(uid, asyncio.Lock())
+    async with lock:
+        if token:        # tarmoq uzilib, mijoz BIR XIL chekni qayta yuborsa \u2014 ikkinchi so'rov yaratilmaydi
+            prev = _MA_IDEM.get((uid, token))
+            if prev and time.monotonic() - prev[1] < 900:
+                return _ma_json({"ok": True, "topup_id": prev[0], "duplicate": True, "pending_topups": prev[2]})
+        if not _ma_rate_ok(uid, "manual", 5, 600):
+            raise _MaError(429, "rate", "Juda ko'p so'rov yubordingiz. Bir necha daqiqadan so'ng qayta urinib ko'ring.")
+        bot = request.app.get(_MA_BOT_KEY)
+        admin_ids = list(dict.fromkeys([*ADMIN_IDS, *await get_extra_admin_ids()]))
+        if bot is None or not admin_ids:
+            raise _MaError(503, "no_admin", "Hozircha chek qabul qilib bo'lmaydi. Keyinroq urinib ko'ring.")
+        await _ma_touch(user)
+
+        topup_id = await create_topup(uid, amount, None)
+        other = await count_other_pending_topups(uid, topup_id)
+        caption = (
+            f"\U0001F195 Balans to'ldirish so'rovi\n"
+            f"\U0001F464 {user['full_name']} (ID: {uid})\n"
+            f"\U0001F4B0 Summa: {fmt_money(amount)} so'm\n"
+            f"\U0001F522 So'rov ID: {topup_id}\n"
+            f"\U0001F4F1 Mini App orqali"
+        )
+        if other:
+            caption += duplicate_topup_warning(other)
+        markup = topup_review_menu(topup_id)
+        sent, ref = 0, None
+        for admin_id in admin_ids:
+            try:
+                if ref is None:
+                    ref = await _ma_send_receipt(bot, admin_id, photo, ext, caption, markup)
+                elif ref[1] == "photo":
+                    await bot.send_photo(admin_id, ref[0], caption=caption, reply_markup=markup)
+                else:
+                    await bot.send_document(admin_id, ref[0], caption=caption, reply_markup=markup)
+                sent += 1
+            except Exception as e:
+                logging.warning("miniapp: chekni adminga (%s) yuborib bo'lmadi: %r", admin_id, e)
+        if sent == 0:    # hech bir admin ko'rmadi \u2014 so'rov "osilib" qolmasin
+            await set_topup_status(topup_id, "rejected", expected_current="pending")
+            raise _MaError(502, "no_delivery", "Chekni adminga yetkazib bo'lmadi. Birozdan so'ng qayta urinib ko'ring.")
+        try:
+            async with _ap_tx() as tx:
+                await tx.execute("UPDATE topups SET photo_file_id = ? WHERE id = ?", ref[0], topup_id)
+        except Exception:
+            logging.exception("miniapp: chek file_id'sini saqlab bo'lmadi (topup #%s)", topup_id)
+
+        pid_raw = fields.get("payment_id", "")
+        if pid_raw.isdigit():    # foydalanuvchi avto-to'lovdan qo'lda usulga o'tgan \u2014 ochiq avto-so'rov bekor qilinadi (botdagi apay:manual kabi)
+            try:
+                await AUTOPAY.cancel(int(pid_raw), uid)
+            except Exception:
+                logging.exception("miniapp: avto-to'lovni bekor qilib bo'lmadi")
+        try:
+            await bot.send_message(uid, TOPUP_SENT_TO_ADMIN)
+        except Exception:
+            pass
+        pending = int(await _ma_scalar("SELECT COUNT(*) FROM topups WHERE user_id = ? AND status = 'pending'", uid) or 0)
+        if token:
+            if len(_MA_IDEM) > 2000:
+                _MA_IDEM.clear()
+            _MA_IDEM[(uid, token)] = (topup_id, time.monotonic(), pending)
+        if len(_MA_LOCKS) > 5000:
+            for k in [k for k, v in _MA_LOCKS.items() if not v.locked() and k != uid]:
+                _MA_LOCKS.pop(k, None)
+    return _ma_json({"ok": True, "topup_id": topup_id, "pending_topups": pending})
+
+
+async def _ma_scalar(sql: str, *args):
+    async with _ap_conn() as tx:
+        return await tx.scalar(sql, *args)
+
+
+_MA_LABEL = {"stars": "Stars", "premium": "Premium", "number": "Raqam", "uc": "UC"}
+_MA_FETCH_ERRORS = _FETCH_ERRORS + _UC_FETCH_ERRORS
+
+
+@_ma_route
+async def _ma_api_prices(request: web.Request, user: dict) -> web.Response:
+    """Mini App uchun narxlar (botdagi bilan bir xil). ?k=number (davlatlar) | uc (tariflar) | boshqasi: Stars/Premium."""
+    k = request.query.get("k", "")
+    try:
+        if k == "number":
+            mult = _markup_multiplier(await get_markup_percent("number"))
+            _, countries = await _fetch_countries_with_fallback(1, 2)
+            out = []
+            for code, info in countries.items():
+                p = (info or {}).get("price")
+                if isinstance(p, (int, float)) and round(float(p) * mult) > 0:
+                    out.append({"c": code, "n": country_display_name(code), "f": country_flag(code) or "",
+                                "p": round(float(p) * mult)})
+            out.sort(key=lambda x: x["n"])
+            return _ma_json({"ok": True, "countries": out})
+        if k == "uc":
+            return _ma_json({"ok": True, "uc": [{"id": t["tariff_id"], "uc": t["total_uc"], "p": t["price"]}
+                                                for t in await load_uc_tariffs()]})
+        prices = await client.get_prices()
+        star = await with_markup(prices["stars"]["price_per_star"] * 1000, "stars")
+        prem = {str(m): await with_markup(prices["premium"][str(m)]["price"], "premium") for m in (3, 6, 12)}
+    except _MA_FETCH_ERRORS as e:
+        raise _MaError(503, "prices", f"Narxlarni olib bo'lmadi: {_err_text(e)}")
+    return _ma_json({"ok": True, "star": star / 1000, "premium": prem, "min_stars": MIN_STARS})
+
+
+@_ma_route
+async def _ma_api_buy(request: web.Request, user: dict) -> web.Response:
+    """Xarid + takroriy yuborishdan himoya. Mijoz har bir xarid uchun bitta `token` yuboradi: tarmoq uzilib, ayni
+    so'rov qayta yuborilsa, ikkinchi marta pul yechilmaydi — birinchi so'rovning natijasi qaytariladi (agar birinchisi
+    hali ketayotgan bo'lsa, tugashini kutadi). Token bo'lmasa — avvalgidek ishlaydi.
+    Token FAQAT pul ushlab qolingan holatlarda (muvaffaqiyat yoki natija noma'lum) saqlanadi; rad etilgan/qaytarilgan
+    xaridda bo'shatiladi — qayta urinish yangidan bajariladi. Xotirada turadi: server qayta ishga tushsa tozalanadi."""
+    uid = user["id"]
+    body = await _ma_body(request)
+    token = body.get("token")
+    if not (isinstance(token, str) and _MA_BUY_TOKEN_RE.fullmatch(token)):
+        return await _ma_buy_core(request, user, body)
+    key = (uid, token)
+    fp = (str(body.get("kind")), str(body.get("username") or "").strip().lstrip("@").lower(), str(body.get("amount")))
+    now = time.monotonic()
+    prev = _MA_BUY_IDEM.get(key)
+    if prev and prev["fut"].done() and now - prev["ts"] > _MA_BUY_IDEM_TTL:
+        _MA_BUY_IDEM.pop(key, None)
+        prev = None
+    if prev:
+        if prev["fp"] != fp:            # bitta token — bitta xarid; boshqa xarid uchun mijoz yangi token oladi
+            raise _MaError(409, "token", "So'rov noto'g'ri. Sahifani qayta oching.")
+        try:
+            payload, err = await asyncio.wait_for(asyncio.shield(prev["fut"]), 55)
+        except asyncio.TimeoutError:
+            raise _MaError(409, "busy", "Buyurtma bajarilmoqda, biroz kuting.")
+        if err is not None:
+            raise err
+        return _ma_json({**payload, "duplicate": True, "balance": await get_balance(uid)})
+    # Birinchi so'rov. Yozuv shu yerda, hech qanday await'siz qo'yiladi — bir vaqtda kelgan ikkinchi so'rov uni ko'radi.
+    fut = asyncio.get_running_loop().create_future()
+    _MA_BUY_IDEM[key] = {"fp": fp, "fut": fut, "ts": now}
+    try:
+        resp = await _ma_buy_core(request, user, body)
+    except _MaError as e:
+        _MA_BUY_IDEM.pop(key, None)     # pul yechilmagan yoki qaytarilgan — token bo'shatiladi
+        fut.set_result((None, e))
+        raise
+    except BaseException as e:
+        # Natija noma'lum (pul yechilgan bo'lishi mumkin): token SAQLANADI, qayta urinish ikkinchi marta yechmaydi.
+        unknown = _MaError(409, "unknown", "Natija noma'lum. «Buyurtmalar» bo'limini tekshiring.")
+        fut.set_result((None, unknown))
+        if isinstance(e, Exception):
+            logging.exception("miniapp: /api/buy natijasi noma'lum (token saqlandi)")
+            raise unknown from e
+        raise
+    fut.set_result((json.loads(resp.text), None))
+    _MA_BUY_IDEM[key]["ts"] = time.monotonic()
+    if len(_MA_BUY_IDEM) > 2000:        # faqat tugagan va eskirganlari; jarayondagi so'rovlarga tegilmaydi
+        t = time.monotonic()
+        for k in [k for k, v in _MA_BUY_IDEM.items() if v["fut"].done() and t - v["ts"] > _MA_BUY_IDEM_TTL]:
+            _MA_BUY_IDEM.pop(k, None)
+    return resp
+
+
+async def _ma_buy_core(request: web.Request, user: dict, body: dict) -> web.Response:
+    """Stars / Premium / Raqam / UC xaridi. Narx har doim SERVERDA qayta hisoblanadi (mijoz narxiga ishonilmaydi);
+    keyin botdagi confirm_* bilan BIR XIL tartib: atomik yechish -> write-ahead buyurtma -> SmmUpper (idempotent)."""
+    uid = user["id"]
+    kind = body.get("kind")
+    if kind not in _MA_LABEL:
+        raise _MaError(400, "kind", "Bu xizmat Mini App'da mavjud emas. Botdan foydalaning.")
+    bot = request.app.get(_MA_BOT_KEY)
+    if bot is None:
+        raise _MaError(503, "server", "Xizmat hozir mavjud emas. Botdan foydalaning.")
+    if not _ma_rate_ok(uid, "buy", 20, 600):
+        raise _MaError(429, "rate", "Juda ko'p urinish. Bir necha daqiqadan so'ng qayta urinib ko'ring.")
+    username = qty = country = server = tariff = None
+    try:
+        if kind in ("stars", "premium"):
+            username = str(body.get("username") or "").strip().lstrip("@")
+            if not USERNAME_RE.match(username):
+                raise _MaError(400, "username", "Username noto'g'ri ko'rinadi (masalan: durov).")
+            qty = int(body.get("amount"))
+            if kind == "stars" and not (MIN_STARS <= qty <= 1_000_000):
+                raise _MaError(400, "amount", f"Minimal miqdor — {MIN_STARS} ta Stars.")
+            if kind == "premium" and qty not in (3, 6, 12):
+                raise _MaError(400, "amount", "Muddatni tanlang (3, 6 yoki 12 oy).")
+            prices = await client.get_prices()
+            base = prices["stars"]["price_per_star"] * qty if kind == "stars" else prices["premium"][str(qty)]["price"]
+            price = await with_markup(base, kind)
+        elif kind == "number":
+            country = str(body.get("amount") or "").strip()
+            server, countries = await _fetch_countries_with_fallback(1, 2)
+            info = countries.get(country)
+            price = await with_markup(info.get("price"), "number") if info else 0
+        else:
+            username = re.sub(r"\s+", "", str(body.get("username") or ""))
+            if not UC_ID_RE.match(username):
+                raise _MaError(400, "username", "PUBG ID noto'g'ri (faqat raqam, 6–12 xona).")
+            tid = int(body.get("amount"))
+            tariff = next((t for t in await load_uc_tariffs() if t["tariff_id"] == tid), None)
+            price = tariff["price"] if tariff else 0
+    except _MA_FETCH_ERRORS as e:
+        raise _MaError(503, "prices", f"Narxlarni olib bo'lmadi: {_err_text(e)}")
+    except (TypeError, ValueError):
+        raise _MaError(400, "amount", "Tanlovni tekshiring.")
+    if price <= 0:                       # bot ham 0 so'mlik xaridga yo'l qo'ymaydi
+        raise _MaError(409, "unavailable", "Bu variant hozir mavjud emas — ro'yxatni yangilab, qayta tanlang.")
+    try:
+        shown = int(body.get("price") or 0)
+    except (TypeError, ValueError):
+        shown = 0
+    if shown and abs(price - shown) > max(2, price * 0.02):
+        raise _MaError(409, "price_changed", "Narx o'zgardi. Qayta urinib ko'ring.", price=price)
+    if uid in _purchase_inflight:        # tekshirish va qo'shish orasida await yo'q — atomik
+        raise _MaError(409, "busy", "Buyurtma bajarilmoqda, biroz kuting.")
+    _purchase_inflight.add(uid)
+    try:
+        return await _ma_do_buy(bot, uid, kind, price, username=username, qty=qty, server=server,
+                                country=country, tariff=tariff)
+    finally:
+        _purchase_inflight.discard(uid)
+
+
+async def _ma_do_buy(bot, uid: int, kind: str, price: int, *, username=None, qty=None, server=None,
+                     country=None, tariff=None) -> web.Response:
+    label, uc = _MA_LABEL[kind], kind == "uc"
+    if not await try_deduct_balance(uid, price):
+        raise _MaError(402, "balance", "Balansingiz yetarli emas.", balance=await get_balance(uid))
+    request_id = new_request_id()
+    details = {"request_id": request_id, "unsent": True}
+    if uc:
+        details.update({"tariff_id": tariff["tariff_id"], "account_id": username, "total_uc": tariff["total_uc"]})
+    try:
+        order_pk = await create_order(
+            user_id=uid, order_type=kind, ref=None, server=server, price=price, details=details, status="processing",
+            country=country, target_username=None if uc else username,
+            qty=(tariff["total_uc"] or None) if uc else qty)
+    except Exception:
+        logging.exception("miniapp: %s buyurtmasini yozib bo'lmadi — pul qaytarildi", kind)
+        await change_balance(uid, price)
+        raise _MaError(500, "server", "Vaqtinchalik xatolik. Pulingiz balansga qaytarildi, qayta urinib ko'ring.")
+    pending = _ma_json({"ok": True, "status": "wait", "order_id": order_pk, "price": price,
+                        "balance": await get_balance(uid)})
+    who = f"Foydalanuvchi ID: {uid}, summa: {fmt_money(price)} so'm. Buyurtma: #{order_pk}. request_id: {request_id}"
+    try:
+        if uc:
+            result = await _call_idempotent(client.buy_uc, tariff["tariff_id"], username, request_id=request_id)
+            if not result.get("order_id"):
+                raise PurchaseUnknownError(request_id, "javobda order_id yo'q")
+        else:
+            result = await _send_purchase_request(kind, request_id, server=server, country=country,
+                                                  target_username=username, qty=qty)
+    except PurchaseUnknownError:
+        if uc:       # UC: pul yo'qolmaydi — buyurtma 'processing' qoladi, fon jarayoni shu request_id bilan qayta uradi
+            await _uc_alert_admins(bot, f"\u26A0\uFE0F UC (Mini App): SmmUpper javobi olinmadi. {who}\nBot avtomatik qayta uradi.")
+            return pending
+        if not await refund_order(order_pk):
+            return pending                  # shu orada fon jarayoni yakunlagan — qayta qaytarilmaydi
+        await _uc_alert_admins(bot, f"\u26A0\uFE0F {label} xaridi (Mini App): SmmUpper javobi olinmadi. {who}\n"
+                                    "Pul foydalanuvchiga qaytarildi; xarid SmmUpper'da bajarilgan bo'lishi ham mumkin — panelda tekshiring.")
+        raise _MaError(502, "unknown", "SmmUpper bilan aloqa uzildi. Pulingiz balansga qaytarildi, birozdan so'ng qayta urinib ko'ring.")
+    except SmmUpperError as e:
+        refunded = bool(await refund_order(order_pk)) if uc else await discard_unsent_order(order_pk)
+        raise _MaError(400, "rejected", f"{e.message}" + (" Pulingiz balansga qaytarildi." if refunded else ""))
+    except Exception as e:
+        logging.error("miniapp: %s #%s kutilmagan xato: %r", label, order_pk, e, exc_info=e)
+        await _uc_alert_admins(bot, f"\u26A0\uFE0F {label} (Mini App): kutilmagan xato ({type(e).__name__}). {who}\n"
+                                    "Bot shu request_id bilan avtomatik qayta uradi (takroriy xarid bo'lmaydi).")
+        return pending                      # pul yo'qolmaydi: fon jarayoni yakunlaydi yoki qaytaradi
+    number = None
+    if uc:
+        info = await _uc_apply_buy_result(bot, order_pk, result)
+        if info is None:
+            info = {"order_id": result.get("order_id"), "price": price, "total_uc": tariff["total_uc"] or 0,
+                    "status": "processing", "account_id": username}
+        try:
+            await bot.send_message(uid, _uc_success_text(info, order_pk))
+        except Exception:
+            logging.exception("miniapp: UC #%s tasdiq xabarini yuborib bo'lmadi", order_pk)
+    else:
+        order = {"order_type": kind, "user_id": uid, "server": server, "country": country,
+                 "target_username": username, "qty": qty}
+        try:
+            info = await _apply_purchase_result(order_pk, result)
+        except Exception:
+            logging.exception("miniapp: %s #%s natijani yozib bo'lmadi", label, order_pk)
+            info = {"price": price, "ref": _purchase_ref(kind, result)}
+        if info is not None:
+            async def _send(text, **kwargs):
+                return await bot.send_message(uid, text, **kwargs)
+            try:
+                await _announce_purchase(bot, order_pk, order, result, info, buyer=await _uc_buyer_name(bot, uid), send=_send)
+            except Exception:
+                logging.exception("miniapp: %s #%s xabar yuborib bo'lmadi", label, order_pk)
+        if kind == "number" and info:
+            number = info.get("ref")
+    return _ma_json({"ok": True, "status": "ok", "order_id": order_pk, "price": (info or {}).get("price", price),
+                     "balance": await get_balance(uid), "number": number})
+
+
+# ---- Raqam: SMS kodni tekshirish va pulni qaytarish (botdagi numcheck / numrefund bilan bir xil qoidalar) ----
+async def _ma_number_row(uid: int, raw_id):
+    try:
+        oid = int(raw_id)
+    except (TypeError, ValueError):
+        raise _MaError(404, "not_found", "Buyurtma topilmadi.")
+    row = await get_order_row(oid)
+    if not row or row["user_id"] != uid or row["order_type"] != "number":
+        raise _MaError(404, "not_found", "Buyurtma topilmadi.")
+    return oid, row
+
+
+async def _ma_claim_code(oid: int, row, data: dict):
+    """Kod kelgan bo'lsa buyurtmani ATOMIK 'done' qiladi (kod va pul ikkalasi birga berilmasligi uchun)."""
+    code = data.get("code")
+    if not (data.get("success") and code):
+        return None
+    result = json.loads(row["details"]) if row["details"] else {}
+    pw = data.get("password") or ""
+    if not await _set_order_status_if(oid, "processing", "done", {**result, "code": code, "password": pw}):
+        raise _MaError(409, "closed", "Bu buyurtma allaqachon yakunlangan (pul qaytarilgan bo'lishi mumkin).")
+    return {"ok": True, "status": "done", "code": str(code), "password": str(pw)}
+
+
+@_ma_route
+async def _ma_api_number_check(request: web.Request, user: dict) -> web.Response:
+    uid = user["id"]
+    oid, row = await _ma_number_row(uid, (await _ma_body(request)).get("id"))
+    if not _ma_rate_ok(uid, "ncheck", 200, 600):
+        raise _MaError(429, "rate", "Juda ko'p so'rov. Birozdan so'ng qayta urinib ko'ring.")
+    details = json.loads(row["details"]) if row["details"] else {}
+    if row["status"] == "done":
+        return _ma_json({"ok": True, "status": "done", "code": str(details.get("code") or ""),
+                         "password": str(details.get("password") or "")})
+    if row["status"] != "processing":
+        return _ma_json({"ok": True, "status": "closed"})
+    try:
+        data = await _try_get_code(row["server"], details)
+    except SmmUpperError as e:
+        raise _MaError(502, "provider", e.message)
+    except _NET_ERRORS:
+        raise _MaError(503, "net", "Tarmoq xatosi. Birozdan so'ng qayta tekshiring.")
+    return _ma_json(await _ma_claim_code(oid, row, data) or {"ok": True, "status": "wait"})
+
+
+@_ma_route
+async def _ma_api_number_refund(request: web.Request, user: dict) -> web.Response:
+    uid = user["id"]
+    oid, row = await _ma_number_row(uid, (await _ma_body(request)).get("id"))
+    if row["status"] != "processing":
+        raise _MaError(409, "closed", "Bu buyurtma allaqachon yakunlangan.")
+    wait = await get_refund_eligible_seconds()
+    elapsed = int(time.time()) - row["created_at"]
+    if elapsed < wait:
+        raise _MaError(409, "early", f"Hali erta — SMS kelishi mumkin. Yana ~{(wait - elapsed) // 60 + 1} daqiqadan so'ng urinib ko'ring.")
+    try:        # qaytarishdan OLDIN kodni oxirgi marta tekshiramiz: kod kelgan bo'lsa — kod beriladi, pul qaytarilmaydi
+        details = json.loads(row["details"]) if row["details"] else {}
+        fresh = await _try_get_code(row["server"], details)
+    except (ValueError,) + _API_ERRORS:
+        fresh = None
+    if fresh:
+        got = await _ma_claim_code(oid, row, fresh)
+        if got:
+            return _ma_json(got)
+    refund = await refund_order(oid, min_age_seconds=wait)
+    if not refund:
+        raise _MaError(409, "closed", "Pulni qaytarib bo'lmadi — balki allaqachon yakunlangan.")
+    logging.info("Raqam refund qilindi (Mini App): order=%s server=%s ref=%s", oid, row["server"], row["ref"])
+    return _ma_json({"ok": True, "status": "refunded", "amount": refund["price"], "balance": await get_balance(uid)})
+
+
+# ---- shrift: Google Fonts o'rniga o'z serverimizdan (sekin tarmoqda ham tez; tashqi domen kutilmaydi) ----
+# Fayllar bot.py yonidagi fonts/ papkasida turadi (yoki MINIAPP_FONT_DIR). Faqat shu papkadagi *.woff2 beriladi.
+MINIAPP_FONT_DIR = (os.getenv("MINIAPP_FONT_DIR", "").strip()
+                    or os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts"))
+_MA_FONT_RE = re.compile(r"[A-Za-z0-9._-]{1,64}\.woff2")
+_MA_FONT_CACHE: Dict[str, tuple] = {}      # nom -> (o'zgargan vaqti, mazmuni)
+
+
+async def _ma_font(request: web.Request) -> web.Response:
+    name = request.match_info.get("name", "")
+    if not _MA_FONT_RE.fullmatch(name):
+        return web.Response(status=404)
+    path = os.path.join(MINIAPP_FONT_DIR, name)
+    try:
+        mtime = os.path.getmtime(path)
+        hit = _MA_FONT_CACHE.get(name)
+        if hit is None or hit[0] != mtime:
+            with open(path, "rb") as f:
+                hit = (mtime, f.read())
+            _MA_FONT_CACHE[name] = hit
+    except OSError:
+        return web.Response(status=404)
+    return web.Response(body=hit[1], content_type="font/woff2",
+                        headers={"Cache-Control": "public, max-age=2592000", "X-Content-Type-Options": "nosniff"})
+
+
+def miniapp_setup_routes(app: web.Application) -> None:
+    app.middlewares.append(_ma_cors_middleware)
+    app.router.add_get("/app", _ma_page)
+    app.router.add_get("/app/", _ma_page)
+    app.router.add_get("/fonts/{name}", _ma_font)
+    app.router.add_get("/api/me", _ma_api_me)
+    app.router.add_post("/api/topup/auto", _ma_api_auto_create)
+    app.router.add_get("/api/topup/auto/status", _ma_api_auto_status)
+    app.router.add_post("/api/topup/auto/cancel", _ma_api_auto_cancel)
+    app.router.add_post("/api/topup/manual", _ma_api_manual)
+    app.router.add_get("/api/prices", _ma_api_prices)
+    app.router.add_post("/api/buy", _ma_api_buy)
+    app.router.add_post("/api/number/check", _ma_api_number_check)
+    app.router.add_post("/api/number/refund", _ma_api_number_refund)
+
+
+async def miniapp_setup_bot(bot) -> None:
+    """Ishga tushganda: Mini App manzili aniq bo'lsa, botning menyu tugmasini Mini App'ga o'rnatadi
+    (MINIAPP_MENU_BUTTON=0 bilan o'chiriladi). Xato bo'lsa bot ishlashda davom etadi."""
+    url = miniapp_url()
+    if not url:
+        logging.info("miniapp: manzil aniqlanmadi (MINIAPP_URL yoki RENDER_EXTERNAL_URL + miniapp.html) \u2014 Mini App tugmalari o'chiq")
+        return
+    if os.getenv("MINIAPP_MENU_BUTTON", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    try:
+        await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Menu", web_app=WebAppInfo(url=url)))
+        logging.info("miniapp: menyu tugmasi o'rnatildi: %s", url)
+    except Exception:
+        logging.exception("miniapp: menyu tugmasini o'rnatib bo'lmadi")
+
+
+@router_balance.message(Command("app"))
+async def cmd_app(message: Message, state: FSMContext):
+    url = miniapp_url()
+    if not url:
+        await message.answer("\U0001F4F1 Mini App hozircha sozlanmagan.")
+        return
+    await state.clear()
+    await message.answer(
+        "\U0001F4F1 Do'konni Mini App'da oching:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="\U0001F4F1 Ochish", web_app=WebAppInfo(url=url), style=STYLE_SUCCESS)]]))
+# <<< MINIAPP END
+
+
+# ==============================================================
+# INLINE BOSH MENYU (menu:* tugmalari)
+# ==============================================================
+router_menu = Router(name="menu")
+
+
+@router_menu.callback_query(F.data == "menu:start")
+async def menu_start(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await refresh_news_url()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=main_menu())
+    except Exception:
+        pass
+    await callback.answer()
+
+
+@router_menu.callback_query(F.data == "menu:shop")
+async def menu_shop(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await callback.message.edit_reply_markup(reply_markup=shop_menu())
+    except Exception:
+        await callback.message.answer("\U0001F6CD Xizmatni tanlang:", reply_markup=shop_menu())
+    await callback.answer()
+
+
+@router_menu.callback_query(F.data == "menu:number")
+async def menu_number(callback: CallbackQuery, state: FSMContext, bot):
+    await callback.answer()
+    await open_number_flow(callback.message, state, bot, callback.from_user.id)
+
+
+@router_menu.callback_query(F.data == "menu:stars")
+async def menu_stars(callback: CallbackQuery, state: FSMContext, bot):
+    await callback.answer()
+    await open_stars_flow(callback.message, state, bot, callback.from_user.id)
+
+
+@router_menu.callback_query(F.data == "menu:premium")
+async def menu_premium(callback: CallbackQuery, state: FSMContext, bot):
+    await callback.answer()
+    await open_premium_flow(callback.message, state, bot, callback.from_user.id)
+
+
+@router_menu.callback_query(F.data == "menu:uc")
+async def menu_uc(callback: CallbackQuery, state: FSMContext, bot):
+    await callback.answer()
+    await open_uc_flow(callback.message, state, bot, callback.from_user.id)
+
+
+@router_menu.callback_query(F.data == "menu:orders")
+async def menu_orders(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await open_orders(callback.message, state, callback.from_user.id)
+
+
+@router_menu.callback_query(F.data == "menu:repeat")
+async def menu_repeat(callback: CallbackQuery, state: FSMContext, bot):
+    await callback.answer()
+    await open_repeat(callback.message, state, bot, callback.from_user.id)
+
+
+@router_menu.callback_query(F.data == "menu:balance")
+async def menu_balance(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    balance = await get_balance(callback.from_user.id)
+    await callback.message.answer(balance_text(balance), reply_markup=balance_menu())
+    await callback.answer()
+
+
+@router_menu.callback_query(F.data == "menu:help")
+async def menu_help(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer(HELP_INTRO, reply_markup=help_menu())
+    await callback.answer()
+
+
+@router_menu.callback_query(F.data == "menu:profile")
+async def menu_profile(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    uid = callback.from_user.id
+    info = await find_user(str(uid)) or {}
+    created = info.get("created_at")
+    since = datetime.fromtimestamp(int(created), LOCAL_TZ).strftime("%d.%m.%Y") if created else "—"
+    uname = f"@{callback.from_user.username}" if callback.from_user.username else "—"
+    phone = info.get("phone") or "—"
+    text = (
+        "\U0001F464 Profil\n\n"
+        f"\U0001F194 ID: <code>{uid}</code>\n"
+        f"\U0001F4DB Ism: {html.escape(callback.from_user.full_name or '')}\n"
+        f"\U0001F517 Username: {html.escape(uname)}\n"
+        f"\U0001F4DE Telefon: {html.escape(str(phone))}\n"
+        f"\U0001F4B0 Balans: {fmt_money(info.get('balance', 0))} so'm\n"
+        f"\U0001F4CB Buyurtmalar: {info.get('order_count', 0)} ta\n"
+        f"\U0001F4B8 Jami xarajat: {fmt_money(info.get('total_spent', 0))} so'm\n"
+        f"\U0001F4C5 Ro'yxatdan o'tgan sana: {since}"
+    )
+    await callback.message.answer(text, parse_mode="HTML", reply_markup=balance_menu())
+    await callback.answer()
+
+
+class RegistrationMiddleware(BaseMiddleware):
+    """Telefon raqami tasdiqlanmagan foydalanuvchi botning hech bir funksiyasidan foydalana olmaydi:
+    unga faqat raqam yuborish so'raladi. /start, kontakt yuborish, obuna tekshiruvi va adminlar bundan mustasno."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        user = data.get("event_from_user")
+        if not user:
+            return await handler(event, data)
+
+        if isinstance(event, Message):
+            if event.chat.type != "private":
+                return await handler(event, data)
+            if event.contact:
+                return await handler(event, data)
+            if event.text:
+                words = event.text.split()
+                if words and words[0].split("@")[0] == "/start":
+                    return await handler(event, data)
+        elif isinstance(event, CallbackQuery):
+            if event.data == "forcesub:check":
+                return await handler(event, data)
+
+        if await is_registered(user.id):
+            return await handler(event, data)
+        if await _is_admin(user.id):
+            return await handler(event, data)
+
+        bot = data.get("bot")
+        chat_id = event.chat.id if isinstance(event, Message) else (event.message.chat.id if event.message else user.id)
+        if isinstance(event, CallbackQuery):
+            try:
+                await event.answer("\U0001F4DE Avval telefon raqamingizni tasdiqlang.", show_alert=True)
+            except Exception:
+                pass
+        if bot:
+            try:
+                await ask_phone(bot, chat_id)
+            except Exception:
+                pass
+        return None
+
+
 async def _health(request):
     return web.Response(text="Bot ishlayapti \u2705")
 
 
-async def _run_health_server():
+async def _run_health_server(bot=None):
     """Render 'Web Service' turi deploy paytida kamida bitta ochiq portni talab
     qiladi (aks holda 'port scan timeout' bilan servisni o'chirib qo'yadi),
     lekin bot faqat polling orqali ishlaydi va o'zidan HTTP so'rov kutmaydi.
     Shuning uchun shu yengil health-check server ochib qo'yiladi — u haqiqiy
     trafik uchun emas, faqat Render'ning port tekshiruvidan o'tish uchun kerak.
+    Shu serverda Mini App ham ishlaydi: sahifa (/app) va API (/api/...) — yuqoridagi MINIAPP bo'limi.
     """
     app = web.Application()
+    app[_MA_BOT_KEY] = bot
     app.router.add_get("/", _health)
+    miniapp_setup_routes(app)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", "10000"))
@@ -8311,12 +9892,16 @@ async def main():
     dp.callback_query.outer_middleware(ban_middleware)
     dp.message.outer_middleware(force_sub_middleware)
     dp.callback_query.outer_middleware(force_sub_middleware)
+    registration_middleware = RegistrationMiddleware()      # ForceSub'dan KEYIN: avval obuna, keyin telefon
+    dp.message.outer_middleware(registration_middleware)
+    dp.callback_query.outer_middleware(registration_middleware)
 
     # Diqqat: router_common (bosh menyu tugmalari uchun umumiy filtr) va
     # router_admin birinchi bo'lib qo'shiladi, keyin qolgan bo'limlar.
     dp.include_router(router_common)
     dp.include_router(router_admin)
     dp.include_router(router_start)
+    dp.include_router(router_menu)
     dp.include_router(router_balance)
     dp.include_router(router_numbers)
     dp.include_router(router_stars)
@@ -8325,7 +9910,12 @@ async def main():
     dp.include_router(router_orders)
 
     await bot.delete_webhook(drop_pending_updates=True)
-    await _run_health_server()
+    await _run_health_server(bot)
+    await miniapp_setup_bot(bot)
+    try:
+        await refresh_news_url()
+    except Exception:
+        logging.exception("Yangiliklar havolasini yuklab bo'lmadi")
 
     # Avto-to'lov userbot'i fonda ulanadi — botni to'xtatib turmaydi; xato bo'lsa bot qo'lda rejimda ishlayveradi.
     try:
@@ -8338,6 +9928,10 @@ async def main():
     uc_task = asyncio.create_task(uc_sweeper(bot))
     _background_tasks.add(uc_task)
     uc_task.add_done_callback(_background_tasks.discard)
+
+    pw_task = asyncio.create_task(provider_balance_watch(bot))
+    _background_tasks.add(pw_task)
+    pw_task.add_done_callback(_background_tasks.discard)
 
     # MUHIM (Render "zero-downtime deploy"ga oid): yangi deploy paytida
     # Render eski va yangi instansiyani BIR NECHA O'N SONIYA (hattoki
@@ -8384,6 +9978,9 @@ async def main():
         uc_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await uc_task
+        pw_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await pw_task
         with contextlib.suppress(Exception):
             await AUTOPAY.stop()
         if _pool is not None:
