@@ -46,7 +46,7 @@ button:focus-visible,.in:focus-visible,.drop:focus-visible,.ord:focus-visible{ou
 .demob{position:sticky;top:0;z-index:6;padding:6px 12px;text-align:center;font-size:12px;font-weight:700;color:var(--wn);background:var(--demob);border-bottom:1px solid rgba(255,200,61,.35)}.demob[hidden]{display:none}
 
 /* ============ BALANS KARTASI (asosiy e'tibor shu yerda) ============ */
-.bal{position:relative;overflow:hidden;border-radius:30px;padding:20px;min-height:186px;color:#fff;
+.bal{position:relative;overflow:hidden;border-radius:30px;padding:18px;min-height:166px;color:#fff;
 background:linear-gradient(120deg,#1534E8,#3846F5 55%,#5B3AF0);
 background:radial-gradient(circle at 100% 100%,transparent 0 34%,rgba(255,255,255,.07) 34% 35%,transparent 35% 48%,rgba(255,255,255,.055) 48% 49%,transparent 49% 62%,rgba(255,255,255,.04) 62% 63%,transparent 63%),radial-gradient(80% 110% at 100% 100%,#8B3CFF,transparent 62%),linear-gradient(120deg,#1534E8,#3846F5 55%,#5B3AF0);
 box-shadow:inset 0 1px 0 rgba(255,255,255,.28),0 0 0 1px rgba(120,150,255,.5),0 16px 42px rgba(60,70,255,.36)}
@@ -55,21 +55,20 @@ box-shadow:inset 0 1px 0 rgba(255,255,255,.28),0 0 0 1px rgba(120,150,255,.5),0 
 .wal{position:absolute;right:8px;top:14px;width:min(36%,140px)}
 .bl{display:flex;align-items:center;gap:10px;font-weight:700}
 .wi{width:34px;height:28px;border-radius:9px;background:#DCE6FF;color:#2F46E8;display:grid;place-items:center}.wi svg{width:20px}
-.amt{font:800 clamp(34px,10.5vw,46px)/1.1 Manrope,sans-serif;letter-spacing:-.02em;margin:10px 0;white-space:nowrap}.amt em{font:700 18px Manrope,sans-serif;font-style:normal;opacity:.8;letter-spacing:0}
+.amt{font:800 clamp(34px,10.5vw,46px)/1.1 Manrope,sans-serif;letter-spacing:-.02em;margin:8px 0;white-space:nowrap}.amt em{font:700 18px Manrope,sans-serif;font-style:normal;opacity:.8;letter-spacing:0}
 .act{display:flex;width:max-content;align-items:center;gap:8px;padding:4px 14px 4px 5px;border-radius:99px;background:rgba(20,200,140,.32);color:#D3FBEC;font-size:13px;font-weight:700}.act svg{width:22px}
 .act.wt{background:rgba(255,200,61,.26);color:#FFE9A8}
-.btn{display:flex;width:max-content;align-items:center;gap:10px;margin-top:14px;border:0;border-radius:99px;background:#fff;color:#2F46E8;font-weight:800;font-size:16px;padding:8px 14px 8px 8px;box-shadow:0 6px 18px rgba(8,10,60,.35)}
+.btn{display:flex;width:max-content;align-items:center;gap:10px;margin-top:12px;border:0;border-radius:99px;background:#fff;color:#2F46E8;font-weight:800;font-size:16px;padding:8px 14px 8px 8px;box-shadow:0 6px 18px rgba(8,10,60,.35)}
 .btn svg{width:16px}.pl{width:30px;height:30px;border-radius:50%;background:#2F46E8;color:#fff;display:grid;place-items:center}
 
 /* ============ XIZMAT KARTALARI ============ */
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0 18px}
-.tile{position:relative;overflow:hidden;display:block;width:100%;text-align:left;padding:14px;border-radius:24px;border:1px solid rgba(var(--rgb),.3);background:linear-gradient(150deg,rgba(var(--rgb),.24),rgba(var(--rgb),.05) 62%),var(--panel);box-shadow:inset 0 1px 0 var(--veil),0 8px 22px var(--sh)}
-.tile::before{content:"";position:absolute;z-index:0;right:-34px;top:-34px;width:110px;height:110px;border-radius:50%;background:radial-gradient(circle,rgba(var(--rgb),.34),transparent 70%);pointer-events:none}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0 16px}
+.tile{position:relative;overflow:hidden;display:flex;align-items:center;gap:11px;width:100%;min-height:72px;text-align:left;padding:11px 12px 11px 11px;border-radius:22px;border:1px solid rgba(var(--rgb),.3);background:linear-gradient(150deg,rgba(var(--rgb),.22),rgba(var(--rgb),.04) 64%),var(--panel);box-shadow:inset 0 1px 0 var(--veil),0 6px 16px var(--sh)}
+.tile::before{content:"";position:absolute;z-index:0;right:-30px;top:-34px;width:96px;height:96px;border-radius:50%;background:radial-gradient(circle,rgba(var(--rgb),.3),transparent 70%);pointer-events:none}
 .tile>*{position:relative;z-index:1}
 .tile:active{transform:scale(.96)}
-.th{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px}
-.cv{width:34px;height:34px;border-radius:50%;background:var(--veil);display:grid;place-items:center}.cv svg{width:16px}
-.tile h3{margin:0;font-size:18px;font-weight:800;letter-spacing:-.01em}.tile p{margin:2px 0 0;color:var(--mut);font-size:13px}
+.tile .ico{width:46px;height:46px;border-radius:15px}.tile .ico svg{width:26px;height:26px}
+.tt{min-width:0}.tt b{display:block;font-size:16.5px;font-weight:800;letter-spacing:-.01em;line-height:1.15}.tt small{display:block;margin-top:2px;color:var(--mut);font-size:12px;font-weight:500;line-height:1.25}
 .ico{width:56px;height:56px;border-radius:18px;display:grid;place-items:center;color:var(--ct,var(--c));background:linear-gradient(150deg,rgba(var(--rgb),.42),rgba(var(--rgb),.12));border:1px solid rgba(var(--rgb),.45);box-shadow:0 6px 16px rgba(var(--rgb),.22),inset 0 1px 0 rgba(255,255,255,.12)}
 .ico svg{width:30px;height:30px}
 
@@ -114,9 +113,9 @@ label{display:block;margin:14px 0 8px;font-weight:700;font-size:13px;color:var(-
 .opt.wide{display:flex;justify-content:space-between;align-items:center;text-align:left;padding:13px 14px}
 .opt:active{transform:scale(.96)}
 .sum{display:flex;justify-content:space-between;margin-top:16px;padding:12px 0;border-top:1px dashed var(--line);color:var(--mut)}.sum b{color:var(--tx)}
-.hold{position:relative;width:100%;height:56px;border:0;border-radius:99px;background:var(--c);color:var(--cx);font-weight:800;overflow:hidden;user-select:none;-webkit-user-select:none;touch-action:none;box-shadow:0 8px 22px rgba(var(--rgb),.3)}
+.hold{position:relative;display:flex;align-items:center;justify-content:center;gap:10px;width:100%;height:52px;border:0;border-radius:99px;background:var(--c);color:var(--cx);font-weight:800;overflow:hidden;user-select:none;-webkit-user-select:none;touch-action:none;box-shadow:0 8px 22px rgba(var(--rgb),.3)}
 .hold i{position:absolute;inset:0;background:rgba(0,0,0,.25);transform-origin:left;transform:scaleX(0)}
-.hold span{position:relative}
+.hold span,.hold b{position:relative}
 .hold:disabled{background:var(--soft);color:var(--mut);cursor:default;box-shadow:none}
 .btn2{width:100%;height:54px;border:0;border-radius:99px;background:var(--pri);color:#fff;font-weight:800;margin-top:14px;box-shadow:0 8px 20px rgba(91,107,255,.28)}
 .btn2:active{transform:scale(.97)}
@@ -148,9 +147,37 @@ label{display:block;margin:14px 0 8px;font-weight:700;font-size:13px;color:var(-
 .sh.buy{display:flex;flex-direction:column;overflow:hidden;padding-bottom:0}
 .sh.buy .grab,.sh.buy .hd{flex:none}
 .sh.buy .sbody{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;margin:0 -18px;padding:0 18px 10px}
-.sh.buy .sfoot{flex:none;margin:0 -18px;padding:4px 18px calc(14px + env(safe-area-inset-bottom,0px));background:var(--panel);border-top:1px solid var(--line)}
+.sh.buy .sfoot{flex:none;margin:0 -18px;padding:10px 18px calc(12px + env(safe-area-inset-bottom,0px));background:var(--panel);border-top:1px solid var(--line)}
 .sh.buy .sfoot .sum{margin-top:6px;padding:8px 0}
 .av{position:relative;overflow:hidden}.av img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+
+/* --- Xizmat oynalari: ixcham --- */
+.sh.buy{padding-top:8px;background:linear-gradient(180deg,rgba(var(--rgb),.17),transparent 150px) no-repeat,var(--panel)}
+.sh.buy .grab{margin-bottom:10px}
+.sh.buy .hd{gap:10px;margin-bottom:0}.sh.buy .hd .ico{width:38px;height:38px;border-radius:12px}.sh.buy .hd .ico svg{width:22px;height:22px}
+.sh.buy .hd h2{font-size:17px}
+.bp{margin-left:auto;display:flex;align-items:baseline;gap:6px;padding:6px 12px;border-radius:99px;background:var(--soft);border:1px solid var(--line);font-size:13px;font-weight:800;white-space:nowrap}
+.bp small{color:var(--mut);font-weight:600;font-size:11.5px}
+.sh.buy label{margin:12px 0 6px;font-size:12.5px}
+.sh.buy .in{padding:12px 14px}
+.ig{position:relative}.ig>i{position:absolute;left:14px;top:50%;transform:translateY(-50%);font:800 15px Manrope,sans-serif;font-style:normal;color:var(--mut);pointer-events:none}
+.sh.buy .ig .in{padding-left:var(--pl,32px)}
+.sh.buy .opt{padding:9px 6px;line-height:1.2}
+.sh.buy .opt b{display:block;font-size:15px;font-weight:800}
+.sh.buy .opt small{margin-top:2px;font-size:11.5px}
+.opt.sel{background:linear-gradient(150deg,rgba(var(--rgb),.2),rgba(var(--rgb),.05)),var(--soft)}
+.sh.buy .opt.mo{position:relative;padding:12px 6px}.opt.mo b{font-size:17px}
+.bdg{position:absolute;top:-8px;right:7px;padding:2px 7px;border-radius:99px;background:var(--c);color:var(--cx);font:800 10.5px Manrope,sans-serif;font-style:normal}
+.opt.uc b span{color:var(--ct,var(--c));font-weight:800}
+.sh.buy .opt.cty{display:flex;align-items:center;gap:9px;text-align:left;padding:9px 10px;min-width:0}
+.cty .fl{font-size:24px;line-height:1;flex:none}
+.cty .cn{min-width:0;flex:1}.cty .cn b{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13.5px}
+.cty .cn small{display:flex;flex-wrap:wrap;align-items:center;gap:1px 6px;font-size:12px;font-weight:600}
+.cty .cn em{font-style:normal;font-size:10.5px;font-weight:800;color:var(--ok)}
+.hp{padding:7px 12px;line-height:1;border-radius:99px;background:rgba(0,0,0,.2);font-size:14px;font-weight:800}.hp:empty{display:none}
+.hold:disabled .hp{background:var(--veil)}
+.sh.buy .hint{margin-top:7px;font-size:12px;min-height:16px}
+.kv{display:flex;justify-content:space-between;gap:12px;padding:11px 0;border-top:1px solid var(--line)}.kv:first-child{border-top:0}.kv span{color:var(--mut)}.kv b{text-align:right}
 
 /* --- Raqam oynasi: pastki panel davlat tanlangach chiqadi --- */
 .sh.buy .sfoot[hidden]{display:none}
@@ -240,7 +267,7 @@ button.lr:active{opacity:.7}
 .rgw small{display:block;color:var(--mut);margin-top:2px}
 .faq details{border-top:1px solid var(--line);padding:14px 0}.faq details:first-child{border-top:0}.faq summary{display:flex;justify-content:space-between;gap:10px;font-weight:700;cursor:pointer;list-style:none}.faq summary::-webkit-details-marker{display:none}.faq summary::after{content:"+";color:var(--link);font-size:20px;line-height:1}.faq details[open] summary::after{transform:rotate(45deg)}.faq p{margin:10px 0 0;color:var(--mut);font-size:14px;line-height:1.5}
 
-@media (max-width:360px){.pfs b{font-size:15px}.pfs small{font-size:10.5px}.pfs>div{padding:0 6px}.tile h3{font-size:16px}.tile p{font-size:12px}.nav>button{font-size:9px}.av{width:48px;height:48px;font-size:22px}}
+@media (max-width:360px){.pfs b{font-size:15px}.pfs small{font-size:10.5px}.pfs>div{padding:0 6px}.tt b{font-size:15px}.tt small{font-size:11px}.tile{gap:9px;padding:10px}.tile .ico{width:42px;height:42px;border-radius:14px}.tile .ico svg{width:24px;height:24px}.nav>button{font-size:9px}.av{width:48px;height:48px;font-size:22px}}
 
 /* =====================================================================
    HARAKAT — faqat <html class="fx"> bo'lganda. Animatsiyalar o'chirilsa (tugma yoki avto-rejim) bu blokdagi
@@ -273,8 +300,8 @@ button.lr:active{opacity:.7}
 
 /* bosilganda javob beruvchi o'tishlar */
 html.fx .btn,html.fx .btn2,html.fx .opt,html.fx .cp,html.fx .resume,html.fx .nav>button,html.fx .tile,html.fx .ord,html.fx .bal,html.fx .av,html.fx .fxb{transition:transform .2s cubic-bezier(.2,1.5,.4,1)}
-html.fx .tile .ico,html.fx .tile .cv,html.fx .cv2{transition:transform .3s cubic-bezier(.2,1.6,.4,1)}
-html.fx .tile:active .ico{transform:rotate(-10deg) scale(1.12)}html.fx .tile:active .cv,html.fx .ord:active .cv2{transform:translateX(4px)}
+html.fx .tile .ico,html.fx .cv2{transition:transform .3s cubic-bezier(.2,1.6,.4,1)}
+html.fx .tile:active .ico{transform:rotate(-10deg) scale(1.12)}html.fx .ord:active .cv2{transform:translateX(4px)}
 html.fx .nav>button:active{transform:scale(.88)}
 html.fx .bal:active{transform:scale(.985)}
 html.fx .av:active{transform:scale(.88) rotate(-8deg)}
@@ -401,7 +428,7 @@ catch(e){throw{code:"net",message:"Internet yoki server bilan aloqa yo'q"}}final
 if(!r.ok||!j||j.ok===false)throw{code:(j&&j.error)||"http",message:(j&&j.message)||"Xatolik yuz berdi",data:j};
 return j}
 const P={star:0,prem:{},uc:[],cty:[]};   /* narxlar openSheet()da /api/prices dan to'ldiriladi */
-const SV={stars:{n:"Stars",s:"50 tadan boshlab",u:1},premium:{n:"Premium",s:"3, 6 va 12 oy",u:1},raqam:{n:"Raqam",s:"SMS kod olish"},uc:{n:"PUBG UC",s:"ID ga yuboriladi"}};
+const SV={stars:{n:"Stars",s:"50 tadan",u:1},premium:{n:"Premium",s:"3, 6, 12 oy",u:1},raqam:{n:"Raqam",s:"SMS kod olish"},uc:{n:"PUBG UC",s:"ID orqali"}};
 const IC={
 stars:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.4l2.9 6.2 6.7.8-5 4.6 1.3 6.7-5.9-3.4-5.9 3.4 1.3-6.7-5-4.6 6.7-.8z"/></svg>',
 premium:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M5 4.5h14l3 5.5-10 11L2 10z"/><path d="M2 10h20M9 4.5L7 10l5 11 5-11-2-5.5" fill="none" stroke="rgba(0,0,0,.25)" stroke-width="1.2"/></svg>',
@@ -481,7 +508,7 @@ try{const old=bal;if(!await load())return;paint(old);if(bal>old&&!TP.run)toast("
 catch(e){gateErr(e)}}
 const hdr=()=>`<div class="top">${avH()}<div class="who"><b>${esc(nm)}</b><small>Xush kelibsiz! 👋</small></div>${fxBtn()}</div>`;
 const V={
-home:()=>hdr()+`<section class="bal">${WAL}<div class="bl"><span class="wi">${IC.topup}</span>Balans</div><div class="amt"><span id="bal">0</span> <em>so'm</em></div>${actHTML()}<button class="btn" id="tu"><i class="pl">${IC.plus}</i>To'ldirish${IC.chev}</button></section><div class="grid">${Object.keys(SV).map((k,i)=>`<button class="tile deal t-${k}" style="--i:${i}" data-k="${k}"><div class="th"><div class="ico">${IC[k]}</div><span class="cv">${IC.chev}</span></div><h3>${SV[k].n}</h3><p>${SV[k].s}</p></button>`).join("")}</div>`,
+home:()=>hdr()+`<section class="bal">${WAL}<div class="bl"><span class="wi">${IC.topup}</span>Balans</div><div class="amt"><span id="bal">0</span> <em>so'm</em></div>${actHTML()}<button class="btn" id="tu"><i class="pl">${IC.plus}</i>To'ldirish${IC.chev}</button></section><div class="grid">${Object.keys(SV).map((k,i)=>`<button class="tile deal t-${k}" style="--i:${i}" data-k="${k}"><span class="ico">${IC[k]}</span><span class="tt"><b>${SV[k].n}</b><small>${SV[k].s}</small></span></button>`).join("")}</div>`,
 help:()=>`<h1 class="pg">Qo'llab-quvvatlash</h1><button class="btn" id="adm" style="width:100%;justify-content:center;margin:0 0 16px;padding:14px 18px">Admin bilan bog'lanish</button><section class="pan faq"><details open><summary>Balansni qanday to'ldiraman?</summary><p>«To'ldirish» tugmasini bosing, summani kiriting va ko'rsatilgan kartaga AYNAN shu summani o'tkazing. To'lov avtomatik aniqlanadi va balans o'zi to'ldiriladi. Avto-to'lov ishlamasa, to'lov chekining rasmini yuboring — admin tasdiqlagach balans to'ldiriladi.</p></details><details><summary>Xizmatni qanday sotib olaman?</summary><p>Bosh sahifadan kerakli xizmatni (Raqam, Stars, Premium, UC) tanlang va ko'rsatmalarga amal qiling. Buyurtma holatini «Buyurtmalar» bo'limidan kuzatasiz.</p></details><details><summary>Raqamga SMS kod kelmasa?</summary><p>Biroz kuting va «Buyurtmalar» bo'limida raqam buyurtmasini ochib, «Kodni tekshirish» tugmasini bosing. Kod baribir kelmasa, kutish vaqti tugagach shu yerdagi «Pulni qaytarish» tugmasi orqali pulingizni qaytarib olasiz.</p></details><details><summary>Pul qachon qaytariladi?</summary><p>Buyurtma xatolik bilan tugasa, pul balansingizga qaytariladi. Stars, Premium va UC buyurtmasi uzoq «Jarayonda» tursa, buyurtmani ochib «Holatini tekshirish» ni bosing — bot holatni tekshiradi. Boshqa muammo bo'lsa, botga yozing va buyurtma raqamini ko'rsating.</p></details><details><summary>Keshbek qanday olinadi?</summary><p>«Profil» bo'limidagi havolani do'stlaringizga yuboring. Ular balansini to'ldirgan har safar sizga keshbek avtomatik qo'shiladi.</p></details></section>`,
 orders:()=>`<h1 class="pg">Buyurtmalar</h1><section class="pan"><div id="ords"></div></section>`,
 me:()=>{const U=(ME&&ME.user)||{},un=U.username?"@"+esc(U.username):"Username yo'q",ot=ME&&ME.orders_total!=null?ME.orders_total:ords.length;
@@ -548,13 +575,14 @@ if(r.countries){if(!r.countries.length)return toast("Hozircha davlatlar mavjud e
 else if(r.uc){if(!r.uc.length)return toast("Hozircha UC tariflari yo'q");P.uc=r.uc.map(x=>[x.uc,x.p,x.id])}
 else{P.star=r.star;P.prem={3:r.premium["3"],6:r.premium["6"],12:r.premium["12"]}}}catch(e){if(gateErr(e))return;return toast(e.message)}
 cur={t,u:"",a:null};const s=$("#sh");s.className="sh buy nofoot t-"+t;const h=SV[t];
-let b=`<div class="grab"></div><div class="hd"><div class="ico">${IC[t]}</div><h2>${h.n}</h2></div><div class="sbody">`;
-if(h.u)b+=`<label>Telegram username (@ siz)</label><input class="in" id="u" placeholder="durov" autocapitalize="off" autocomplete="off">`;
-if(t=="stars")b+=`<label>Miqdor (eng kami 50)</label><div class="row">${[50,100,250,500,1000,2500].map(n=>`<button class="opt" data-a="${n}">${fmt(n)}</button>`).join("")}</div><input class="in" id="n" inputmode="numeric" placeholder="Boshqa miqdor">`;
-if(t=="premium")b+=`<label>Muddat</label><div class="row">${[3,6,12].map(m=>`<button class="opt" data-a="${m}">${m} oy<small>${fmt(P.prem[m])}</small></button>`).join("")}</div>`;
-if(t=="uc")b+=`<label>PUBG Mobile ID</label><input class="in" id="u" inputmode="numeric" placeholder="5123456789"><label>Tarif</label><div class="row two">${P.uc.map(x=>`<button class="opt" data-a="${x[0]}">${fmt(x[0])} UC<small>${fmt(x[1])} so'm</small></button>`).join("")}</div>`;
-if(t=="raqam")b+=`<label>Davlat — arzonidan boshlab</label><div class="list">${P.cty.map((c,i)=>`<button class="opt wide" data-a="${i}"><span>${c[0]} ${c[1]}${P.cty.length>5&&i<5?' <span class="chip ok">Arzon</span>':""}</span><b>${fmt(c[2])} so'm</b></button>`).join("")}</div>`;
-b+=`</div><div class="sfoot" hidden><div class="sum"><span>Balansdan yechiladi</span><b id="pr">—</b></div><button class="hold" id="hold"><i></i><span id="hl"></span></button><p class="hint" id="hint"></p></div>`;
+let b=`<div class="grab"></div><div class="hd"><div class="ico">${IC[t]}</div><h2>${h.n}</h2><span class="bp"><small>Balans</small>${fmt(bal)}</span></div><div class="sbody">`;
+if(h.u)b+=`<label>Qabul qiluvchi username</label><div class="ig"><i>@</i><input class="in" id="u" placeholder="durov" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></div>`;
+if(t=="stars")b+=`<label>Miqdor (eng kami 50)</label><div class="row">${[50,100,250,500,1000,2500].map(n=>`<button class="opt" data-a="${n}"><b>${fmt(n)}</b><small>${fmt(n*P.star)} so'm</small></button>`).join("")}</div><input class="in" id="n" inputmode="numeric" placeholder="Boshqa miqdor" style="margin-top:8px">`;
+if(t=="premium"){const pm=[3,6,12],pp=pm.map(m=>(P.prem[m]||0)/m),bi=pp.indexOf(Math.min(...pp)),sv=pp[0]>0?Math.round(100*(1-pp[bi]/pp[0])):0;
+b+=`<label>Muddat</label><div class="row">${pm.map((m,i)=>`<button class="opt mo" data-a="${m}">${i==bi&&bi>0&&sv>=1?`<i class="bdg">-${sv}%</i>`:""}<b>${m} oy</b><small>${fmt(P.prem[m])} so'm</small></button>`).join("")}</div>`}
+if(t=="uc")b+=`<label>PUBG Mobile ID</label><div class="ig" style="--pl:44px"><i>ID</i><input class="in" id="u" inputmode="numeric" placeholder="5123456789" autocomplete="off"></div><label>Tarif</label><div class="row two">${P.uc.map(x=>`<button class="opt uc" data-a="${x[0]}"><b>${fmt(x[0])} <span>UC</span></b><small>${fmt(x[1])} so'm</small></button>`).join("")}</div>`;
+if(t=="raqam")b+=`<label>Davlat — arzonidan boshlab</label><div class="row two">${P.cty.map((c,i)=>`<button class="opt cty" data-a="${i}"><span class="fl">${c[0]}</span><span class="cn"><b>${esc(c[1])}</b><small>${fmt(c[2])} so'm${P.cty.length>5&&i<5?"<em>Arzon</em>":""}</small></span></button>`).join("")}</div>`;
+b+=`</div><div class="sfoot" hidden><button class="hold" id="hold"><i></i><span id="hl"></span><b class="hp" id="hp"></b></button><p class="hint" id="hint"></p></div>`;
 s.innerHTML=b;show(true);bindSheet();
 }
 const price=()=>{const{t,a}=cur;if(a==null)return 0;return t=="stars"?a*P.star:t=="premium"?P.prem[a]:t=="uc"?P.uc.find(x=>x[0]==a)[1]:P.cty[a][2]};
@@ -566,10 +594,11 @@ if(t=="uc"&&!/^\d{6,12}$/.test(u))return "PUBG ID kiriting (6–12 xona)";return
 function upd(){const e=err(),p=price(),h=$("#hold");
 {const f=$(".sfoot");if(f){let on;if(cur.t=="raqam")on=cur.a!=null;else{if(idok())cur.fs=1;else if(!cur.u)cur.fs=0;on=!!cur.fs}
 if(on&&f.hidden){f.hidden=false;f.classList.remove("pop");void f.offsetWidth;f.classList.add("pop")}else if(!on)f.hidden=true;$("#sh").classList.toggle("nofoot",!on)}}
-$("#pr").textContent=p?fmt(p)+" so'm":"—";
-const low=!e&&p>bal&&!cur.tok;   /* token bor = xarid urinib ko'rilgan, natijani server hal qiladi (balans eskirgan bo'lishi mumkin) */h.disabled=!!e||low;
-$("#hl").textContent=e||(low?"Balans yetarli emas":"Sotib olish — bosib turing");
-$("#hint").innerHTML=low?'<a id="tp">Balansni to\'ldirish</a>':(e?"":"Tasdiqlash uchun tugmani 1 soniya bosib turing");
+const low=!e&&p>bal&&!cur.tok;   /* token bor = xarid urinib ko'rilgan, natijani server hal qiladi (balans eskirgan bo'lishi mumkin) */
+h.disabled=!!e||low;
+$("#hl").textContent=low?"Balans yetarli emas":"Sotib olish";
+$("#hp").textContent=!e&&p?fmt(p)+" so'm":"";
+$("#hint").innerHTML=low?'<a id="tp">Balansni to\'ldirish</a>':(e?esc(e):"Tasdiqlash uchun tugmani 1 soniya bosib turing");
 if(low)$("#tp").onclick=()=>topup()}
 function bindSheet(){const s=$("#sh");
 s.querySelectorAll(".opt").forEach(b=>b.onclick=()=>{hap();s.querySelectorAll(".opt").forEach(x=>x.classList.remove("sel"));b.classList.add("sel");cur.a=+b.dataset.a;cur.tok=null;const n=$("#n");if(n)n.value="";upd();if(cur.t=="raqam")try{b.scrollIntoView({block:"nearest"})}catch(e){}});
@@ -585,14 +614,14 @@ h.addEventListener("keydown",e=>{if((e.key==" "||e.key=="Enter")&&!h.disabled){e
 
 const desc=()=>{const{t,a,u}=cur;return t=="stars"?fmt(a)+" Stars → @"+u:t=="premium"?"Premium, "+a+" oy → @"+u:t=="uc"?fmt(a)+" UC → ID "+u:P.cty[a][0]+" "+P.cty[a][1]+" raqami"};
 async function pay(){hap();const{t}=cur,w=desc(),h=$("#hold");let p=price(),st="wait",nb=null,rr;
-h.disabled=true;$("#hl").textContent="Bajarilmoqda…";
+h.disabled=true;$("#hl").textContent="Bajarilmoqda…";$("#hp").textContent="";
 const tok=cur.tok||(cur.tok=uuid());   /* bitta xarid = bitta token: tarmoq uzilib qayta yuborilsa, server ikkinchi marta yechmaydi */
 try{rr=await call("/api/buy",{body:{token:tok,kind:t=="raqam"?"number":t,username:cur.u,amount:t=="raqam"?P.cty[cur.a][3]:t=="uc"?P.uc.find(x=>x[0]==cur.a)[2]:cur.a,price:p},timeout:60000});cur.tok=null;p=rr.price||p;nb=rr.balance;if(t=="stars"||t=="premium")st=rr.status=="ok"?"ok":"wait"}
 catch(e){if(gateErr(e))return;if(e.code=="price_changed"){cur.tok=null;toast("Narx o'zgardi, qayta oching");return show(false)}
 const hf=h.querySelector("i");if(hf){hf.style.transition="none";hf.style.transform="scaleX(0)"}
 if(e.data&&e.data.balance!=null){bal=e.data.balance;if(ME)ME.balance=bal}
 if(e.code=="net"){h.disabled=false;$("#hl").textContent="Qayta urinish — bosib turing";$("#hint").textContent="Aloqa uzildi. Xarid bajarilgan bo'lishi mumkin — qayta urinsangiz, pul ikki marta yechilmaydi.";return}   /* cur.tok saqlanadi */
-if(e.code=="unknown"){loadedAt=0;refresh();upd();h.disabled=true;$("#hl").textContent="Buyurtmalarni tekshiring";$("#hint").textContent=e.message;return}
+if(e.code=="unknown"){loadedAt=0;refresh();upd();h.disabled=true;$("#hl").textContent="Buyurtmalarni tekshiring";$("#hp").textContent="";$("#hint").textContent=e.message;return}
 cur.tok=null;upd();$("#hint").textContent=e.message;return}
 const be=$("#bal"),old=bal;bal=nb!=null?nb:bal-p;if(be)countTo(be,old,bal);if(ME)ME.balance=bal;
 ords.unshift({t,w,d:"Hozir",p,s:st,id:rr.order_id});renderOrd(true);show(false);

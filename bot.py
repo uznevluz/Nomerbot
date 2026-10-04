@@ -36,6 +36,7 @@ from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
     CopyTextButton,
+    ChatMemberUpdated,
     ErrorEvent,
     FSInputFile,
     InlineKeyboardButton,
@@ -3278,32 +3279,155 @@ async def phone_received(message: Message, state: FSMContext, bot):
         await notify_admins_new_user(bot, message.from_user, phone)
 
 
+async def get_user_created_at(user_id: int) -> Optional[int]:
+    """Foydalanuvchi bazaga qo'shilgan vaqt (unix, soniyada); topilmasa None."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            return await conn.fetchval("SELECT created_at FROM users WHERE user_id = $1", user_id)
+    async with _db_sqlite() as db:
+        cur = await db.execute("SELECT created_at FROM users WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        return row[0] if row else None
+
+
+async def _all_admin_ids() -> list:
+    return list(dict.fromkeys([*ADMIN_IDS, *await get_extra_admin_ids()]))
+
+
+def _profile_keyboard(user_id: int, username: Optional[str], phone: Optional[str]) -> Optional[InlineKeyboardMarkup]:
+    """"Profilni ko'rish" tugmalari.
+
+    Nega tg://user?id=... tugmasi YO'Q: foydalanuvchi maxfiylik sozlamasida profilga havolani yopgan bo'lsa,
+    Telegram butun xabarni rad etadi (BUTTON_USER_PRIVACY_RESTRICTED) yoki tugma bosilganda hech narsa
+    ochilmaydi. Shuning uchun ishonchli ikki yo'l beriladi:
+      1) username bo'lsa — https://t.me/<username>;
+      2) telefon raqami bo'lsa — https://t.me/+<raqam> (raqam orqali profil ochiladi).
+    Ismning o'zi ham xabar ichida bosiladigan havola (tg://user?id=) bo'lib turadi.
+    """
+    row = []
+    if username:
+        row.append(InlineKeyboardButton(text="\U0001F464 Profilni ko'rish", url=f"https://t.me/{username}"))
+    digits = re.sub(r"\D", "", phone or "")
+    if 8 <= len(digits) <= 15:
+        row.append(InlineKeyboardButton(text="\U0001F4DE Raqam orqali ochish", url=f"https://t.me/+{digits}"))
+    return InlineKeyboardMarkup(inline_keyboard=[row]) if row else None
+
+
+def _user_card_text(title: str, user, phone: Optional[str], lines: tuple = (), mention: bool = True) -> str:
+    name = html.escape(user.full_name or "—")
+    if mention:
+        name = f'<a href="tg://user?id={user.id}">{name}</a>'
+    uname = f"@{user.username}" if user.username else "—"
+    parts = [
+        title, "",
+        f"\U0001F464 Ism: {name}",
+        f"\U0001F517 Username: {html.escape(uname)}",
+        f"\U0001F194 ID: <code>{user.id}</code>",
+        f"\U0001F4DE Telefon: <code>{html.escape(phone)}</code>" if phone else "\U0001F4DE Telefon: — (tasdiqlamagan)",
+    ]
+    parts.extend(lines)
+    return "\n".join(parts)
+
+
+async def _send_to_admins(bot, text: str, plain_text: str, kb, skip_id: int = 0) -> None:
+    """Barcha adminlarga yuboradi. Biror variant rad etilsa (ism havolasi yoki tugma sababli) — keyingisini
+    sinaydi: 1) havola + tugmalar, 2) havolasiz matn + tugmalar, 3) havolasiz matn, tugmasiz."""
+    attempts = [(text, kb), (plain_text, kb), (plain_text, None)]
+    for admin_id in await _all_admin_ids():
+        if admin_id == skip_id:
+            continue
+        last = None
+        for txt, markup in attempts:
+            try:
+                await bot.send_message(admin_id, txt, parse_mode="HTML", reply_markup=markup)
+                break
+            except Exception as e:
+                last = e
+        else:
+            logging.error("Foydalanuvchi haqida adminga (%s) xabar yuborib bo'lmadi: %r", admin_id, last)
+
+
+async def _notify_user_event(bot, title: str, user, phone: Optional[str], *, show_joined: bool = False,
+                             extra: tuple = ()) -> None:
+    lines = list(extra)
+    if show_joined:
+        try:
+            created = await get_user_created_at(user.id)
+        except Exception:
+            created = None
+        if created:
+            lines.append("\U0001F4C5 Ro'yxatdan o'tgan: " + datetime.fromtimestamp(int(created), LOCAL_TZ).strftime("%d.%m.%Y"))
+    kb = _profile_keyboard(user.id, user.username, phone)
+    await _send_to_admins(
+        bot,
+        _user_card_text(title, user, phone, tuple(lines), mention=True),
+        _user_card_text(title, user, phone, tuple(lines), mention=False),
+        kb, skip_id=user.id,
+    )
+
+
 async def notify_admins_new_user(bot, user, phone: str) -> None:
     """Yangi foydalanuvchi telefon orqali ro'yxatdan o'tganda barcha adminlarga: ism, username, ID, telefon
-    va "Profilni ko'rish" tugmasi. Xato bo'lsa bot ishlashda davom etadi."""
-    uname = f"@{user.username}" if user.username else "—"
-    profile_url = f"https://t.me/{user.username}" if user.username else f"tg://user?id={user.id}"
-    text = (
-        "\U0001F195 Yangi foydalanuvchi ro'yxatdan o'tdi\n\n"
-        f"\U0001F464 Ism: {html.escape(user.full_name or '—')}\n"
-        f"\U0001F517 Username: {html.escape(uname)}\n"
-        f"\U0001F194 ID: <code>{user.id}</code>\n"
-        f"\U0001F4DE Telefon: <code>{html.escape(phone)}</code>"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="\U0001F464 Profilni ko'rish", url=profile_url)]])
-    for admin_id in dict.fromkeys([*ADMIN_IDS, *await get_extra_admin_ids()]):
-        if admin_id == user.id:
-            continue
-        try:
-            await bot.send_message(admin_id, text, parse_mode="HTML", reply_markup=kb)
-        except Exception:
-            # username'siz foydalanuvchida tg://user?id= havolasi maxfiylik sozlamasi tufayli rad etilishi mumkin —
-            # tugmasiz, lekin bosiladigan havola bilan qayta yuboramiz.
-            try:
-                await bot.send_message(
-                    admin_id, text + f'\n\U0001F449 <a href="tg://user?id={user.id}">Profilni ko\'rish</a>', parse_mode="HTML")
-            except Exception:
-                logging.exception("Yangi foydalanuvchi haqida adminga (%s) xabar yuborib bo'lmadi", admin_id)
+    va "Profilni ko'rish" tugmalari. Xato bo'lsa bot ishlashda davom etadi."""
+    try:
+        await _notify_user_event(bot, "\U0001F195 Yangi foydalanuvchi ro'yxatdan o'tdi", user, phone)
+    except Exception:
+        logging.exception("Yangi foydalanuvchi haqida adminlarga xabar yuborib bo'lmadi")
+
+
+@router_start.my_chat_member(F.chat.type == "private")
+async def on_user_blocked_bot(event: ChatMemberUpdated, bot):
+    """Foydalanuvchi botni bloklasa yoki chatni o'chirib tashlasa, Telegram shu yangilanishni yuboradi
+    (new status = "kicked") — adminlarga xuddi ro'yxatdan o'tishdagi kabi xabar boradi."""
+    try:
+        if event.new_chat_member.status not in ("kicked", "left"):
+            return
+        user = event.from_user
+        if user.is_bot or await _is_admin(user.id):
+            return
+        phone = await get_phone(user.id)
+        await _notify_user_event(bot, "\U0001F6AA Foydalanuvchi botni bloklab, chiqib ketdi", user, phone, show_joined=True)
+    except Exception:
+        logging.exception("Foydalanuvchi chiqib ketgani haqida xabar yuborib bo'lmadi")
+
+
+def _same_channel(chat, channel) -> bool:
+    ch = str(channel or "").strip()
+    if not ch:
+        return False
+    if ch.lstrip("-").isdigit():
+        return chat.id == int(ch)
+    return bool(chat.username) and chat.username.lower() == ch.lstrip("@").lower()
+
+
+@router_start.chat_member()
+async def on_channel_member_left(event: ChatMemberUpdated, bot):
+    """Foydalanuvchi majburiy obuna kanalidan chiqib ketsa (yoki chiqarib yuborilsa) — adminlarga xabar.
+    Ishlashi uchun bot kanalda ADMIN bo'lishi kerak (majburiy obuna uchun ham shu talab qilinadi).
+    Faqat botdan foydalanuvchilar uchun xabar yuboriladi — kanalning boshqa a'zolari adminlarni bezovta qilmaydi."""
+    try:
+        old, new = event.old_chat_member, event.new_chat_member
+        was_in = old.status in ("member", "administrator", "creator") or (
+            old.status == "restricted" and getattr(old, "is_member", False))
+        if not (was_in and new.status in ("left", "kicked")):
+            return
+        user = new.user
+        if user.is_bot:
+            return
+        channels = await get_force_sub_channels()
+        if not any(_same_channel(event.chat, (c or {}).get("channel")) for c in channels):
+            return
+        _sub_cache.pop(user.id, None)       # obuna holati keshda eskirmasin — keyingi so'rovda qayta tekshiriladi
+        if await _is_admin(user.id) or not await user_exists(user.id):
+            return
+        phone = await get_phone(user.id)
+        left_self = event.from_user is None or event.from_user.id == user.id
+        title = ("\U0001F4E4 Foydalanuvchi kanaldan chiqib ketdi" if left_self
+                 else "\u26D4 Foydalanuvchi kanaldan chiqarib yuborildi")
+        await _notify_user_event(bot, title, user, phone, show_joined=True,
+                                 extra=(f"\U0001F4E2 Kanal: {html.escape(event.chat.title or str(event.chat.id))}",))
+    except Exception:
+        logging.exception("Kanaldan chiqib ketgan foydalanuvchi haqida xabar yuborib bo'lmadi")
 
 
 @router_start.callback_query(F.data == "shop:soon")
