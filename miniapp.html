@@ -168,17 +168,55 @@ label{display:block;margin:14px 0 8px;font-weight:700;font-size:13px;color:var(-
 .hsec p{margin:0;flex:1;font-size:13px;color:var(--mut)}.hsec p b{display:block;color:var(--tx);font-size:14px;margin-bottom:2px}
 .hsec .gbtn,.hsec button{flex:none;border:0;border-radius:99px;background:rgb(var(--prgb));color:#fff;font-weight:800;font-size:13.5px;padding:10px 16px}
 .tile.off{opacity:.45}
-.aph{display:flex;align-items:center;justify-content:space-between}.aph .pg{margin-bottom:12px}
-.atb{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;padding:4px;border-radius:14px;background:var(--soft);margin-bottom:12px}
-.atb button{border:0;border-radius:10px;padding:9px 2px;font-size:12.5px;font-weight:700;background:transparent;color:var(--mut);white-space:nowrap}
-.atb button.on{background:var(--panel);color:var(--tx);box-shadow:0 2px 8px rgba(0,0,0,.18)}
-.atb i{font-style:normal;background:var(--bad);color:#fff;border-radius:99px;font-size:11px;padding:1px 6px;margin-left:4px}
-.ahr small{font-size:12px;opacity:.85}.ahr .big{font:800 30px Manrope,sans-serif;margin:2px 0 12px}.ahr .big em{font-style:normal;font-size:15px;opacity:.85}
-.ahr .mn{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.ahr .mn>div{background:rgba(255,255,255,.16);border-radius:14px;padding:8px 6px;text-align:center}.ahr .mn b{display:block;font-size:14px}
-.hs .sb{opacity:.75;margin-top:1px}
+/* ============ ADMIN PANELI (Profil -> Admin paneli) ============ */
+.adh{display:flex;align-items:center;gap:10px;margin:2px 0 14px}.adh .pg{margin:0;flex:1;min-width:0}
+.adk{flex:none;display:grid;place-items:center;width:42px;height:42px;padding:0;border-radius:50%;border:1px solid var(--line);background:var(--panel);color:var(--tx)}
+.adk svg{width:20px;height:20px}.adk.bk svg{transform:rotate(180deg)}.adk:active{transform:scale(.92)}
+.ad-in{display:flex;align-items:center;gap:12px;width:100%;margin-top:12px;padding:12px 14px;border:1px solid var(--line);border-radius:22px;background:var(--panel);color:var(--tx);text-align:left}
+.ad-in .lk{flex:1;min-width:0}.ad-in>svg{flex:none;width:18px;height:18px;color:var(--mut)}.ad-in:active{opacity:.75}
+.ad-dot{flex:none;width:9px;height:9px;border-radius:50%;background:var(--wn);box-shadow:0 0 0 3px rgba(255,200,61,.22)}.ad-dot.bad{background:var(--bad);box-shadow:0 0 0 3px rgba(255,107,129,.24)}.ad-dot[hidden]{display:none}
+.ad-tb{display:flex;gap:4px;padding:4px;margin-bottom:12px;border-radius:16px;background:var(--soft)}
+.ad-tb button{flex:1 1 0;min-width:0;display:flex;align-items:center;justify-content:center;gap:5px;border:0;border-radius:12px;padding:10px 2px;background:transparent;color:var(--mut);font-weight:700;font-size:12.5px;white-space:nowrap}
+.ad-tb button.on{background:var(--panel);color:var(--tx);box-shadow:0 2px 8px var(--sh)}
+.ad-tb i{font-style:normal;min-width:18px;padding:1px 5px;border-radius:99px;background:var(--bad);color:#fff;font-size:11px;font-weight:800;line-height:1.5}
+.ad-shop{--sc:var(--ok);--scr:62,224,174;position:relative;overflow:hidden;border-radius:26px;padding:16px;border:1px solid rgba(var(--scr),.42);background:linear-gradient(165deg,rgba(var(--scr),.15),transparent 62%),var(--panel)}
+.ad-shop.warn{--sc:var(--wn);--scr:255,200,61}.ad-shop.off{--sc:var(--bad);--scr:255,107,129}
+.ad-sh{display:flex;align-items:center;gap:12px}.ad-sh>div:nth-child(2){flex:1;min-width:0}
+.ad-sh b{display:block;font-size:18px;font-weight:800}.ad-sh small{display:block;margin-top:1px;color:var(--mut);font-size:12px;font-weight:600}
+.ad-orb{position:relative;flex:none;display:grid;place-items:center;width:44px;height:44px;border-radius:50%;background:rgba(var(--scr),.18);box-shadow:inset 0 0 0 1.5px rgba(var(--scr),.5)}
+.ad-orb i{width:14px;height:14px;border-radius:50%;background:var(--sc);box-shadow:0 0 14px rgba(var(--scr),.8)}
+.ad-bl{flex:none;text-align:right}.ad-bl b{font:800 20px Manrope,sans-serif}.ad-bl small{margin-top:0}
+.ad-mt{position:relative;height:10px;margin-top:16px;border-radius:99px;background:var(--soft)}
+.ad-mt i{display:block;height:100%;border-radius:99px;background:var(--sc);box-shadow:0 0 12px rgba(var(--scr),.45);transform-origin:left}
+.ad-mt u{position:absolute;top:-4px;bottom:-4px;width:3px;margin-left:-1.5px;border-radius:2px;background:var(--tx);opacity:.75}
+.ad-ml{margin-top:9px;color:var(--mut);font-size:12px;font-weight:600}.ad-ml .tk{display:inline-block;width:3px;height:11px;margin-right:6px;border-radius:2px;background:var(--tx);opacity:.75;vertical-align:-1px}
+.ad-msg{margin:12px 0 0;color:var(--sc);font-size:13.5px;font-weight:700;line-height:1.45}.ad-shop.off .ad-msg{color:var(--badt)}
+.ad-sw{display:flex;align-items:center;gap:12px;width:100%;margin-top:14px;padding:12px 14px;border:1px solid var(--line);border-radius:18px;background:var(--panel);color:var(--tx);text-align:left}
+.ad-sw .lk{flex:1;min-width:0}.ad-sw:active:not(:disabled){opacity:.8}.ad-sw:disabled{opacity:.6}
+.ad-sw[aria-checked="true"] .sw2{background:linear-gradient(135deg,var(--pa),var(--pb));box-shadow:none}.ad-sw[aria-checked="true"] .sw2 i{transform:translateX(18px)}
+.ad-pend{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;margin-top:10px;padding:13px 16px;border:0;border-radius:18px;background:rgba(255,200,61,.13);box-shadow:inset 0 0 0 1px rgba(255,200,61,.45);color:var(--notet);text-align:left;font-size:14px}
+.ad-pend svg{flex:none;width:18px;height:18px}
+.ad-rev{margin-top:12px}.ad-rev .hhi{top:auto;bottom:-10px}
+.ad-pr{position:relative;display:flex;gap:6px}
+.ad-pr button{flex:1;border:0;border-radius:99px;padding:8px 0;background:rgba(255,255,255,.16);color:#fff;font-weight:800;font-size:12.5px}
+.ad-pr button[aria-pressed="true"]{background:#fff;color:var(--ha)}
+.ad-rev small{position:relative;display:block;margin-top:16px;font-size:12.5px;font-weight:700;opacity:.9}
+.ad-big{position:relative;margin-top:2px;font:800 34px Manrope,sans-serif;letter-spacing:-.02em;overflow-wrap:anywhere}.ad-big em{font-style:normal;font-size:15px;font-weight:700;opacity:.85}
+.ad-k{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}
+.ad-k>div{min-width:0;padding:13px 14px;border:1px solid var(--line);border-radius:20px;background:var(--panel)}.ad-k .w2{grid-column:1/-1}
+.ad-k small{display:block;color:var(--mut);font-size:12px;font-weight:600}
+.ad-k b{display:block;margin:3px 0 1px;font:800 20px Manrope,sans-serif;overflow-wrap:anywhere}.ad-k b em{font-style:normal;font-size:12px;font-weight:700;color:var(--mut)}
+.ad-k .sb{display:block;color:var(--mut);font-size:12px;font-weight:600}.ad-k .sb.up{color:var(--ok)}
+.apr{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:13px 0;border-top:1px solid var(--line)}.apr:first-child{border-top:0}.apr>div:first-child{min-width:0}
+.apr b{display:block;font-size:14.5px;overflow-wrap:anywhere}.apr .amt{display:block;margin-top:2px;font:800 17px Manrope,sans-serif}.apr small{display:block;margin-top:1px;color:var(--mut);font-size:12px}
+.apb{display:flex;gap:6px;flex:none}.apb button{min-width:44px;min-height:40px;border:0;border-radius:99px;padding:8px 12px;font-weight:800;font-size:13px;background:rgba(var(--prgb),.2);color:var(--link)}
+.ad-u{margin-top:12px;padding:14px;border:1px solid var(--line);border-radius:22px;background:var(--panel)}
+.ad-u h3{margin:0;font-size:17px;font-weight:800;overflow-wrap:anywhere}.ad-u .mut{color:var(--mut);font-size:13px}.ad-u .ban{margin-left:6px;color:var(--badt);font-size:12px;font-weight:700}
+html.fx .adk.ld svg{animation:spin .8s linear infinite}
+html.fx .ad-shop.on .ad-orb::after{content:"";position:absolute;inset:0;border-radius:50%;border:2px solid rgba(var(--scr),.6);animation:pls 2.4s ease-out infinite}
+html.fx .ad-mt i{animation:grow .8s cubic-bezier(.2,.9,.3,1) backwards}
+html.fx .ad-pr button,html.fx .ad-tb button{transition:background .2s,color .2s}
 .uch{display:flex;gap:6px;overflow-x:auto;margin:8px 0 0;padding-bottom:2px}.uchip{flex:none;border:0;border-radius:99px;padding:7px 12px;font-weight:700;font-size:13px;background:rgba(var(--prgb),.18);color:var(--link)}
-.apr{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 0;border-top:1px solid var(--line)}.apr:first-child{border-top:0}.apr b{display:block;font-size:14px}.apr small{color:var(--mut);font-size:12px}
-.apb{display:flex;gap:6px;flex:none}.apb button{border:0;border-radius:99px;padding:8px 12px;font-weight:800;font-size:13px;background:rgba(var(--prgb),.2);color:var(--link)}.apb .ok{background:rgba(62,224,174,.2);color:var(--ok)}.apb .no{background:rgba(255,107,129,.2);color:var(--badt)}
 .note{margin:12px 0 0;padding:10px 12px;border-radius:12px;background:rgba(255,200,61,.12);color:var(--notet);font-size:13px}
 .warn{margin:0 0 14px;padding:11px 13px;border-radius:12px;background:rgba(255,107,129,.13);box-shadow:inset 0 0 0 1px rgba(255,107,129,.4);color:var(--badt);font-size:13px;font-weight:700;line-height:1.4}
 .drop{display:flex;align-items:center;justify-content:center;gap:10px;min-height:92px;margin:10px 0 0;padding:12px;border:1.5px dashed var(--line);border-radius:16px;background:var(--soft);color:var(--tx);font-size:14px;font-weight:700;text-align:center;cursor:pointer}
@@ -444,6 +482,206 @@ html.fx .ts.d:not(:last-child) i::after{animation:ln .4s calc(var(--k)*.25s + .3
 html.fx .ts.a i::before{animation:pls 1.4s ease-out infinite}
 html.fx .rf{animation:rfill 1.1s .3s cubic-bezier(.2,.9,.3,1) backwards}
 html.fx .rp{position:absolute;border-radius:50%;background:currentColor;opacity:.25;transform:scale(0);animation:rp .6s ease-out forwards;pointer-events:none}
+
+/* =====================================================================
+   BO'SH JOY (spacing): yozuvlar va elementlar bir-biriga yopishib qolmasligi uchun.
+   Shu blok eng oxirida turadi — kerak bo'lmasa butunlay o'chirib tashlash mumkin.
+   ===================================================================== */
+#app{padding:20px 16px 118px}
+.top{gap:12px;margin-bottom:20px}
+.who small{display:block;margin-top:3px}
+/* balans kartasi */
+.bal{padding:20px}
+.bl{gap:12px}
+.amt{margin:10px 0 12px}
+.act{gap:10px}
+.btn{gap:12px;margin-top:16px}
+/* xizmat kartalari */
+.grid{gap:12px;margin:16px 0 22px}
+.tt b{line-height:1.2}
+.tt small{margin-top:3px}
+@media (min-width:361px){.tile{padding:12px 12px 12px 11px}}
+@media (min-width:361px) and (max-width:389px){.tile .ico{width:44px;height:44px}}
+@media (min-width:390px){.tile{gap:13px;padding:13px 13px 13px 12px}}
+/* sarlavhalar, bo'limlar, buyurtmalar */
+.pg{margin:6px 0 20px}
+.blk{margin-top:26px}
+.sec{gap:12px;margin:0 4px 12px}
+.ord{padding:14px 0}
+.ord small{margin-top:3px}
+.ord .r .chip{display:inline-block;margin-top:5px}
+/* profil */
+.pfh{padding:20px}
+.pfi{gap:16px}
+.pfi small{margin-top:4px}
+.pfs{margin-top:18px;padding-top:16px}
+.pfs>div{padding:0 10px}
+.pfs small{margin-top:4px;white-space:normal;line-height:1.3}
+.sc{padding:16px 16px 6px}
+.lgs{margin-top:14px}
+.lg{gap:14px;padding:12px 0}
+.lg small{margin-top:3px}
+.rfc{padding:18px}
+.rgw{gap:16px;margin:0 0 16px}
+.rgw small{margin-top:4px}
+.rst{gap:12px}
+.rst>div{padding:12px 14px}
+.rst b{margin-top:4px}
+.rnote{margin:12px 2px 16px;line-height:1.5}
+.rbt{gap:12px}
+.lr{gap:14px;padding:12px 0}
+.stg .lr{padding:11px 0}
+.lk small{margin-top:3px}
+.lv{gap:10px}
+.pals{gap:12px}
+.pcard{gap:10px;padding:12px}
+.pcard .tick{top:18px;right:18px}
+/* qo'llab-quvvatlash sahifasi */
+.hh{padding:20px}
+.hh p{margin:8px 0 0;line-height:1.45}
+.hh .btn{margin-top:18px}
+.hs{gap:10px;margin-top:12px}
+.hs>div{padding:13px 8px}
+.hs small{display:block;margin-top:4px;line-height:1.3}
+.hst{gap:10px}
+.hst>div{padding:14px 10px}
+.hst i{margin:0 auto 10px}
+.hst small{margin-top:4px}
+.hsv{gap:10px}
+.hsv>div{padding:14px}
+.hsv .ico{margin-bottom:10px}
+.hsv small{margin-top:4px;line-height:1.4}
+.hsec{gap:14px;margin-top:24px;padding:16px}
+.hsec p b{margin-bottom:4px}
+.faq details{padding:15px 0}
+.faq summary{gap:14px}
+.faq p{margin:12px 0 0;line-height:1.55}
+/* pastki oynalar (sheet) */
+.hd{gap:12px;margin-bottom:14px}
+.sh.buy .hd{gap:12px;margin-bottom:4px}
+label{margin:16px 0 8px}
+.sh.buy label{margin:16px 0 8px}
+.row{gap:10px}
+.list{gap:10px}
+.row+.in{margin-top:12px}
+.opt small{margin-top:3px}
+.sh.buy .opt{padding:11px 8px}
+.sh.buy .opt small{margin-top:3px}
+.sh.buy .opt.mo{padding:14px 8px}
+.sh.buy .opt.cty{gap:12px;padding:11px 12px}
+.cty .cn small{gap:2px 8px}
+.sh.buy .hint{margin-top:10px}
+.hint{margin:12px 0 0}
+.sum{margin-top:18px}
+.sh.buy .sfoot .sum{margin-top:8px;padding:10px 0}
+.kv{padding:12px 0}
+.bp{gap:8px}
+.note{padding:12px 14px}
+.warn{padding:12px 14px;margin:0 0 16px}
+.card{gap:8px;padding:18px 16px}
+.card .cp{top:12px;right:12px}
+.card b{margin-top:2px}
+.pc{padding:6px 16px}
+.pr{column-gap:14px;row-gap:4px;padding:13px 0}
+.resume{padding:14px 16px}
+.tm{gap:10px}
+.ks h3{margin:18px 0 4px}
+/* muvaffaqiyat oynasi */
+.burst{margin:0 auto 26px}
+.win h2{margin:0 0 10px}
+.num{gap:14px;padding:14px 16px;margin:18px 0 12px}
+.waitl{gap:10px}
+/* admin paneli */
+.ad-shop{padding:18px}
+.ad-sh{gap:14px}
+.ad-mt{margin-top:18px}
+.ad-ml{margin-top:11px}
+.ad-msg{margin:14px 0 0}
+.ad-pr{gap:8px}
+.ad-k{gap:10px}
+.ad-k>div{padding:14px 16px}
+.ad-k b{margin:4px 0 2px}
+.ad-in,.ad-sw{gap:14px}
+.apr{gap:14px;padding:14px 0}
+.apb{gap:8px}
+.uch{gap:8px}
+.ad-u{padding:16px}
+.ad-u .ban{margin-left:8px}
+/* tor ekranlar */
+@media (max-width:360px){.tile{padding:11px 10px}.pfs>div{padding:0 8px}.pfs small{font-size:10.5px}}
+
+/* =====================================================================
+   PASTKI MENYU — skrinshotdagidek: ikonka yonida yozuv, tugmalar orasida chiziq,
+   faol tugma tepasida "o'yiqcha". Tor ekranda faqat faol tugmada yozuv ko'rinadi (qolganlarida
+   yozuv ekran o'qigichlar uchun saqlanadi), kenglik yetarli bo'lsa (≥ ~424px) hammasida ko'rinadi.
+   ===================================================================== */
+.nav{--nt:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 10'%3E%3Cpath d='M0 0H28C23.5 0 22.3 2 21 4.6C19.6 7.4 17.6 10 14 10C10.4 10 8.4 7.4 7 4.6C5.7 2 4.5 0 0 0Z'/%3E%3C/svg%3E");
+container-type:inline-size;container-name:nv;left:10px;right:10px;display:flex;align-items:stretch;padding:0 6px;border-radius:32px;border:1px solid rgba(var(--prgb),.34);
+box-shadow:0 14px 34px var(--sh2),0 0 24px rgba(var(--prgb),calc(.12*var(--gk))),inset 0 1px 0 rgba(var(--prgb),.5),inset 0 0 22px rgba(var(--prgb),calc(.08*var(--gk)))}
+.nav>button{position:relative;flex:1 1 0;display:flex;align-items:center;justify-content:center;gap:8px;min-height:50px;margin:5px 0;padding:0 8px;border-radius:22px;background:none;color:var(--mut);font-size:11px;font-weight:700;line-height:1.1;white-space:nowrap}
+.nav svg{flex:none;width:22px;height:22px}
+.nav>button.on{flex:0 0 auto;padding:0 14px;background:none;color:var(--link);font-weight:800}
+.nav>button.on svg{filter:drop-shadow(0 0 6px rgba(var(--prgb),calc(.6*var(--gk))))}
+/* tugmalar orasidagi chiziq */
+.nav>button+button::before{content:"";position:absolute;left:0;top:50%;width:1px;height:28px;margin-top:-14px;background:var(--line)}
+/* faol tugma tepasidagi o'yiqcha */
+.nav>button.on::after{content:"";position:absolute;top:-7px;bottom:auto;left:50%;width:28px;height:10px;margin-left:-14px;border-radius:0;background:var(--link);box-shadow:none;
+-webkit-mask:var(--nt) center/100% 100% no-repeat;mask:var(--nt) center/100% 100% no-repeat}
+/* tor ekran: faolsiz tugmalarda yozuv yashirin (o'qigichlar uchun qoladi) */
+.nav>button:not(.on)>span{position:absolute;width:1px;height:1px;margin:-1px;padding:0;border:0;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
+@container nv (min-width:392px){
+.nav>button{flex:1 1 auto;gap:5px;padding:0 4px;font-size:10px}
+.nav>button.on{flex:1 1 auto;padding:0 4px}
+.nav svg{width:19px;height:19px}
+.nav>button:not(.on)>span{position:static;width:auto;height:auto;margin:0;clip:auto}
+.nav>button{min-width:0}
+.nav>button>span{min-width:0;padding:1px 0;overflow:hidden;text-overflow:ellipsis}
+}
+html.fx .nav>button.on::after{transform-origin:50% 0;animation:notch .4s cubic-bezier(.2,1.4,.4,1) backwards}
+html.fx .nav>button.on>span{animation:navl .38s .05s cubic-bezier(.2,.9,.3,1) backwards}
+@keyframes notch{from{transform:translateY(-8px) scaleX(.5);opacity:0}}
+@keyframes navl{from{opacity:0;transform:translateX(-8px)}}
+@media (max-width:340px){.nav>button.on{padding:0 10px}.nav>button{font-size:10.5px;gap:6px}}
+
+/* =====================================================================
+   CHAQMOQ — premium animatsiyalar. Hammasi faqat <html class="fx"> bo'lganda ishlaydi (animatsiya tugmasi o'chirsa yo'q bo'ladi).
+   ===================================================================== */
+@property --lza{syntax:"<angle>";inherits:false;initial-value:0deg}
+:root{--bolt:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M13.5 1.5 4 14h6.2l-1.7 8.5L20 9.5h-6.4z'/%3E%3C/svg%3E")}
+@keyframes lzspin{to{--lza:360deg}}
+@keyframes lzflick{0%,60%,100%{opacity:.95;transform:scale(1)}64%{opacity:.25}67%{opacity:1;transform:scale(1.25) rotate(-6deg)}71%{opacity:.3}74%{opacity:1;transform:scale(1.1)}80%{opacity:.9;transform:scale(1)}}
+@keyframes lzrun{from{background-position:-43% 0}to{background-position:143% 0}}
+@keyframes lzshine{0%,55%{transform:translateX(-130%)}100%{transform:translateX(130%)}}
+@keyframes lzcharge{0%,100%{opacity:.7;transform:scale(1)}50%{opacity:1;transform:scale(1.25)}}
+@keyframes lzstrike{0%{opacity:0;transform:scale(.4) var(--fl,rotate(0deg))}10%{opacity:1;transform:scale(1.2) var(--fl,rotate(0deg))}22%{opacity:.25}32%{opacity:1;transform:scale(1) var(--fl,rotate(0deg))}100%{opacity:0;transform:scale(.9) var(--fl,rotate(0deg))}}
+@keyframes lzflash{0%{opacity:0}8%{opacity:1}22%{opacity:.35}34%{opacity:.8}100%{opacity:0}}
+@keyframes lzsky{0%,90%,100%{opacity:0}91%{opacity:.6}92.5%{opacity:.15}94%{opacity:.75}98%{opacity:0}}
+@keyframes lzfly{from{opacity:1;transform:translate(0,0) rotate(var(--r)) scale(.3)}to{opacity:0;transform:translate(var(--dx),var(--dy)) rotate(var(--r)) scale(var(--s))}}
+@keyframes lzring{from{opacity:.9;transform:scale(.3)}to{opacity:0;transform:scale(1.6)}}
+/* balans kartasi: chegara bo'ylab aylanuvchi yorug'lik + miltillovchi chaqmoq */
+html.fx .bal::before{content:"";position:absolute;inset:0;border-radius:inherit;padding:2px;pointer-events:none;background:conic-gradient(from var(--lza),transparent 0 62%,rgba(255,255,255,.2) 74%,#fff 86%,transparent 92%);-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;animation:lzspin 4.2s linear infinite}
+html.fx .bl::after{content:"";flex:none;width:15px;height:21px;background:linear-gradient(180deg,#fff,#FFD24A);-webkit-mask:var(--bolt) center/contain no-repeat;mask:var(--bolt) center/contain no-repeat;animation:lzflick 3.8s 1s infinite}
+/* "To'ldirish": vaqti-vaqti bilan yorug'lik chizig'i o'tadi */
+html.fx .btn{position:relative;overflow:hidden}
+html.fx .btn::after{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(105deg,transparent 30%,rgba(var(--prgb),.38) 50%,transparent 70%);transform:translateX(-130%);animation:lzshine 3.6s 1.4s ease-in-out infinite}
+/* xizmat kartalari: "zaryad" olib turuvchi nur, bosilganda elektr hoshiya */
+html.fx .tile::before{animation:lzcharge 3.4s ease-in-out infinite;animation-delay:calc(var(--i,0)*.6s)}
+html.fx .tile{transition:transform .2s cubic-bezier(.2,1.5,.4,1),box-shadow .3s}
+html.fx .tile:active{box-shadow:inset 0 1px 0 var(--veil),0 0 0 1px rgba(var(--rgb),.9),0 0 24px rgba(var(--rgb),calc(.55*var(--gk)))}
+/* pastki menyu: tepa chiziq bo'ylab yugurib o'tuvchi nur */
+html.fx .nav::before{content:"";position:absolute;top:-1px;left:28px;right:28px;height:2px;border-radius:2px;pointer-events:none;background:linear-gradient(90deg,transparent,var(--link),transparent) -43% 0/30% 100% no-repeat;animation:lzrun 3.4s linear infinite}
+/* fon: ba'zan tepada chaqmoq chaqnaydi */
+html.fx body::after{content:"";position:fixed;left:0;right:0;top:0;height:240px;z-index:-1;pointer-events:none;background:radial-gradient(70% 100% at 70% 0,rgba(var(--prgb),.5),transparent 70%);opacity:0;animation:lzsky 9s 3s infinite}
+/* muvaffaqiyat oynasi: ekran chaqnaydi, ikki chekkadan chaqmoq uriladi */
+html.fx .win.on::before{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(60% 45% at 50% 38%,rgba(var(--rgb),.5),transparent 70%),linear-gradient(180deg,rgba(255,255,255,.12),transparent 40%);animation:lzflash .9s ease-out both}
+html.fx .burst::before,html.fx .burst::after{content:"";position:absolute;top:50%;width:34px;height:50px;margin-top:-25px;background:linear-gradient(180deg,#fff,var(--c));-webkit-mask:var(--bolt) center/contain no-repeat;mask:var(--bolt) center/contain no-repeat;opacity:0;animation:lzstrike 1s .25s ease-out both}
+html.fx .burst::before{left:-30px;--fl:rotate(-14deg)}
+html.fx .burst::after{right:-30px;--fl:scaleX(-1) rotate(-14deg)}
+/* har bosishda chaqmoq uchqunlari (JS .zap yaratadi) */
+.zap{position:fixed;width:0;height:0;z-index:40;pointer-events:none}
+.zap::before{content:"";position:absolute;left:-20px;top:-20px;width:40px;height:40px;border-radius:50%;background:radial-gradient(circle,rgba(255,255,255,.85),rgba(var(--prgb),.35) 45%,transparent 70%);animation:lzring .45s ease-out forwards}
+.zap i{position:absolute;left:-5px;top:-8px;width:10px;height:16px;background:linear-gradient(180deg,#fff,var(--zc,var(--link)));-webkit-mask:var(--bolt) center/contain no-repeat;mask:var(--bolt) center/contain no-repeat;animation:lzfly .6s cubic-bezier(.1,.7,.3,1) forwards}
+@media (prefers-reduced-motion:reduce){.zap{display:none}html.fx .bal::before,html.fx .btn::after,html.fx .nav::before,html.fx body::after{animation:none}}
 </style>
 </head>
 <body>
@@ -638,9 +876,9 @@ return `<h1 class="pg">Qo'llab-quvvatlash</h1><section class="hh"><span class="h
 <section class="blk"><div class="sec"><b>Ko'p so'raladigan savollar</b></div><div class="pan faq"><details open><summary>Balansni qanday to'ldiraman?</summary><p>«To'ldirish» tugmasini bosing, summani kiriting va ko'rsatilgan kartaga AYNAN shu summani o'tkazing. To'lov avtomatik aniqlanadi. Avto-to'lov ishlamasa, chek rasmini yuboring — admin tasdiqlagach balans to'ldiriladi.</p></details><details><summary>Avto-to'lovda nimaga e'tibor beraman?</summary><p>Summa aynan ko'rsatilgandek bo'lishi shart (oxirgi so'mlar to'lovni aniqlash uchun qo'shilgan, ular ham balansingizga tushadi). To'lov vaqti cheklangan — taymer tugamasdan o'tkazing.</p></details><details><summary>Xizmatni qanday sotib olaman?</summary><p>Bosh sahifadan xizmatni tanlang, ma'lumotni kiriting va «Sotib olish» tugmasini 1 soniya bosib turing. Natijani «Buyurtmalar» bo'limidan kuzatasiz.</p></details><details><summary>Raqamga SMS kod kelmasa?</summary><p>Biroz kuting va «Buyurtmalar» bo'limida raqam buyurtmasini ochib, «Kodni tekshirish» tugmasini bosing. Kod baribir kelmasa, kutish vaqti tugagach «Pulni qaytarish» tugmasi orqali pulingizni qaytarib olasiz.</p></details><details><summary>Kodni keyin qayerdan ko'raman?</summary><p>«Buyurtmalar» → raqam buyurtmasi → «Kodni ko'rish». U yerda raqam, kod va 2FA parol bor, har biri uchun nusxalash tugmasi mavjud.</p></details><details><summary>Username yoki ID ni xato kiritsam?</summary><p>Stars, Premium va UC noto'g'ri username yoki ID ga yuborilsa, qaytarib bo'lmaydi. Tasdiqlashdan oldin ma'lumotni yaxshilab tekshiring.</p></details><details><summary>Pul qachon qaytariladi?</summary><p>Buyurtma xatolik bilan tugasa, pul balansingizga o'zi qaytadi. Stars, Premium va UC uzoq «Jarayonda» tursa, buyurtmani ochib «Holatini tekshirish» ni bosing. Boshqa muammo bo'lsa, adminga buyurtma raqamini yozing.</p></details><details><summary>Xavfsizlik: kod va parolni kimga beraman?</summary><p>SMS kod va 2FA parolni hech kimga bermang. Admin ularni hech qachon so'ramaydi.</p></details><details><summary>Keshbek qanday olinadi?</summary><p>«Profil» bo'limidagi havolani do'stlaringizga yuboring. Ular balansini to'ldirgan har safar sizga${kb!="—"?" "+kb:""} keshbek avtomatik qo'shiladi.</p></details></div></section>
 <div class="hsec"><p><b>Javob topolmadingizmi?</b>Adminga yozing va buyurtma raqamini (#) ko'rsating.</p><button type="button" data-adm>Yozish</button></div>`},
 orders:()=>`<h1 class="pg">Buyurtmalar</h1><section class="pan"><div id="ords"></div></section>`,
-admin:()=>`<div class="aph"><h1 class="pg">Admin</h1><button type="button" class="uchip" id="ar">↻ Yangilash</button></div><div id="adb"><p class="hint">Yuklanmoqda…</p></div>`,
+admin:()=>`<div class="adh"><button type="button" class="adk bk" id="ab" aria-label="Profilga qaytish">${IC.chev}</button><h1 class="pg">Admin paneli</h1><button type="button" class="adk" id="ar" aria-label="Yangilash">${IC.ref}</button></div><div id="adb"><p class="hint">Yuklanmoqda…</p></div>`,
 me:()=>{const U=(ME&&ME.user)||{},un=U.username?"@"+esc(U.username):"Username yo'q",ot=ME&&ME.orders_total!=null?ME.orders_total:ords.length;
-return`<section class="pfh"><div class="pfi">${avH()}<div><b>${esc(nm)}</b><small>${un}</small></div></div><div class="pfs"><div><b id="pb">${fmt(bal)}</b><small>Balans, so'm</small></div><div><b id="po">${ot}</b><small>Buyurtmalar</small></div><div><b id="ps">${fmt(U.spent||0)}</b><small>Xarajat, so'm</small></div></div></section>${spend()}${refHTML()}${accHTML()}${palHTML()}`}
+return`<section class="pfh"><div class="pfi">${avH()}<div><b>${esc(nm)}</b><small>${un}</small></div></div><div class="pfs"><div><b id="pb">${fmt(bal)}</b><small>Balans, so'm</small></div><div><b id="po">${ot}</b><small>Buyurtmalar</small></div><div><b id="ps">${fmt(U.spent||0)}</b><small>Xarajat, so'm</small></div></div></section>${ME&&ME.is_admin?admEntry():""}${spend()}${refHTML()}${accHTML()}${palHTML()}`}
 };
 const refHTML=()=>{const r=ME&&ME.referral;return r?`<section class="blk"><div class="sec"><b>Do'stlarni taklif qiling</b></div><div class="pan rfc">${ring(r)}<div class="rst"><div><small>Taklif qilinganlar</small><b>${r.invited} ta</b></div><div><small>Keshbek (${r.percent}%)</small><b>${fmt(r.earned)} so'm</b></div></div><p class="rnote">Do'stingiz balansini to'ldirsa, siz ${r.percent}% keshbek olasiz.</p><div class="rbt"><button type="button" class="pbtn" id="rs">${IC.share}Ulashish</button><button type="button" class="gbtn" id="rc">${IC.copy}Nusxalash</button></div></div></section>`:""};
 const ring=r=>{const n=r.invited||0,nx=[5,10,25,50,100].find(x=>x>n)||n||1,o=(213.6*(1-Math.min(1,n/nx))).toFixed(1),l=nx-n;
@@ -668,16 +906,18 @@ const ST={ok:"Bajarildi",wait:"Jarayonda",bad:"Bajarilmadi",ref:"Qaytarildi"};
 const ordRow=(o,i,fr,st)=>`<div class="ord t-${esc(o.t)}${fr&&i==0?" fresh":""}${st?" st":""}" style="--k:${i}" data-i="${i}" role="button" tabindex="0"><div class="ico">${IC[o.t]||IC.topup}</div><div><b>${esc(o.w)}</b><small>${esc(o.d)}</small></div><div class="r"><b>${fmt(o.p)} <span>so'm</span></b><span class="chip ${ST[o.s]?esc(o.s):"wait"}">${ST[o.s]||ST.wait}</span></div><span class="cv2">${IC.chev}</span></div>`;
 function renderOrd(fresh,st){const e=$("#ords");if(e)e.innerHTML=ords.length?ords.slice(0,99).map((o,i)=>ordRow(o,i,fresh,st)).join(""):'<p class="hint" style="padding:18px 0">Hali buyurtmalar yo\'q</p>'}
 function go(t){
+if(t=="admin"&&!(ME&&ME.is_admin))t="home";
 const f=first;first=false;tab=t;if(!f)hap();const ae=document.activeElement,hadNav=!!(ae&&ae.closest&&ae.closest("#nav")),hadApp=!!(ae&&ae.closest&&ae.closest("#app"));
 const a=$("#app");a.classList.toggle("calm",!f);a.classList.toggle("pgin",!f);a.style.setProperty("--b",f?"700ms":"80ms");a.innerHTML=V[t]();[...a.children].forEach((c,i)=>c.style.setProperty("--k",i));
-const nb=(k,l,i)=>`<button type="button" data-t="${k}"${tab==k?' class="on" aria-current="page"':""}>${IC[i]}<span>${l}</span></button>`;
+const nb=(k,l,i)=>`<button type="button" data-t="${k}"${(tab==k||(tab=="admin"&&k=="me"))?' class="on" aria-current="page"':""}>${IC[i]}<span>${l}</span></button>`;
 const nv=$("#nav");
-nv.innerHTML=nb("home","Bosh sahifa","home")+nb("orders","Buyurtmalar","list")+nb("help","Qo'llab-quvvatlash","help")+nb("me","Profil","me")+(ME&&ME.is_admin?nb("admin","Admin","topup"):"");
+nv.innerHTML=nb("home","Bosh sahifa","home")+nb("orders","Buyurtmalar","list")+nb("help","Qo'llab-quvvatlash","help")+nb("me","Profil","me");
 nv.querySelectorAll("button[data-t]").forEach(b=>b.onclick=()=>go(b.dataset.t));
 if(hadNav){const nb2=nv.querySelector('[data-t="'+t+'"]');if(nb2)nb2.focus({preventScroll:true})}else if(hadApp&&document.documentElement.classList.contains("kb"))a.focus({preventScroll:true});
 renderOrd(0,1);
 if(t=="me")document.querySelectorAll("[data-cp]").forEach(b=>b.onclick=()=>{hap();copy(b.dataset.cp)});
 if(t=="me"&&ME&&ME.referral){$("#rc").onclick=()=>copy(ME.referral.link);$("#rs").onclick=()=>{hap();openUrl("https://t.me/share/url?url="+encodeURIComponent(ME.referral.link)+"&text="+encodeURIComponent("Raqam, Stars, Premium va UC — hammasi bir joyda!"))}}
+if(t=="me"&&ME&&ME.is_admin){$("#adm").onclick=()=>{hap();go("admin")};admPeek()}
 if(t=="admin")admLoad();
 if(t=="help")document.querySelectorAll("[data-adm]").forEach(b=>b.onclick=()=>{hap();const u=ME&&ME.support&&ME.support.url;if(u)return openUrl(u);toast("Savolingizni botga yozing");if(tg)setTimeout(()=>tg.close(),900)});
 if(t=="home"){countTo($("#bal"),f?0:bal,bal,f?1100:300);
@@ -694,28 +934,57 @@ if(q)q.s=r.status;renderOrd();toast(r.status=="ok"?"Buyurtma bajarilgan":r.statu
 catch(e){if(gateErr(e))return;toast(e.message);if(b)b.disabled=false}}
 const ago=t=>{const m=Math.max(0,Math.round((Date.now()/1e3-t)/60));return m<60?m+" daq":m<1440?Math.round(m/60)+" soat":Math.round(m/1440)+" kun"};
 const ask=(m,f)=>{try{if(tg&&tg.showConfirm)return tg.showConfirm(m,o=>{if(o)f()})}catch(e){}if(confirm(m))f()};
-const AD={tab:"ov",d:null},AT=[["ov","Umumiy"],["pay","To'lovlar"],["ord","Buyurtmalar"],["usr","Foydalanuvchi"]];
-const aSt=(l,v,s,c)=>`<div><b${c?` style="color:var(--${c})"`:""}>${v}</b><small>${l}</small>${s?`<small class="sb">${s}</small>`:""}</div>`;
-const admOv=r=>{const low=r.provider!=null&&r.provider_low>0&&r.provider<r.provider_low,T=r.by_type||{},ks=Object.keys(SV).filter(k=>T[k]&&T[k].revenue>0).sort((a,b)=>T[b].revenue-T[a].revenue),tot=ks.reduce((a,k)=>a+T[k].revenue,0);
-return`<section class="hh ahr"><span class="hhi">${IC.topup}</span><small>Bugungi daromad</small><div class="big">${fmt(r.revenue_today)} <em>so'm</em></div><div class="mn"><div><b>${fmt(r.revenue_week)}</b><small>Hafta</small></div><div><b>${fmt(r.revenue_month)}</b><small>Oy</small></div><div><b>${fmt(r.revenue_total)}</b><small>Jami</small></div></div></section>
-<div class="hs">${aSt("Foydalanuvchi",fmt(r.users_total),"+"+r.users_new_today+" bugun")}${aSt("Buyurtma",fmt(r.orders_total),r.orders_today+" bugun")}${aSt("Bloklangan",fmt(r.users_banned))}${aSt("Mijozlar balansi",fmt(r.balance_total))}${aSt("To'ldirish bugun",fmt(r.topups_today),r.topups_today_n+" ta")}${aSt("SmmUpper",r.provider==null?"—":fmt(r.provider),low?"Do'kon yopiq":"Do'kon ochiq",low?"badt":"")}</div>${low?`<p class="warn" style="margin:10px 0 0">⚠️ SmmUpper balansi chegaradan (${fmt(r.provider_low)} so'm) past — xaridlar to'xtatilgan.</p>`:""}
-${ks.length?`<section class="blk"><div class="sec"><b>Xizmatlar bo'yicha daromad</b></div><div class="pan sc"><div class="stk">${ks.map((k,i)=>`<i class="t-${k}" style="--i:${i};flex:${T[k].revenue} 1 0"></i>`).join("")}</div><div class="lgs">${ks.map(k=>`<div class="lg t-${k}"><span class="ico">${IC[k]}</span><div><b>${SV[k].n}</b><small>${Math.round(100*T[k].revenue/tot)}% · ${fmt(T[k].orders)} ta</small></div><span class="am">${fmt(T[k].revenue)} so'm</span></div>`).join("")}</div></div></section>`:""}`};
-const admPay=r=>`<section class="blk" style="margin-top:0"><div class="sec"><b>Kutilayotgan to'ldirishlar</b><small>${r.pending.length} ta</small></div><div class="pan">${r.pending.length?r.pending.map(p=>`<div class="apr" data-id="${p.id}" data-am="${p.amount}"><div><b>${esc(p.name)}</b><small>${fmt(p.amount)} so'm · ${ago(p.created_at)} oldin</small></div><div class="apb"><button data-a="receipt">Chek</button><button class="ok" data-a="approve" aria-label="Tasdiqlash">✓</button><button class="no" data-a="reject" aria-label="Rad etish">✕</button></div></div>`).join(""):'<p class="hint" style="padding:14px 0">Kutilayotgan so\'rov yo\'q</p>'}</div><p class="hint">Oxirgi 24 soatda tasdiqlangan: ${fmt(r.topups_today)} so'm (${r.topups_today_n} ta)</p></section>`;
-const admOrd=r=>`<section class="blk" style="margin-top:0"><div class="sec"><b>Oxirgi buyurtmalar</b><small>${r.recent.length} ta</small></div><div class="pan">${r.recent.length?r.recent.map(o=>`<div class="ord t-${esc(o.t)}"><div class="ico">${IC[o.t]||IC.topup}</div><div><b>${esc(o.w)}</b><small>${esc(o.u)} · ${ago(o.at)}</small></div><div class="r"><b>${fmt(o.p)} <span>so'm</span></b><span class="chip ${ST[o.s]?esc(o.s):"wait"}">${ST[o.s]||ST.wait}</span></div></div>`).join(""):'<p class="hint" style="padding:14px 0">Buyurtmalar yo\'q</p>'}</div></section>`;
+IC.shield=sv('<path d="M12 3l7.5 3v5.5c0 4.6-3.1 8.3-7.5 9.5-4.4-1.2-7.5-4.9-7.5-9.5V6z"/><path d="M9 12l2.2 2.2L15.5 10"/>');
+const AD={tab:"ov",d:null,t:0,per:"revenue_today"},AT=[["ov","Umumiy"],["pay","To'lovlar"],["ord","Buyurtma"],["usr","Mijoz"]],
+PER=[["revenue_today","Bugun","Bugungi daromad"],["revenue_week","Hafta","Haftalik daromad"],["revenue_month","Oy","Oylik daromad"],["revenue_total","Jami","Jami daromad"]];
+/* SmmUpper holati: low — balans chegaradan past; guard — avto-to'xtatish yoqiq; closed — do'kon haqiqatan yopiq (ikkalasi ham bo'lsa) */
+const admState=r=>{const lim=+r.provider_low||0,bal=r.provider,known=bal!=null,low=known&&lim>0&&bal<lim,guard=r.guard!==false;return{lim,bal,known,low,guard,closed:guard&&low,own:r.owner!==false}};
+const admEntry=()=>`<button type="button" class="ad-in" id="adm"><span class="ico t-topup">${IC.shield}</span><span class="lk">Admin paneli<small id="adsub">Statistika, to'lovlar, do'kon holati</small></span><i class="ad-dot" id="addot" hidden></i>${IC.chev}</button>`;
+const admShop=r=>{const s=admState(r),st=s.closed?"off":s.low?"warn":"on",mx=Math.max(s.lim*1.5,s.known?s.bal:0,1),
+fill=s.known?Math.min(100,Math.max(s.bal>0?3:0,s.bal/mx*100)):0,mk=s.lim>0?Math.min(100,s.lim/mx*100):null,
+msg=s.closed?`SmmUpper balansi chegaradan (${fmt(s.lim)} so'm) past — xaridlar to'xtatilgan.`:s.low?`SmmUpper balansi chegaradan (${fmt(s.lim)} so'm) past, lekin avto-to'xtatish o'chiq — xaridlar ochiq. Bajarilmagan xaridda pul foydalanuvchiga qaytariladi.`:!s.known?"SmmUpper balansini olib bo'lmadi. Xaridlar to'sqinliksiz ishlaydi.":s.lim<=0?"Chegara belgilanmagan — xaridlar doim ochiq.":"SmmUpper balansi yetarli — xaridlar ochiq.",
+sub=!s.own?"Buni faqat asosiy admin o'zgartira oladi":s.guard?"Yoqiq: balans chegaradan tushsa, xaridlar o'zi to'xtaydi":"O'chiq: balans qancha bo'lmasin, xaridlar ochiq turadi";
+return`<section class="ad-shop ${st}"><div class="ad-sh"><span class="ad-orb" aria-hidden="true"><i></i></span><div><b>${s.closed?"Do'kon yopiq":"Do'kon ochiq"}</b><small>SmmUpper hisobi</small></div><div class="ad-bl"><b>${s.known?fmt(s.bal):"—"}</b> <small>so'm</small></div></div><div class="ad-mt" role="img" aria-label="SmmUpper balansi ${s.known?fmt(s.bal):"noma'lum"} so'm, chegara ${fmt(s.lim)} so'm"><i style="width:${fill.toFixed(1)}%"></i>${mk!=null?`<u style="left:${mk.toFixed(1)}%"></u>`:""}</div><div class="ad-ml"><span class="tk"></span>Chegara: ${s.lim>0?fmt(s.lim)+" so'm":"belgilanmagan"}</div><p class="ad-msg" role="status">${msg}</p><button type="button" class="ad-sw" id="ag" role="switch" aria-checked="${s.guard}"${s.own?"":" disabled"}><span class="lk">Balans past bo'lsa xaridlarni to'xtatish<small>${sub}</small></span><span class="sw2"><i></i></span></button></section>`};
+const admOv=r=>{const T=r.by_type||{},ks=Object.keys(SV).filter(k=>T[k]&&T[k].revenue>0).sort((a,b)=>T[b].revenue-T[a].revenue),tot=ks.reduce((a,k)=>a+T[k].revenue,0),pd=r.pending.length,pe=PER.find(x=>x[0]==AD.per)||PER[0];
+return admShop(r)+(pd?`<button type="button" class="ad-pend" data-go="pay"><b>${pd} ta to'lov tasdiq kutmoqda</b>${IC.chev}</button>`:"")
++`<section class="hh ad-rev"><span class="hhi">${IC.topup}</span><div class="ad-pr">${PER.map(x=>`<button type="button" data-p="${x[0]}" aria-pressed="${x[0]==pe[0]}">${x[1]}</button>`).join("")}</div><small id="arl">${pe[2]}</small><div class="ad-big"><span id="arv">${fmt(r[pe[0]])}</span> <em>so'm</em></div></section>`
++`<div class="ad-k"><div><small>Foydalanuvchilar</small><b>${fmt(r.users_total)}</b><span class="sb${r.users_new_today>0?" up":""}">+${fmt(r.users_new_today)} bugun</span></div><div><small>Buyurtmalar</small><b>${fmt(r.orders_total)}</b><span class="sb">${fmt(r.orders_today)} ta bugun</span></div><div><small>To'ldirish, 24 soat</small><b>${fmt(r.topups_today)} <em>so'm</em></b><span class="sb">${fmt(r.topups_today_n)} ta</span></div><div><small>Bloklangan</small><b>${fmt(r.users_banned)}</b><span class="sb">foydalanuvchi</span></div><div class="w2"><small>Mijozlar balansi</small><b>${fmt(r.balance_total)} <em>so'm</em></b><span class="sb">Hamma foydalanuvchilar hisobidagi jami pul</span></div></div>`
++(ks.length?`<section class="blk"><div class="sec"><b>Xizmatlar bo'yicha daromad</b></div><div class="pan sc"><div class="stk">${ks.map((k,i)=>`<i class="t-${k}" style="--i:${i};flex:${T[k].revenue} 1 0"></i>`).join("")}</div><div class="lgs">${ks.map(k=>`<div class="lg t-${k}"><span class="ico">${IC[k]}</span><div><b>${SV[k].n}</b><small>${Math.round(100*T[k].revenue/tot)}% va ${fmt(T[k].orders)} ta buyurtma</small></div><span class="am">${fmt(T[k].revenue)} so'm</span></div>`).join("")}</div></div></section>`:"")};
+const admPay=r=>`<section class="blk" style="margin-top:0"><div class="sec"><b>Kutilayotgan to'ldirishlar</b><small>${r.pending.length} ta</small></div><div class="pan">${r.pending.length?r.pending.map(p=>`<div class="apr" data-id="${p.id}" data-am="${p.amount}"><div><b>${esc(p.name)}</b><span class="amt">${fmt(p.amount)} so'm</span><small>${ago(p.created_at)} oldin</small></div><div class="apb"><button data-a="receipt">Chek</button><button class="ok" data-a="approve" aria-label="Tasdiqlash">✓</button><button class="no" data-a="reject" aria-label="Rad etish">✕</button></div></div>`).join(""):'<p class="hint" style="padding:14px 0">Tasdiq kutayotgan to\'lov yo\'q</p>'}</div><p class="hint">Oxirgi 24 soatda tasdiqlangan: ${fmt(r.topups_today)} so'm (${r.topups_today_n} ta)</p></section>`;
+const admOrd=r=>`<section class="blk" style="margin-top:0"><div class="sec"><b>Oxirgi buyurtmalar</b><small>${r.recent.length} ta</small></div><div class="pan">${r.recent.length?r.recent.map(o=>`<div class="ord t-${esc(o.t)}"><div class="ico">${IC[o.t]||IC.topup}</div><div><b>${esc(o.w)}</b><small>${esc(o.u)}, ${ago(o.at)} oldin</small></div><div class="r"><b>${fmt(o.p)} <span>so'm</span></b><span class="chip ${ST[o.s]?esc(o.s):"wait"}">${ST[o.s]||ST.wait}</span></div></div>`).join(""):'<p class="hint" style="padding:14px 0">Buyurtmalar yo\'q</p>'}</div></section>`;
 const admUsr=()=>`<section class="blk" style="margin-top:0"><div class="sec"><b>Foydalanuvchini topish</b></div><input class="in" id="aq" placeholder="ID yoki @username" autocomplete="off" autocapitalize="off"><button type="button" class="btn2" id="aqb">Topish</button><div id="aur"></div></section>`;
 function admDraw(){const r=AD.d,e=$("#adb");if(!r||!e)return;
-e.innerHTML=`<div class="atb">${AT.map(x=>`<button type="button" data-k="${x[0]}"${AD.tab==x[0]?' class="on"':""}>${x[1]}${x[0]=="pay"&&r.pending.length?`<i>${r.pending.length}</i>`:""}</button>`).join("")}</div>`+({ov:admOv,pay:admPay,ord:admOrd,usr:admUsr}[AD.tab])(r);
-e.querySelectorAll(".atb button").forEach(b=>b.onclick=()=>{hap();AD.tab=b.dataset.k;admDraw()});
+e.innerHTML=`<div class="ad-tb" role="tablist">${AT.map(x=>`<button type="button" role="tab" data-k="${x[0]}" aria-selected="${AD.tab==x[0]}"${AD.tab==x[0]?' class="on"':""}>${x[1]}${x[0]=="pay"&&r.pending.length?`<i>${r.pending.length}</i>`:""}</button>`).join("")}</div>`+({ov:admOv,pay:admPay,ord:admOrd,usr:admUsr}[AD.tab])(r);
+e.querySelectorAll(".ad-tb button").forEach(b=>b.onclick=()=>{if(AD.tab==b.dataset.k)return;hap();AD.tab=b.dataset.k;admDraw();window.scrollTo(0,0)});
+e.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>{hap();AD.tab=b.dataset.go;admDraw();window.scrollTo(0,0)});
+e.querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{const k=b.dataset.p;if(k==AD.per)return;hap();const o=AD.d[AD.per];AD.per=k;
+e.querySelectorAll("[data-p]").forEach(x=>x.setAttribute("aria-pressed",String(x.dataset.p==k)));$("#arl").textContent=PER.find(x=>x[0]==k)[2];countTo($("#arv"),o,AD.d[k],500)});
+const ag=$("#ag");if(ag)ag.onclick=()=>admGuard();
 e.querySelectorAll(".apr button").forEach(b=>b.onclick=()=>{const w=b.closest(".apr"),a=b.dataset.a,id=w.dataset.id;hap();
 if(a=="receipt")return call("/api/admin/receipt",{body:{id}}).then(()=>toast("Chek botga yuborildi"),x=>toast(x.message));
 ask((a=="approve"?"Tasdiqlansinmi: ":"Rad etilsinmi: ")+fmt(w.dataset.am)+" so'm?",async()=>{try{await call("/api/admin/topup",{body:{id,action:a}});toast(a=="approve"?"Tasdiqlandi":"Rad etildi")}catch(x){toast(x.message)}admLoad()})});
 const q=$("#aqb");if(q){q.onclick=admFind;$("#aq").onkeydown=ev=>{if(ev.key=="Enter")admFind()}}}
-async function admLoad(){const rb=$("#ar");if(rb)rb.onclick=()=>{hap();admLoad()};if(AD.d)admDraw();
-try{AD.d=await call("/api/admin/stats");if(tab=="admin")admDraw()}
-catch(x){if(gateErr(x))return;const e=$("#adb");if(e&&!AD.d)e.innerHTML=`<p class="hint err">${esc(x.message)}</p>`;else toast(x.message)}}
+/* SmmUpper avto-to'xtatishni yoqish/o'chirish (server: /api/admin/shop). Do'kon holatini o'zgartiradigan bo'lsa — avval so'raydi. */
+function admGuard(){const r=AD.d,btn=$("#ag");if(!r||!btn||btn.disabled)return;const s=admState(r),want=!s.guard;hap();
+const run=async()=>{btn.disabled=true;try{const x=await call("/api/admin/shop",{body:{guard:want}});AD.d.guard=x.guard;AD.d.shop_open=x.shop_open;
+toast(x.guard?(admState(AD.d).closed?"Yoqildi — balans past, do'kon yopildi":"Avto-to'xtatish yoqildi"):"O'chirildi — xaridlar ochiq")}
+catch(e){if(gateErr(e))return;toast(e.message)}admDraw()};
+if(!want&&s.low)return ask("Avto-to'xtatish o'chiriladi va xaridlar ochiladi, balans past bo'lsa ham. Davom etamizmi?",run);
+if(want&&s.low)return ask("Balans chegaradan past — avto-to'xtatish yoqilsa, do'kon yopiladi. Davom etamizmi?",run);
+run()}
+async function admLoad(){const rb=$("#ar"),bk=$("#ab");if(bk)bk.onclick=()=>{hap();go("me")};if(rb)rb.onclick=()=>{hap();admLoad()};if(AD.d)admDraw();
+if(rb)rb.classList.add("ld");
+try{AD.d=await call("/api/admin/stats");AD.t=Date.now();if(tab=="admin")admDraw()}
+catch(x){if(gateErr(x))return;const e=$("#adb");if(e&&!AD.d)e.innerHTML=`<p class="hint err">${esc(x.message)}</p>`;else toast(x.message)}
+finally{const b=$("#ar");if(b)b.classList.remove("ld")}}
+/* Profil sahifasidagi "Admin paneli" kartasi: do'kon holati va kutilayotgan to'lovlar soni (so'rov 20 soniya keshlanadi) */
+async function admPeek(){try{if(!AD.d||Date.now()-AD.t>20000){AD.d=await call("/api/admin/stats");AD.t=Date.now()}
+if(tab!="me")return;const r=AD.d,s=admState(r),n=r.pending.length,sub=$("#adsub"),dt=$("#addot");
+if(sub)sub.textContent=(s.closed?"Do'kon yopiq":"Do'kon ochiq")+(n?", "+n+" ta to'lov kutmoqda":"");
+if(dt){dt.hidden=!(s.closed||n);dt.className="ad-dot"+(s.closed?" bad":"")}}catch(e){}}
 async function admFind(){const q=$("#aq").value.trim(),o=$("#aur");if(!q)return;
 try{const u=await call("/api/admin/user",{body:{q}});
-o.innerHTML=`<div class="pan" style="margin-top:10px;padding:12px 14px"><b>${esc(u.name||"Foydalanuvchi")}</b>${u.banned?' <small style="color:var(--badt)">(bloklangan)</small>':""}<br><small class="mut">${u.username?"@"+esc(u.username)+" · ":""}ID ${u.id}</small><div class="kv"><span>Balans</span><b id="ab">${fmt(u.balance)} so'm</b></div><div class="kv"><span>Buyurtmalar</span><b>${u.orders} ta</b></div><div class="kv"><span>Xarajat</span><b>${fmt(u.spent)} so'm</b></div><input class="in" id="aa" inputmode="numeric" placeholder="Summa" autocomplete="off" style="margin-top:10px"><div class="row two" style="margin-top:8px"><button type="button" class="btn2" data-s="1">Qo'shish</button><button type="button" class="btn2 dng" data-s="-1">Ayirish</button></div></div>`;
+o.innerHTML=`<div class="ad-u"><h3>${esc(u.name||"Foydalanuvchi")}${u.banned?'<span class="ban">bloklangan</span>':""}</h3><small class="mut">${u.username?"@"+esc(u.username)+", ":""}ID ${u.id}</small><div class="kv"><span>Balans</span><b id="ab">${fmt(u.balance)} so'm</b></div><div class="kv"><span>Buyurtmalar</span><b>${u.orders} ta</b></div><div class="kv"><span>Xarajat</span><b>${fmt(u.spent)} so'm</b></div><input class="in" id="aa" inputmode="numeric" placeholder="Summa" autocomplete="off" style="margin-top:10px"><div class="row two" style="margin-top:8px"><button type="button" class="btn2" data-s="1">Qo'shish</button><button type="button" class="btn2 dng" data-s="-1">Ayirish</button></div></div>`;
 const aa=$("#aa");aa.oninput=()=>{aa.value=aa.value.replace(/\D/g,"").slice(0,9)};
 o.querySelectorAll("[data-s]").forEach(b=>b.onclick=()=>{const v=+aa.value,sg=+b.dataset.s;if(!v)return toast("Summani kiriting");hap();
 ask(fmt(v)+" so'm "+(sg>0?"qo'shilsinmi?":"ayirilsinmi?"),async()=>{try{const r=await call("/api/admin/balance",{body:{id:u.id,amount:sg*v}});$("#ab").textContent=fmt(r.balance)+" so'm";aa.value="";toast("Bajarildi")}catch(x){toast(x.message)}})})}
@@ -1043,6 +1312,19 @@ if(m){e.preventDefault();flag(true);m()}});
 document.addEventListener("click",e=>{const t=e.target.closest&&e.target.closest("[data-pk],[data-md],.pxb,[data-kbh],[data-close]");if(!t)return;
 if(t.dataset.pk)PAL.setPal(t.dataset.pk);else if(t.dataset.md)PAL.setMode(t.dataset.md);else if(t.classList.contains("pxb"))PAL.sheet();else if(t.dataset.kbh!=null)help();else show(false)});
 return{help,sync,flag}})();
+
+/* chaqmoq uchqunlari: faqat tap qilinganda (barmoq surilsa — scroll — chiqmaydi) */
+(()=>{const H=document.documentElement,SEL=".tile,.btn,.btn2,.pbtn,.gbtn,.opt,.nav>button,.av,.cp,.hold,.ord";let d=null;
+addEventListener("pointerdown",e=>{d=null;if(!H.classList.contains("fx")||!e.isPrimary)return;
+const t=e.target.closest&&e.target.closest(SEL);if(!t)return;let c="";try{c=getComputedStyle(t).getPropertyValue("--c").trim()}catch(x){}
+d={x:e.clientX,y:e.clientY,c}},{passive:true,capture:true});
+addEventListener("pointercancel",()=>{d=null},true);
+addEventListener("pointerup",e=>{const s=d;d=null;
+if(!s||Math.abs(e.clientX-s.x)>10||Math.abs(e.clientY-s.y)>10||document.querySelectorAll(".zap").length>3)return;
+const z=document.createElement("div");z.className="zap";z.style.left=s.x+"px";z.style.top=s.y+"px";if(s.c)z.style.setProperty("--zc",s.c);
+for(let i=0;i<7;i++){const b=document.createElement("i"),a=i/7*6.283+Math.random()*.6,r=26+Math.random()*28;
+b.style.cssText="--dx:"+(Math.cos(a)*r|0)+"px;--dy:"+(Math.sin(a)*r|0)+"px;--r:"+((a*57.3+90)|0)+"deg;--s:"+(.6+Math.random()*.7).toFixed(2);z.appendChild(b)}
+document.body.appendChild(z);setTimeout(()=>z.remove(),700)},{passive:true,capture:true})})();
 </script>
 </body>
 </html>

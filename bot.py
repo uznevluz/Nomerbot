@@ -2672,8 +2672,17 @@ _NEWS_URL = ""     # "Yangiliklar kanali" tugmasi havolasi (ishga tushganda va a
 
 def main_menu() -> InlineKeyboardMarkup:
     """Bosh menyu (inline): "Xaridni boshlash" + "Yangiliklar kanali". Pastki (reply) klaviatura endi yo'q;
-    main_menu() chaqiriladigan barcha joylar o'zgarishsiz ishlaydi."""
-    rows = [[InlineKeyboardButton(text="\U0001F6CD Xaridni boshlash \U0001F6CD", callback_data="menu:shop", style=STYLE_PRIMARY)]]
+    main_menu() chaqiriladigan barcha joylar o'zgarishsiz ishlaydi.
+
+    "Xaridni boshlash" Mini App'ni TO'G'RIDAN-TO'G'RI ochadi (web_app tugmasi) — chatda boshqa tugmalar chiqmaydi.
+    Mini App manzili sozlanmagan bo'lsa (MINIAPP_URL / RENDER_EXTERNAL_URL) — eski usul: chat ichidagi xizmatlar menyusi."""
+    mini_url = miniapp_url()
+    if mini_url:
+        # DIQQAT: faqat INLINE web_app tugmasi — shunda Telegram initData beradi (reply-klaviaturada bermaydi).
+        rows = [[InlineKeyboardButton(text="\U0001F6CD Xaridni boshlash \U0001F6CD", web_app=WebAppInfo(url=mini_url),
+                                      style=STYLE_PRIMARY)]]
+    else:
+        rows = [[InlineKeyboardButton(text="\U0001F6CD Xaridni boshlash \U0001F6CD", callback_data="menu:shop", style=STYLE_PRIMARY)]]
     if _is_valid_button_url(_NEWS_URL):
         rows.append([InlineKeyboardButton(text="\U0001F4E2 Yangiliklar kanali", url=_NEWS_URL)])
     return _kb(rows)
@@ -5688,6 +5697,7 @@ PROVIDER_LOW_DEFAULT = int(os.getenv("PROVIDER_LOW_BALANCE", "50000"))     # so'
 PROVIDER_CHECK_SECONDS = 600                                               # har 10 daqiqada tekshiriladi
 PROVIDER_REALERT_SECONDS = 6 * 3600                                        # past tursa — har 6 soatda eslatiladi
 SETTINGS_KEY_PROVIDER_LOW = "provider_low_balance"
+SETTINGS_KEY_PROVIDER_GUARD = "provider_guard"      # "1" (standart) — balans chegaradan past bo'lsa Mini App xaridlari to'xtaydi; "0" — to'xtamaydi
 
 
 async def _provider_balance() -> Optional[int]:
@@ -5704,6 +5714,12 @@ async def _provider_low_limit() -> int:
         return max(0, int(raw)) if raw is not None else PROVIDER_LOW_DEFAULT
     except (TypeError, ValueError):
         return PROVIDER_LOW_DEFAULT
+
+
+async def _provider_guard_on() -> bool:
+    """Avto-himoya yoqiqmi? Sozlama yo'q bo'lsa — YOQIQ (eski xatti-harakat saqlanadi)."""
+    raw = await get_setting(SETTINGS_KEY_PROVIDER_GUARD, default=None)
+    return str(raw).strip().lower() not in ("0", "false", "off", "no")
 
 
 async def provider_balance_watch(bot):
@@ -6146,8 +6162,10 @@ async def provider_balance_cmd(message: Message):
     limit_line = f"{fmt_money(limit)} so'm" if limit > 0 else "o'chiq"
     await message.answer(
         f"\U0001F4B0 SmmUpper balansi: {now_line}\n"
-        f"\u26A0\uFE0F Ogohlantirish chegarasi: {limit_line}\n\n"
-        f"Chegarani o'zgartirish: /setlow 100000  (0 \u2014 o'chirish)")
+        f"\u26A0\uFE0F Ogohlantirish chegarasi: {limit_line}\n"
+        f"\U0001F6E1 Xaridlarni avto-to'xtatish: {'yoqiq' if await _provider_guard_on() else 'ochiq (o`chirilgan)'}\n\n"
+        f"Chegarani o'zgartirish: /setlow 100000  (0 \u2014 o'chirish)\n"
+        f"Avto-to'xtatishni yoqish/o'chirish: Mini App \u2192 Profil \u2192 Admin paneli")
 
 
 @router_admin.message(Command("setlow"))
@@ -9614,9 +9632,9 @@ async def _ma_shop_open() -> bool:
     if now - _MA_SHOP["ts"] > 60:
         _MA_SHOP["ts"] = now
         try:
-            low, bal = await _provider_low_limit(), await _provider_balance()
-            # chegara 0 bo'lsa yoki balansni bilib bo'lmasa — xaridga TO'SQINLIK QILINMAYDI
-            _MA_SHOP["open"] = 1.0 if (low <= 0 or bal is None or bal >= low) else 0.0
+            low, bal, guard = await _provider_low_limit(), await _provider_balance(), await _provider_guard_on()
+            # himoya o'chiq, chegara 0 bo'lsa yoki balansni bilib bo'lmasa — xaridga TO'SQINLIK QILINMAYDI
+            _MA_SHOP["open"] = 1.0 if (not guard or low <= 0 or bal is None or bal >= low) else 0.0
         except Exception:
             _MA_SHOP["open"] = 1.0
     return bool(_MA_SHOP["open"])
@@ -9641,7 +9659,7 @@ def _ma_int(v) -> int:
 
 @_ma_route
 async def _ma_api_admin_stats(request: web.Request, user: dict) -> web.Response:
-    await _ma_admin(user)
+    admin_id = await _ma_admin(user)
     st = await get_stats()
     keys = ("revenue_today", "revenue_week", "revenue_month", "revenue_total", "users_total", "users_new_today",
             "users_banned", "orders_today", "orders_total", "balance_total")
@@ -9672,7 +9690,24 @@ async def _ma_api_admin_stats(request: web.Request, user: dict) -> web.Response:
                        "u": r["full_name"] or (("@" + r["username"]) if r["username"] else str(r["user_id"]))})
     out["recent"] = recent
     out["provider"], out["provider_low"] = await _provider_balance(), await _provider_low_limit()
+    out["guard"], out["shop_open"], out["owner"] = await _provider_guard_on(), await _ma_shop_open(), _is_owner(admin_id)
     return _ma_json({"ok": True, **out})
+
+
+@_ma_route
+async def _ma_api_admin_shop(request: web.Request, user: dict) -> web.Response:
+    """SmmUpper avto-himoyasini yoqish/o'chirish. Xavfli sozlama (xarid to'xtashi yoki ochiq qolishi) — FAQAT asosiy
+    adminlar (.env ADMIN_IDS), /setlow kabi."""
+    admin_id = await _ma_admin(user)
+    if not _is_owner(admin_id):
+        raise _MaError(403, "owner_only", "Buni faqat asosiy admin o'zgartira oladi.")
+    guard = (await _ma_body(request)).get("guard")
+    if not isinstance(guard, bool):
+        raise _MaError(400, "bad_request", "So'rov noto'g'ri.")
+    await set_setting(SETTINGS_KEY_PROVIDER_GUARD, "1" if guard else "0")
+    await log_admin_action(admin_id, "shop_guard", note="yoqildi" if guard else "o'chirildi (Mini App)")
+    _MA_SHOP["ts"] = 0.0          # kesh eskirdi: yangi holat darrov kuchga kiradi
+    return _ma_json({"ok": True, "guard": guard, "shop_open": await _ma_shop_open()})
 
 
 @_ma_route
@@ -9816,6 +9851,7 @@ def miniapp_setup_routes(app: web.Application) -> None:
     app.router.add_post("/api/admin/receipt", _ma_api_admin_receipt)
     app.router.add_post("/api/admin/user", _ma_api_admin_user)
     app.router.add_post("/api/admin/balance", _ma_api_admin_balance)
+    app.router.add_post("/api/admin/shop", _ma_api_admin_shop)
 
 
 async def miniapp_setup_bot(bot) -> None:
@@ -9868,6 +9904,12 @@ async def menu_start(callback: CallbackQuery, state: FSMContext):
 @router_menu.callback_query(F.data == "menu:shop")
 async def menu_shop(callback: CallbackQuery, state: FSMContext):
     await state.clear()
+    if miniapp_url():
+        # Eski xabardagi tugma bosildi: xizmatlar ro'yxatini chiqarmaymiz — tugmani Mini App tugmasiga almashtiramiz.
+        with contextlib.suppress(Exception):
+            await callback.message.edit_reply_markup(reply_markup=main_menu())
+        await callback.answer("\U0001F6CD Do'kon yangilandi \u2014 «Xaridni boshlash» tugmasini qayta bosing.", show_alert=True)
+        return
     try:
         await callback.message.edit_reply_markup(reply_markup=shop_menu())
     except Exception:
