@@ -35,6 +35,7 @@ from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    ChatMemberUpdated,
     CopyTextButton,
     ErrorEvent,
     FSInputFile,
@@ -323,6 +324,8 @@ async def init_db():
             # qolmasligi uchun.
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_flow_msg_id BIGINT")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT")
+            # Foydalanuvchi botni to'xtatgan/bloklagan (chiqib ketgan) bo'lsa TRUE (my_chat_member orqali yangilanadi)
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS left_bot BOOLEAN NOT NULL DEFAULT FALSE")
     else:
         async with _db_sqlite() as db:
             # WAL rejimi baza faylida doimiy saqlanadi — shuning uchun bu
@@ -359,6 +362,10 @@ async def init_db():
                 await db.execute("ALTER TABLE users ADD COLUMN phone TEXT")
             except Exception:
                 pass
+            try:
+                await db.execute("ALTER TABLE users ADD COLUMN left_bot INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass
             await db.commit()
 
 
@@ -372,34 +379,129 @@ async def user_exists(user_id: int) -> bool:
         return await cur.fetchone() is not None
 
 
-async def ensure_user(user_id: int, username: Optional[str], full_name: Optional[str], referred_by: Optional[int] = None):
+async def ensure_user(user_id: int, username: Optional[str], full_name: Optional[str], referred_by: Optional[int] = None) -> bool:
     """`referred_by` faqat foydalanuvchi ENDI birinchi marta yaratilayotganda
     o'rnatiladi — INSERT OR IGNORE / ON CONFLICT DO NOTHING tufayli, agar u
     allaqachon mavjud bo'lsa, bu qiymat e'tiborsiz qoldiriladi (referal
-    keyinchalik boshqacha /start bosilsa ham o'zgarmay qoladi)."""
+    keyinchalik boshqacha /start bosilsa ham o'zgarmay qoladi).
+    Qaytadi: True — foydalanuvchi ENDI yaratildi (yangi), False — avvaldan bor edi.
+    Yangi bo'lsa, adminlarga xabar fonda yuboriladi."""
     if _PG:
         async with _pool.acquire() as conn:
-            await conn.execute(
+            res = await conn.execute(
                 "INSERT INTO users (user_id, username, full_name, balance, created_at, referred_by) "
                 "VALUES ($1, $2, $3, 0, $4, $5) ON CONFLICT (user_id) DO NOTHING",
                 user_id, username, full_name, int(time.time()), referred_by,
             )
+            is_new = res.split()[-1] == "1"
+            back = await conn.execute(
+                "UPDATE users SET left_bot = FALSE WHERE user_id = $1 AND left_bot = TRUE", user_id)
+            returned = back.split()[-1] != "0"
             await conn.execute(
                 "UPDATE users SET username = $1, full_name = $2 WHERE user_id = $3",
                 username, full_name, user_id,
             )
     else:
         async with _db_sqlite() as db:
-            await db.execute(
+            cur = await db.execute(
                 "INSERT OR IGNORE INTO users (user_id, username, full_name, balance, created_at, referred_by) "
                 "VALUES (?, ?, ?, 0, ?, ?)",
                 (user_id, username, full_name, int(time.time()), referred_by),
             )
+            is_new = cur.rowcount > 0
+            cur = await db.execute("UPDATE users SET left_bot = 0 WHERE user_id = ? AND left_bot = 1", (user_id,))
+            returned = cur.rowcount > 0
             await db.execute(
                 "UPDATE users SET username = ?, full_name = ? WHERE user_id = ?",
                 (username, full_name, user_id),
             )
             await db.commit()
+    if is_new:
+        _schedule_notice(_new_user_notice(user_id, username, full_name, referred_by))
+    elif returned:
+        _schedule_notice(_returned_notice(user_id, username, full_name))
+    return is_new
+
+
+# ---------- Yangi foydalanuvchi / botdan chiqib ketish haqida adminga xabar ----------
+_NOTIFY_BOT: Optional[Bot] = None       # main() da o'rnatiladi
+
+
+async def set_user_left(user_id: int, left: bool) -> bool:
+    """users.left_bot ni yangilaydi. True qaytadi — holat HAQIQATAN o'zgargan bo'lsa (takroriy xabar chiqmasligi uchun)."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            res = await conn.execute(
+                "UPDATE users SET left_bot = $1 WHERE user_id = $2 AND left_bot IS DISTINCT FROM $1", left, user_id)
+            return res.split()[-1] != "0"
+    async with _db_sqlite() as db:
+        cur = await db.execute(
+            "UPDATE users SET left_bot = ? WHERE user_id = ? AND left_bot != ?", (int(left), user_id, int(left)))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def count_users_split() -> tuple:
+    """(jami, botdan chiqib ketganlar)."""
+    if _PG:
+        async with _pool.acquire() as conn:
+            total = await conn.fetchval("SELECT COUNT(*) FROM users")
+            left = await conn.fetchval("SELECT COUNT(*) FROM users WHERE left_bot = TRUE")
+    else:
+        async with _db_sqlite() as db:
+            cur = await db.execute("SELECT COUNT(*) FROM users")
+            total = (await cur.fetchone())[0]
+            cur = await db.execute("SELECT COUNT(*) FROM users WHERE left_bot = 1")
+            left = (await cur.fetchone())[0]
+    return int(total or 0), int(left or 0)
+
+
+def _user_line(user_id: int, username: Optional[str], full_name: Optional[str]) -> str:
+    dash = "\u2014"
+    uname = f"@{username}" if username else dash
+    return f"\U0001F464 {full_name or dash}\n\U0001F517 {uname}\n\U0001F194 {user_id}"
+
+
+async def _notify_admins_text(text: str) -> None:
+    bot = _NOTIFY_BOT
+    if bot is None:
+        return
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception:
+            pass
+
+
+async def _new_user_notice(user_id: int, username: Optional[str], full_name: Optional[str], referred_by) -> None:
+    try:
+        total, left = await count_users_split()
+        ref = f"\n\U0001F465 Taklif qilgan: {referred_by}" if referred_by else ""
+        await _notify_admins_text(
+            f"\U0001F195 Yangi foydalanuvchi!\n\n{_user_line(user_id, username, full_name)}{ref}\n\n"
+            f"\U0001F4CA Jami: {total} (faol: {total - left})")
+    except Exception:
+        logging.exception("Yangi foydalanuvchi haqida xabar yuborib bo'lmadi")
+
+
+async def _returned_notice(user_id: int, username: Optional[str], full_name: Optional[str]) -> None:
+    try:
+        total, left = await count_users_split()
+        await _notify_admins_text(
+            f"\U0001F501 Foydalanuvchi botga qaytdi\n\n{_user_line(user_id, username, full_name)}\n\n"
+            f"\U0001F4CA Jami: {total} (faol: {total - left})")
+    except Exception:
+        logging.exception("Qaytgan foydalanuvchi haqida xabar yuborib bo'lmadi")
+
+
+def _schedule_notice(coro) -> None:
+    """Admin xabarini fonda yuboradi (ensure_user'ni sekinlashtirmaydi)."""
+    if _NOTIFY_BOT is None:
+        coro.close()
+        return
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 async def get_referral_stats(user_id: int) -> dict:
@@ -3300,6 +3402,26 @@ class AdminPanel(StatesGroup):
 # UMUMIY HANDLERLAR (handler_common)
 # ==============================================================
 router_common = Router(name="common")
+
+
+@router_common.my_chat_member(F.chat.type == "private")
+async def on_bot_membership_changed(event: ChatMemberUpdated):
+    """Foydalanuvchi botni bloklasa/to'xtatsa (kicked/left) yoki qayta yoqsa (member) — adminga xabar.
+    Bu update'lar message/callback middleware'laridan o'tmaydi (ban/throttle ta'sir qilmaydi)."""
+    user = event.from_user
+    status = event.new_chat_member.status
+    if status in ("kicked", "left"):
+        if not await set_user_left(user.id, True):
+            return                          # bazada yo'q yoki allaqachon belgilangan
+        total, left = await count_users_split()
+        bal = await get_balance(user.id)
+        await _notify_admins_text(
+            f"\U0001F6AA Foydalanuvchi botni bloklab chiqib ketdi\n\n{_user_line(user.id, user.username, user.full_name)}\n"
+            f"\U0001F4B0 Balansi: {fmt_money(bal)} so'm\n\n"
+            f"\U0001F4CA Jami: {total} (faol: {total - left}, chiqib ketgan: {left})")
+    elif status == "member":
+        if await set_user_left(user.id, False):
+            await _returned_notice(user.id, user.username, user.full_name)
 # MUHIM: router_admin ATAYIN shu yerda, boshqa routerlar bilan birga
 # e'lon qilinadi (garchi uning handlerlari faylning pastida, "ADMIN PANEL
 # HANDLER" bo'limida joylashgan bo'lsa ham). Sababi: pastroqda,
@@ -6485,6 +6607,8 @@ async def _run_broadcast(bot, chat_id: int, message_id: Optional[int], text: str
                 continue
             except TelegramForbiddenError:
                 blocked += 1
+                with contextlib.suppress(Exception):
+                    await set_user_left(user_id, True)      # keyingi hisobotlarda "chiqib ketgan" bo'lib ko'rinadi
                 break
             except Exception:
                 failed += 1
@@ -10107,6 +10231,8 @@ async def main():
         logging.exception("Avto-to'lov jadvallarini yaratib bo'lmadi (bot qo'lda rejimda ishlayveradi)")
 
     bot = Bot(token=BOT_TOKEN)
+    global _NOTIFY_BOT
+    _NOTIFY_BOT = bot
     AUTOPAY.attach(bot)
     dp = Dispatcher(storage=PersistentStorage())
     dp.errors.register(global_error_handler)
