@@ -385,7 +385,7 @@ async def ensure_user(user_id: int, username: Optional[str], full_name: Optional
     allaqachon mavjud bo'lsa, bu qiymat e'tiborsiz qoldiriladi (referal
     keyinchalik boshqacha /start bosilsa ham o'zgarmay qoladi).
     Qaytadi: True — foydalanuvchi ENDI yaratildi (yangi), False — avvaldan bor edi.
-    Yangi bo'lsa, adminlarga xabar fonda yuboriladi."""
+    Yangi foydalanuvchi haqida adminga xabar telefon tasdiqlanganda yuboriladi (phone_received)."""
     if _PG:
         async with _pool.acquire() as conn:
             res = await conn.execute(
@@ -416,9 +416,9 @@ async def ensure_user(user_id: int, username: Optional[str], full_name: Optional
                 (username, full_name, user_id),
             )
             await db.commit()
-    if is_new:
-        _schedule_notice(_new_user_notice(user_id, username, full_name, referred_by))
-    elif returned:
+    # "Yangi foydalanuvchi" xabari bu yerda EMAS: telefon raqami tasdiqlanganda (phone_received) telefon va profil
+    # havolasi bilan yuboriladi. Bu yerda faqat botga QAYTGANLAR haqida xabar beriladi.
+    if returned and not is_new:
         _schedule_notice(_returned_notice(user_id, username, full_name))
     return is_new
 
@@ -456,40 +456,91 @@ async def count_users_split() -> tuple:
     return int(total or 0), int(left or 0)
 
 
-def _user_line(user_id: int, username: Optional[str], full_name: Optional[str]) -> str:
+def _profile_url(user_id: int, username: Optional[str]) -> str:
+    return f"https://t.me/{username}" if username else f"tg://user?id={user_id}"
+
+
+def _profile_markup(user_id: int, username: Optional[str]) -> InlineKeyboardMarkup:
+    """«Profilni ko'rish» tugmasi: username bo'lsa t.me havolasi, bo'lmasa ID bo'yicha profil."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="\U0001F464 Profilni ko'rish", url=_profile_url(user_id, username))]])
+
+
+def _user_line(user_id: int, username: Optional[str], full_name: Optional[str], phone: Optional[str] = None) -> str:
+    """Adminga yuboriladigan foydalanuvchi kartasi (HTML: ism bosilsa profil ochiladi). _notify_admins_text HTML bilan yuboradi."""
     dash = "\u2014"
-    uname = f"@{username}" if username else dash
-    return f"\U0001F464 {full_name or dash}\n\U0001F517 {uname}\n\U0001F194 {user_id}"
+    uname = f"@{html.escape(username)}" if username else dash
+    lines = [f'\U0001F464 <a href="tg://user?id={user_id}">{html.escape(full_name or dash)}</a>',
+             f"\U0001F517 {uname}",
+             f"\U0001F194 <code>{user_id}</code>"]
+    if phone:
+        lines.append(f"\U0001F4DE {html.escape(phone)}")
+    return "\n".join(lines)
 
 
-async def _notify_admins_text(text: str) -> None:
+async def _notice_admin_ids() -> list:
+    """Xabar oladiganlar: .env dagi ADMIN_IDS + admin panel orqali qo'shilgan adminlar."""
+    ids = list(ADMIN_IDS)
+    try:
+        ids += [i for i in await get_extra_admin_ids() if i not in ids]
+    except Exception:
+        logging.exception("Qo'shimcha adminlar ro'yxatini o'qib bo'lmadi")
+    return ids
+
+
+async def _notify_admins_text(text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
     bot = _NOTIFY_BOT
     if bot is None:
         return
-    for admin_id in ADMIN_IDS:
+    for admin_id in await _notice_admin_ids():
         try:
-            await bot.send_message(admin_id, text)
-        except Exception:
-            pass
+            try:
+                await bot.send_message(admin_id, text, parse_mode="HTML", reply_markup=reply_markup)
+            except Exception:
+                if reply_markup is None:
+                    raise
+                # tg://user?id tugmasi maxfiylik sozlamasi tufayli rad etilgan bo'lishi mumkin — tugmasiz qayta yuboramiz
+                await bot.send_message(admin_id, text, parse_mode="HTML")
+        except Exception as e:
+            logging.warning("Adminga (%s) xabar yuborib bo'lmadi: %s", admin_id, e)
 
 
-async def _new_user_notice(user_id: int, username: Optional[str], full_name: Optional[str], referred_by) -> None:
+async def _users_count_line(label: str = "Foydalanuvchilar") -> str:
+    """Faol foydalanuvchilar soni (botni bloklab chiqib ketganlar hisobga olinmaydi)."""
+    total, left = await count_users_split()
+    return f"\U0001F4CA {label}: {total - left}" + (f" (chiqib ketgan: {left})" if left else "")
+
+
+async def _get_referrer(user_id: int) -> Optional[int]:
+    if _PG:
+        async with _pool.acquire() as conn:
+            return await conn.fetchval("SELECT referred_by FROM users WHERE user_id = $1", user_id)
+    async with _db_sqlite() as db:
+        cur = await db.execute("SELECT referred_by FROM users WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        return row[0] if row else None
+
+
+async def _registered_notice(user_id: int, username: Optional[str], full_name: Optional[str], phone: str) -> None:
+    """Telefon raqami tasdiqlanib, ro'yxatdan o'tgan YANGI foydalanuvchi haqida adminga xabar."""
     try:
-        total, left = await count_users_split()
-        ref = f"\n\U0001F465 Taklif qilgan: {referred_by}" if referred_by else ""
+        ref = await _get_referrer(user_id)
+        ref_line = f"\n\U0001F465 Taklif qilgan: <code>{ref}</code>" if ref else ""
         await _notify_admins_text(
-            f"\U0001F195 Yangi foydalanuvchi!\n\n{_user_line(user_id, username, full_name)}{ref}\n\n"
-            f"\U0001F4CA Jami: {total} (faol: {total - left})")
+            f"\U0001F195 Yangi foydalanuvchi ro'yxatdan o'tdi!\n\n{_user_line(user_id, username, full_name, phone)}{ref_line}\n\n"
+            f"{await _users_count_line()}",
+            reply_markup=_profile_markup(user_id, username))
     except Exception:
         logging.exception("Yangi foydalanuvchi haqida xabar yuborib bo'lmadi")
 
 
 async def _returned_notice(user_id: int, username: Optional[str], full_name: Optional[str]) -> None:
     try:
-        total, left = await count_users_split()
+        phone = await get_phone(user_id)
         await _notify_admins_text(
-            f"\U0001F501 Foydalanuvchi botga qaytdi\n\n{_user_line(user_id, username, full_name)}\n\n"
-            f"\U0001F4CA Jami: {total} (faol: {total - left})")
+            f"\U0001F501 Foydalanuvchi botga qaytdi\n\n{_user_line(user_id, username, full_name, phone)}\n\n"
+            f"{await _users_count_line()}",
+            reply_markup=_profile_markup(user_id, username))
     except Exception:
         logging.exception("Qaytgan foydalanuvchi haqida xabar yuborib bo'lmadi")
 
@@ -652,15 +703,26 @@ async def is_registered(user_id: int) -> bool:
     return False
 
 
-async def set_phone(user_id: int, phone: str):
+async def set_phone(user_id: int, phone: str) -> bool:
+    """Telefonni saqlaydi. True qaytadi — foydalanuvchi telefonni BIRINCHI marta tasdiqlayotgan bo'lsa
+    (adminga «yangi foydalanuvchi» xabari faqat shunda yuboriladi; atomik, takroriy yuborishda ikki marta chiqmaydi)."""
     if _PG:
         async with _pool.acquire() as conn:
-            await conn.execute("UPDATE users SET phone = $1 WHERE user_id = $2", phone, user_id)
+            res = await conn.execute(
+                "UPDATE users SET phone = $1 WHERE user_id = $2 AND (phone IS NULL OR phone = '')", phone, user_id)
+            first = res.split()[-1] != "0"
+            if not first:
+                await conn.execute("UPDATE users SET phone = $1 WHERE user_id = $2", phone, user_id)
     else:
         async with _db_sqlite() as db:
-            await db.execute("UPDATE users SET phone = ? WHERE user_id = ?", (phone, user_id))
+            cur = await db.execute(
+                "UPDATE users SET phone = ? WHERE user_id = ? AND (phone IS NULL OR phone = '')", (phone, user_id))
+            first = cur.rowcount > 0
+            if not first:
+                await db.execute("UPDATE users SET phone = ? WHERE user_id = ?", (phone, user_id))
             await db.commit()
     _registered_ids.add(user_id)
+    return first
 
 
 async def try_deduct_balance(user_id: int, amount: int) -> bool:
@@ -1455,6 +1517,8 @@ async def get_stats() -> dict:
                 return val if val is not None else 0
 
             users_total = await scalar("SELECT COUNT(*) FROM users")
+            users_left = await scalar("SELECT COUNT(*) FROM users WHERE left_bot = TRUE")
+            users_total -= users_left          # «Jami» — botda qolganlar (chiqib ketganlar alohida ko'rsatiladi)
             users_banned = await scalar("SELECT COUNT(*) FROM users WHERE banned = TRUE")
             users_new_today = await scalar("SELECT COUNT(*) FROM users WHERE created_at >= $1", day_ago)
             balance_total = await scalar("SELECT COALESCE(SUM(balance), 0) FROM users")
@@ -1487,6 +1551,8 @@ async def get_stats() -> dict:
                 return row[0] if row and row[0] is not None else 0
 
             users_total = await scalar("SELECT COUNT(*) FROM users")
+            users_left = await scalar("SELECT COUNT(*) FROM users WHERE left_bot = 1")
+            users_total -= users_left          # «Jami» — botda qolganlar (chiqib ketganlar alohida ko'rsatiladi)
             users_banned = await scalar("SELECT COUNT(*) FROM users WHERE banned = 1")
             users_new_today = await scalar(
                 "SELECT COUNT(*) FROM users WHERE created_at >= ?", (day_ago,))
@@ -1521,6 +1587,7 @@ async def get_stats() -> dict:
 
     return {
         "users_total": users_total,
+        "users_left": users_left,
         "users_banned": users_banned,
         "users_new_today": users_new_today,
         "balance_total": balance_total,
@@ -2660,6 +2727,7 @@ def stats_text(s: dict) -> str:
         f"\U0001F4CA Statistika\n\n"
         f"\U0001F465 Foydalanuvchilar\n"
         f"   Jami: {s['users_total']}\n"
+        f"   Chiqib ketgan: {s.get('users_left', 0)}\n"
         f"   Bugun qo'shilgan: {s['users_new_today']}\n"
         f"   Bloklangan: {s['users_banned']}\n"
         f"   Balanslar jami (botning \"qarzi\"): {fmt_money(s['balance_total'])} so'm\n\n"
@@ -3413,12 +3481,13 @@ async def on_bot_membership_changed(event: ChatMemberUpdated):
     if status in ("kicked", "left"):
         if not await set_user_left(user.id, True):
             return                          # bazada yo'q yoki allaqachon belgilangan
-        total, left = await count_users_split()
         bal = await get_balance(user.id)
+        phone = await get_phone(user.id)
         await _notify_admins_text(
-            f"\U0001F6AA Foydalanuvchi botni bloklab chiqib ketdi\n\n{_user_line(user.id, user.username, user.full_name)}\n"
+            f"\U0001F6AA Foydalanuvchi botni bloklab chiqib ketdi\n\n{_user_line(user.id, user.username, user.full_name, phone)}\n"
             f"\U0001F4B0 Balansi: {fmt_money(bal)} so'm\n\n"
-            f"\U0001F4CA Jami: {total} (faol: {total - left}, chiqib ketgan: {left})")
+            f"{await _users_count_line('Qoldi')}",
+            reply_markup=_profile_markup(user.id, user.username))
     elif status == "member":
         if await set_user_left(user.id, False):
             await _returned_notice(user.id, user.username, user.full_name)
@@ -3912,7 +3981,10 @@ async def phone_received(message: Message, state: FSMContext, bot):
                              reply_markup=phone_request_menu())
         return
     await ensure_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
-    await set_phone(message.from_user.id, phone)
+    first_time = await set_phone(message.from_user.id, phone)
+    if first_time:       # adminga: ism, username, ID, telefon va profil havolasi bilan
+        _schedule_notice(_registered_notice(message.from_user.id, message.from_user.username,
+                                            message.from_user.full_name, phone))
     await state.clear()
     _kb_cleaned.add(message.chat.id)
     await message.answer(f"✅ Raqamingiz tasdiqlandi: {phone}", reply_markup=ReplyKeyboardRemove())
@@ -9746,6 +9818,70 @@ async def _ma_api_number_refund(request: web.Request, user: dict) -> web.Respons
     return _ma_json({"ok": True, "status": "refunded", "amount": refund["price"], "balance": await get_balance(uid)})
 
 
+@_ma_route
+async def _ma_api_order_check(request: web.Request, user: dict) -> web.Response:
+    """Stars / Premium / UC buyurtmasi holatini tekshirish (Mini App: Buyurtmalarim -> buyurtma -> tekshirish).
+    Botdagi `check_order` bilan bir xil mantiq: yakuniy holat provayderdan qayta so'ralmaydi; provayder buyurtmani
+    rad etgan bo'lsa pul BIR MARTA (atomik) balansga qaytariladi. Raqam buyurtmalari uchun /api/number/check va
+    /api/number/refund bor. Javob: status = "ok" | "ref" | "bad" | "wait" (Mini App'dagi buyurtma holatlari bilan bir xil)."""
+    uid = user["id"]
+    body = await _ma_body(request)
+    try:
+        oid = int(body.get("id"))
+    except (TypeError, ValueError):
+        raise _MaError(404, "not_found", "Buyurtma topilmadi.")
+    row = await get_order_row(oid)
+    if not row or row["user_id"] != uid or row["order_type"] not in ("stars", "premium", "uc"):
+        raise _MaError(404, "not_found", "Buyurtma topilmadi.")
+
+    async def _reply(db_status: str) -> web.Response:
+        return _ma_json({"ok": True, "status": _MA_ORDER_STATUS.get(db_status, "wait"),
+                         "balance": await get_balance(uid)})
+
+    if row["status"] in FINAL_STATUSES:        # yakuniy holatni provayderdan qayta so'ramaymiz (qaytarilgan pul ustidan yozilmasin)
+        return await _reply(row["status"])
+    if not _ma_rate_ok(uid, "ocheck", 200, 600):
+        raise _MaError(429, "rate", "Juda ko'p so'rov. Birozdan so'ng qayta urinib ko'ring.")
+    if not row["ref"]:                         # provayderga yuborilishi hali tasdiqlanmagan: fon jarayoni (recover) hal qiladi
+        return await _reply(row["status"])
+
+    if row["order_type"] == "uc":              # UC: holat SmmUpper'dan olinadi; rad etilgan bo'lsa pul qaytadi
+        bot = request.app.get(_MA_BOT_KEY)
+        if bot is None:
+            raise _MaError(503, "server", "Xizmat hozir mavjud emas. Birozdan so'ng qayta urinib ko'ring.")
+        status = await uc_sync_order(bot, oid)
+        if status is None:
+            raise _MaError(502, "provider", "SmmUpper javob bermadi. Birozdan so'ng qayta tekshiring.")
+        return await _reply(status)
+
+    try:
+        data = await client.get_order(row["ref"])
+    except SmmUpperError as e:
+        raise _MaError(502, "provider", e.message)
+    except _NET_ERRORS:
+        raise _MaError(503, "net", "Tarmoq xatosi. Birozdan so'ng qayta tekshiring.")
+    result = data.get("result") if isinstance(data, dict) else None
+    result = result if isinstance(result, dict) else {}
+    status = str(result.get("status") or row["status"]).lower()
+
+    if status in ("failed", "error"):
+        # Bajarilmagan Stars/Premium: pul foydalanuvchiga qaytariladi (atomik, faqat bir marta; any_open — provayderning
+        # oraliq holati bazaga yozilgan bo'lsa ham qaytadi), aks holda foydalanuvchi puldan ayrilib qolardi.
+        refund = await refund_order(oid, any_open=True)
+        if refund:
+            return _ma_json({"ok": True, "status": "ref", "amount": refund["price"], "balance": await get_balance(uid)})
+        fresh = await get_order_row(oid)       # qaytarilmadi: haqiqiy joriy holatni ko'rsatamiz
+        return await _reply(fresh["status"] if fresh else row["status"])
+
+    if status != row["status"]:
+        # Provayder holati FAQAT bazadagi holat biz o'qigan holatda turgan bo'lsa yoziladi (atomik): parallel qaytarish
+        # 'refunded'ni ustidan yozib, ikkinchi marta qaytarishga yo'l ochmasin.
+        await _set_order_status_if(oid, row["status"], status, {**_order_details_from_row(row), **result})
+        fresh = await get_order_row(oid)
+        return await _reply(fresh["status"] if fresh else status)
+    return await _reply(row["status"])
+
+
 
 # ---- SmmUpper hisobi chegaradan past bo'lsa — Mini App xaridlari to'xtaydi (60 soniya keshlanadi) ----
 _MA_SHOP: Dict[str, float] = {"ts": 0.0, "open": 1.0}
@@ -9786,7 +9922,7 @@ async def _ma_api_admin_stats(request: web.Request, user: dict) -> web.Response:
     admin_id = await _ma_admin(user)
     st = await get_stats()
     keys = ("revenue_today", "revenue_week", "revenue_month", "revenue_total", "users_total", "users_new_today",
-            "users_banned", "orders_today", "orders_total", "balance_total")
+            "users_left", "users_banned", "orders_today", "orders_total", "balance_total")
     out = {k: _ma_int(st.get(k)) for k in keys}
     obt, rbt = st.get("orders_by_type") or {}, st.get("revenue_by_type") or {}
     out["by_type"] = {_MA_ORDER_TYPE.get(k, k): {"orders": _ma_int(obt.get(k)), "revenue": _ma_int(rbt.get(k))}
@@ -9970,6 +10106,7 @@ def miniapp_setup_routes(app: web.Application) -> None:
     app.router.add_post("/api/buy", _ma_api_buy)
     app.router.add_post("/api/number/check", _ma_api_number_check)
     app.router.add_post("/api/number/refund", _ma_api_number_refund)
+    app.router.add_post("/api/order/check", _ma_api_order_check)
     app.router.add_get("/api/admin/stats", _ma_api_admin_stats)
     app.router.add_post("/api/admin/topup", _ma_api_admin_topup)
     app.router.add_post("/api/admin/receipt", _ma_api_admin_receipt)
