@@ -9287,6 +9287,11 @@ async def _ma_api_me(request: web.Request, user: dict) -> web.Response:
     await _ma_touch(user)
     now = int(time.time())
     balance = await get_balance(uid)
+    try:
+        info = await find_user(str(uid)) or {}
+    except Exception:
+        info = {}
+    created = info.get("created_at")
     orders = []
     for row in await list_orders(uid, limit=MINIAPP_RECENT_ORDERS):
         try:
@@ -9334,7 +9339,9 @@ async def _ma_api_me(request: web.Request, user: dict) -> web.Response:
         "ok": True,
         "referral": referral,
         "user": {"id": uid, "name": user.get("first_name") or user.get("username") or "Foydalanuvchi",
-                 "username": user.get("username") or ""},
+                 "username": user.get("username") or "", "phone": info.get("phone") or "",
+                 "joined": datetime.fromtimestamp(int(created), LOCAL_TZ).strftime("%d.%m.%Y") if created else "",
+                 "spent": int(info.get("total_spent") or 0)},
         "balance": balance, "orders": orders, "orders_total": total, "pending_topups": pending,
         "min_topup": MIN_TOPUP, "max_topup": MINIAPP_MAX_TOPUP,
         "autopay": {"ready": ap_ready, "ttl_min": ttl},
