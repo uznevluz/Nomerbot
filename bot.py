@@ -1945,6 +1945,49 @@ def _err_text(e: BaseException) -> str:
     return getattr(e, "message", None) or str(e) or type(e).__name__
 
 
+# ---- SmmUpper (hamkor) hisobida mablag' yetmasa: bu foydalanuvchiga SIR ----
+# Foydalanuvchiga hech qachon "hamkor hisobida pul yo'q" deb aytilmaydi — faqat quyidagi matn ko'rsatiladi,
+# adminga esa alohida (spam bo'lmaydigan) ogohlantirish yuboriladi.
+PROVIDER_BUSY_TEXT = "Xizmat vaqtincha mavjud emas. Birozdan keyin qayta urinib ko'ring yoki admin bilan bog'laning."
+_FUNDS_RE = re.compile(
+    r"insufficient|not\s+enough|low\s+balance|no\s+funds|funds|balance|balans|mablag|yetarli\s+emas|yetmay|"
+    r"\u043d\u0435\u0434\u043e\u0441\u0442\u0430\u0442\u043e\u0447|\u0431\u0430\u043b\u0430\u043d\u0441|\u0441\u0440\u0435\u0434\u0441\u0442\u0432", re.IGNORECASE)
+_FUNDS_ALERT: Dict[str, float] = {"ts": 0.0}
+FUNDS_ALERT_EVERY = 600        # soniya: adminga ko'pi bilan 10 daqiqada bir marta (ko'p foydalanuvchi urinsa ham spam bo'lmasin)
+
+
+def is_provider_funds_error(e) -> bool:
+    """SmmUpper xaridni 'hisobda mablag' yetarli emas' sababli rad etdimi? (HTTP 402 yoki xato matnida balans/mablag' haqida gap)."""
+    if not isinstance(e, SmmUpperError):
+        return False
+    if getattr(e, "status", None) == 402:
+        return True
+    return bool(_FUNDS_RE.search(getattr(e, "message", "") or ""))
+
+
+def provider_error_text(e) -> str:
+    """Foydalanuvchiga ko'rsatiladigan xato matni. Hamkor hisobida pul yetmasa — sabab YASHIRILADI."""
+    if is_provider_funds_error(e):
+        return PROVIDER_BUSY_TEXT
+    return _err_text(e)
+
+
+async def alert_provider_funds(bot, e, who: str) -> None:
+    """Hamkor hisobida mablag' yetmay xarid rad etildi: foydalanuvchiga sabab ko'rsatilmaydi, ADMINGA esa darhol xabar boradi."""
+    now = time.monotonic()
+    if _FUNDS_ALERT["ts"] and now - _FUNDS_ALERT["ts"] < FUNDS_ALERT_EVERY:
+        return
+    _FUNDS_ALERT["ts"] = now
+    await _uc_alert_admins(
+        bot,
+        "\u26A0\uFE0F SmmUpper hisobida mablag' yetmadi \u2014 xarid bajarilmadi!\n"
+        f"{who}\n"
+        "Foydalanuvchi puli balansiga qaytarildi. Unga sabab ko'rsatilmadi "
+        "(\"birozdan keyin qayta urinib ko'ring yoki admin bilan bog'laning\" deyildi).\n"
+        f"SmmUpper javobi: {getattr(e, 'message', e)} (status: {getattr(e, 'status', '?')})\n"
+        "SmmUpper hisobini to'ldiring.")
+
+
 class PurchaseUnknownError(Exception):
     """Xarid natijasi NOMA'LUM (tarmoq/timeout/5xx/409): so'rov SmmUpper'da bajarilgan bo'lishi ham mumkin."""
 
@@ -2127,14 +2170,24 @@ async def _send_purchase_request(order_type: str, request_id: str, *, server=Non
     return await _call_idempotent(client.buy_premium, target_username, qty, request_id=request_id, attempts=attempts)
 
 
-async def _reject_purchase(callback, state, order_pk: int, e) -> None:
+async def _reject_purchase(callback, state, order_pk: int, e, bot=None) -> None:
     """Provayder xaridni ANIQ rad etdi (balans/mavjud emas/noto'g'ri ma'lumot...): yozuv o'chiriladi va pul
-    qaytadi (atomik, bir marta)."""
+    qaytadi (atomik, bir marta). Hamkor hisobida pul yetmasa — foydalanuvchiga sabab ko'rsatilmaydi (admin bilmaydi), adminga xabar ketadi."""
+    funds = is_provider_funds_error(e)
+    who = f"Foydalanuvchi ID: {callback.from_user.id}, buyurtma #{order_pk}."
+    if funds:
+        with contextlib.suppress(Exception):
+            row = await get_order_row(order_pk)
+            if row:
+                who = (f"{_WA_LABELS.get(row['order_type'], row['order_type'])}, foydalanuvchi ID: {callback.from_user.id}, "
+                       f"summa: {fmt_money(row['price'])} so'm, buyurtma #{order_pk}.")
     if await discard_unsent_order(order_pk):
-        text = f"\u274C Xatolik: {e.message}\n\U0001F4B0 Pulingiz balansga qaytarildi."
+        text = f"\u274C Xatolik: {provider_error_text(e)}\n\U0001F4B0 Pulingiz balansga qaytarildi."
     else:
         logging.warning(f"#{order_pk}: rad etilgan xaridni bekor qilib bo'lmadi (yozuv o'zgargan) — pul qaytarilmadi")
-        text = f"\u274C Xatolik: {e.message}"
+        text = f"\u274C Xatolik: {provider_error_text(e)}"
+    if funds:
+        await alert_provider_funds(bot or getattr(callback, "bot", None), e, who)
     await callback.message.answer(text, reply_markup=main_menu())
     await state.clear()
 
@@ -2317,7 +2370,9 @@ async def recover_purchase_order(bot, order_pk: int) -> Optional[str]:
     if definite_error is not None:
         # SmmUpper ANIQ rad etdi (birinchi urinish ham bajarilmagan): yozuv o'chiriladi va pul qaytadi
         if await discard_unsent_order(order_pk):
-            await _notify_purchase_refund(bot, None, user_id, row["price"], definite_error.message, label)
+            if is_provider_funds_error(definite_error):
+                await alert_provider_funds(bot, definite_error, f"{label}, foydalanuvchi ID: {user_id}, summa: {fmt_money(row['price'])} so'm (fon jarayoni qayta yuborganda).")
+            await _notify_purchase_refund(bot, None, user_id, row["price"], provider_error_text(definite_error), label)
         return "refunded"
     if not request_id or age > WA_RECOVER_GIVE_UP:
         refund = await refund_order(order_pk)
@@ -4688,7 +4743,7 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
         await _refund_unknown_purchase(bot, callback, state, est_price, "Raqam", e, order_pk=order_pk)
         return
     except SmmUpperError as e:
-        await _reject_purchase(callback, state, order_pk, e)
+        await _reject_purchase(callback, state, order_pk, e, bot=bot)
         return
     except Exception as e:
         await _park_purchase(bot, callback, state, order_pk, est_price, "Raqam", request_id, e)
@@ -5074,7 +5129,7 @@ async def confirm_stars(callback: CallbackQuery, state: FSMContext, bot):
         await _refund_unknown_purchase(bot, callback, state, est_price, "Stars", e, order_pk=order_pk)
         return
     except SmmUpperError as e:
-        await _reject_purchase(callback, state, order_pk, e)
+        await _reject_purchase(callback, state, order_pk, e, bot=bot)
         return
     except Exception as e:
         await _park_purchase(bot, callback, state, order_pk, est_price, "Stars", request_id, e)
@@ -5239,7 +5294,7 @@ async def confirm_premium(callback: CallbackQuery, state: FSMContext, bot):
         await _refund_unknown_purchase(bot, callback, state, est_price, "Premium", e, order_pk=order_pk)
         return
     except SmmUpperError as e:
-        await _reject_purchase(callback, state, order_pk, e)
+        await _reject_purchase(callback, state, order_pk, e, bot=bot)
         return
     except Exception as e:
         await _park_purchase(bot, callback, state, order_pk, est_price, "Premium", request_id, e)
@@ -5267,6 +5322,10 @@ async def confirm_premium(callback: CallbackQuery, state: FSMContext, bot):
 #      "processing/pending/waiting/review" — kutiladi (refund qilinmaydi).
 router_uc = Router(name="uc")
 
+# PUBG akkauntini tekshirish uchun tashqi xizmat (ixtiyoriy; SmmUpper API'da bunday metod yo'q).
+# PUBG_LOOKUP_URL — manzil, ID o'rniga {id} yoziladi (masalan: https://xizmat.uz/pubg?id={id}); javob JSON, ichida nik (nickname/name).
+PUBG_LOOKUP_URL = os.getenv("PUBG_LOOKUP_URL", "").strip()
+PUBG_LOOKUP_KEY = os.getenv("PUBG_LOOKUP_KEY", "").strip()   # kerak bo'lsa: Authorization: Bearer ...
 UC_ID_RE = re.compile(r"^\d{6,12}$")     # PUBG Mobile ID: faqat raqam, 6-12 xona (hujjatga ko'ra)
 UC_POLL_SECONDS = 90                     # kutilayotgan UC buyurtmalari shuncha vaqtda bir tekshiriladi
 UC_POLL_BATCH = 40                       # bir aylanishda ko'pi bilan nechta buyurtma tekshiriladi
@@ -5695,8 +5754,10 @@ async def confirm_uc(callback: CallbackQuery, state: FSMContext, bot):
     except SmmUpperError as e:
         # Aniq rad etildi (balans/tarif/ID): buyurtma 'refunded' bo'ladi va pul qaytadi (atomik, bir marta)
         await refund_order(order_pk)
+        if is_provider_funds_error(e):          # hamkor hisobida pul yetmadi: foydalanuvchiga sabab SIR, adminga xabar
+            await alert_provider_funds(bot, e, f"UC, foydalanuvchi ID: {user_id}, summa: {fmt_money(est_price)} so'm, buyurtma #{order_pk}.")
         await callback.message.answer(
-            f"\u274C Xatolik: {e.message}\n\U0001F4B0 Pulingiz balansga qaytarildi.",
+            f"\u274C Xatolik: {provider_error_text(e)}\n\U0001F4B0 Pulingiz balansga qaytarildi.",
             reply_markup=main_menu(),
         )
         await state.clear()
@@ -5768,7 +5829,9 @@ async def uc_recover_order(bot, order_pk: int) -> Optional[str]:
     if definite_error is not None or not have_data or age > UC_RECOVER_GIVE_UP:
         refund = await refund_order(order_pk)
         if refund:
-            reason = definite_error.message if definite_error is not None else "SmmUpper javob bermadi"
+            reason = provider_error_text(definite_error) if definite_error is not None else "SmmUpper javob bermadi"
+            if definite_error is not None and is_provider_funds_error(definite_error):
+                await alert_provider_funds(bot, definite_error, f"UC #{order_pk}, foydalanuvchi ID: {user_id}, summa: {fmt_money(refund['price'])} so'm (fon jarayoni qayta yuborganda).")
             await _uc_notify_refund(bot, order_pk, user_id, refund["price"], reason)
             if definite_error is None:
                 await _uc_alert_admins(
@@ -6098,6 +6161,9 @@ def _format_order_detail(row, include_buyer: bool = False) -> str:
         account_id = _uc_account_from_row(row)
         if account_id:
             lines.append(f"\U0001F3AE PUBG ID: {account_id}")
+            nick = str(_uc_details_from_row(row).get("nick") or "")
+            if nick:
+                lines.append(f"\U0001F464 Nik: {nick}")
     return "\n".join(lines)
 
 
@@ -9309,6 +9375,13 @@ async def _ma_api_me(request: web.Request, user: dict) -> web.Response:
                 "WHERE p.user_id = ? AND p.status = 'pending' AND p.expires_at > ? ORDER BY p.id DESC LIMIT 1", uid, now)
         except Exception:
             row = None
+        topups_ok = 0        # muvaffaqiyatli to'ldirishlar soni (qo'lda tasdiqlangan + avto-to'lov) — profildagi galichka uchun
+        for _q in ("SELECT COUNT(*) FROM topups WHERE user_id = ? AND status = 'approved'",
+                   "SELECT COUNT(*) FROM autopay_payments WHERE user_id = ? AND status = 'paid'"):
+            try:
+                topups_ok += int(await tx.scalar(_q, uid) or 0)
+            except Exception:
+                pass
     if row and row["card_number"]:
         open_payment = {"id": row["id"], "amount": row["exact_amount"], "base": row["base_amount"],
                         "extra": row["exact_amount"] - row["base_amount"],
@@ -9342,7 +9415,7 @@ async def _ma_api_me(request: web.Request, user: dict) -> web.Response:
                  "username": user.get("username") or "", "phone": info.get("phone") or "",
                  "joined": datetime.fromtimestamp(int(created), LOCAL_TZ).strftime("%d.%m.%Y") if created else "",
                  "spent": int(info.get("total_spent") or 0)},
-        "balance": balance, "orders": orders, "orders_total": total, "pending_topups": pending,
+        "balance": balance, "orders": orders, "orders_total": total, "topups_ok": topups_ok, "pending_topups": pending,
         "min_topup": MIN_TOPUP, "max_topup": MINIAPP_MAX_TOPUP,
         "autopay": {"ready": ap_ready, "ttl_min": ttl},
         "card": {"number": card_number, "holder": card_holder},
@@ -9622,7 +9695,7 @@ async def _ma_buy_core(request: web.Request, user: dict, body: dict) -> web.Resp
         raise _MaError(503, "server", "Xizmat hozir mavjud emas. Botdan foydalaning.")
     if not _ma_rate_ok(uid, "buy", 20, 600):
         raise _MaError(429, "rate", "Juda ko'p urinish. Bir necha daqiqadan so'ng qayta urinib ko'ring.")
-    username = qty = country = server = tariff = None
+    username = qty = country = server = tariff = nick = None
     try:
         if kind in ("stars", "premium"):
             username = str(body.get("username") or "").strip().lstrip("@")
@@ -9645,6 +9718,7 @@ async def _ma_buy_core(request: web.Request, user: dict, body: dict) -> web.Resp
             username = re.sub(r"\s+", "", str(body.get("username") or ""))
             if not UC_ID_RE.match(username):
                 raise _MaError(400, "username", "PUBG ID noto'g'ri (faqat raqam, 6–12 xona).")
+            nick = re.sub(r"\s+", " ", str(body.get("nick") or "")).strip()[:32]
             tid = int(body.get("amount"))
             tariff = next((t for t in await load_uc_tariffs() if t["tariff_id"] == tid), None)
             price = tariff["price"] if tariff else 0
@@ -9665,22 +9739,24 @@ async def _ma_buy_core(request: web.Request, user: dict, body: dict) -> web.Resp
     _purchase_inflight.add(uid)
     try:
         return await _ma_do_buy(bot, uid, kind, price, username=username, qty=qty, server=server,
-                                country=country, tariff=tariff)
+                                country=country, tariff=tariff, nick=nick)
     finally:
         _purchase_inflight.discard(uid)
 
 
 async def _ma_do_buy(bot, uid: int, kind: str, price: int, *, username=None, qty=None, server=None,
-                     country=None, tariff=None) -> web.Response:
+                     country=None, tariff=None, nick=None) -> web.Response:
     label, uc = _MA_LABEL[kind], kind == "uc"
     if not await _ma_shop_open():      # SmmUpper hisobi chegaradan past: pul yechilmaydi, xarid to'xtatiladi
-        raise _MaError(503, "shop_closed", "Xizmat vaqtincha mavjud emas. Birozdan so'ng qayta urinib ko'ring.")
+        raise _MaError(503, "shop_closed", PROVIDER_BUSY_TEXT)
     if not await try_deduct_balance(uid, price):
         raise _MaError(402, "balance", "Balansingiz yetarli emas.", balance=await get_balance(uid))
     request_id = new_request_id()
     details = {"request_id": request_id, "unsent": True}
     if uc:
         details.update({"tariff_id": tariff["tariff_id"], "account_id": username, "total_uc": tariff["total_uc"]})
+        if nick:
+            details["nick"] = nick
     try:
         order_pk = await create_order(
             user_id=uid, order_type=kind, ref=None, server=server, price=price, details=details, status="processing",
@@ -9712,7 +9788,9 @@ async def _ma_do_buy(bot, uid: int, kind: str, price: int, *, username=None, qty
         raise _MaError(502, "unknown", "SmmUpper bilan aloqa uzildi. Pulingiz balansga qaytarildi, birozdan so'ng qayta urinib ko'ring.")
     except SmmUpperError as e:
         refunded = bool(await refund_order(order_pk)) if uc else await discard_unsent_order(order_pk)
-        raise _MaError(400, "rejected", f"{e.message}" + (" Pulingiz balansga qaytarildi." if refunded else ""))
+        if is_provider_funds_error(e):          # hamkor hisobida pul yetmadi: foydalanuvchiga sabab SIR, adminga xabar
+            await alert_provider_funds(bot, e, who)
+        raise _MaError(400, "rejected", provider_error_text(e) + (" Pulingiz balansga qaytarildi." if refunded else ""))
     except Exception as e:
         logging.error("miniapp: %s #%s kutilmagan xato: %r", label, order_pk, e, exc_info=e)
         await _uc_alert_admins(bot, f"\u26A0\uFE0F {label} (Mini App): kutilmagan xato ({type(e).__name__}). {who}\n"
@@ -9776,6 +9854,69 @@ async def _ma_claim_code(oid: int, row, data: dict):
         raise _MaError(409, "closed", "Bu buyurtma allaqachon yakunlangan (pul qaytarilgan bo'lishi mumkin).")
     return {"ok": True, "status": "done", "code": str(code), "password": str(pw),
             "number": str(result.get("number") or "")}
+
+
+_PUBG_NICK_KEYS = ("nickname", "nick", "player_name", "playerName", "role_name", "username", "name")
+
+
+def _pubg_pick_nick(data, depth: int = 0) -> str:
+    """JSON javobdan o'yinchi nikini topadi (xizmatlar maydon nomini turlicha yozadi)."""
+    if depth > 4:
+        return ""
+    if isinstance(data, dict):
+        for key in _PUBG_NICK_KEYS:
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()[:64]
+        for val in data.values():
+            found = _pubg_pick_nick(val, depth + 1)
+            if found:
+                return found
+    elif isinstance(data, list):
+        for val in data[:5]:
+            found = _pubg_pick_nick(val, depth + 1)
+            if found:
+                return found
+    return ""
+
+
+async def check_pubg_account(account_id: str, username: str = "") -> dict:
+    """{found: True|False|None, nickname, match: True|False|None}. found=None — tekshirib bo'lmadi (xizmat yo'q/ishlamayapti)."""
+    out = {"found": None, "nickname": "", "match": None}
+    if not PUBG_LOOKUP_URL:
+        return out
+    headers = {"Authorization": f"Bearer {PUBG_LOOKUP_KEY}"} if PUBG_LOOKUP_KEY else {}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as sess:
+            async with sess.get(PUBG_LOOKUP_URL.replace("{id}", account_id), headers=headers) as resp:
+                if resp.status in (400, 404):
+                    out["found"] = False
+                    return out
+                if resp.status != 200:
+                    return out
+                data = await resp.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        return out
+    nick = _pubg_pick_nick(data)
+    if not nick:
+        return out   # javob bor, lekin nik topilmadi — xavfsiz tomoni: "tekshirib bo'lmadi"
+    out["found"], out["nickname"] = True, nick
+    if username:
+        out["match"] = re.sub(r"\s+", "", username).casefold() == re.sub(r"\s+", "", nick).casefold()
+    return out
+
+
+@_ma_route
+async def _ma_api_uc_check(request: web.Request, user: dict) -> web.Response:
+    uid = user["id"]
+    body = await _ma_body(request)
+    account_id = re.sub(r"\s+", "", str(body.get("account_id") or ""))
+    if not UC_ID_RE.match(account_id):
+        raise _MaError(400, "username", "PUBG ID noto'g'ri (faqat raqam, 6–12 xona).")
+    if not _ma_rate_ok(uid, "ucchk", 30, 600):
+        raise _MaError(429, "rate", "Juda ko'p so'rov. Birozdan so'ng qayta urinib ko'ring.")
+    nick = re.sub(r"\s+", " ", str(body.get("username") or "")).strip()[:32]
+    return _ma_json({"ok": True, **await check_pubg_account(account_id, nick)})
 
 
 @_ma_route
@@ -10111,6 +10252,7 @@ def miniapp_setup_routes(app: web.Application) -> None:
     app.router.add_post("/api/topup/manual", _ma_api_manual)
     app.router.add_get("/api/prices", _ma_api_prices)
     app.router.add_post("/api/buy", _ma_api_buy)
+    app.router.add_post("/api/uc/check", _ma_api_uc_check)
     app.router.add_post("/api/number/check", _ma_api_number_check)
     app.router.add_post("/api/number/refund", _ma_api_number_refund)
     app.router.add_post("/api/order/check", _ma_api_order_check)
