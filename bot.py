@@ -2093,21 +2093,24 @@ def _purchase_ref(order_type: str, result: dict) -> Optional[str]:
 
 
 async def _claim_purchase_result(order_pk: int, expected_details: Optional[str], ref: Optional[str],
-                                 details: dict) -> bool:
+                                 details: dict, new_status: str = "processing") -> bool:
     """Provayder javobini buyurtmaga BIR MARTA yozadi (atomik "claim"): faqat buyurtma hali 'processing' bo'lsa va
-    'details' o'qilgandan beri o'zgarmagan bo'lsa. Handler va fon jarayoni bir vaqtda urinsa — faqat bittasi yutadi."""
+    'details' o'qilgandan beri o'zgarmagan bo'lsa. Handler va fon jarayoni bir vaqtda urinsa — faqat bittasi yutadi.
+    new_status: Stars/Premium provayderda darhol bajarilgan bo'lsa 'done', aks holda 'processing' qoladi."""
     details_json = json.dumps(details, ensure_ascii=False)
     if _PG:
         async with _pool.acquire() as conn:
             res = await conn.execute(
-                "UPDATE orders SET ref = $1, details = $2 WHERE id = $3 AND status = 'processing' AND details = $4",
-                ref, details_json, order_pk, expected_details,
+                "UPDATE orders SET ref = $1, details = $2, status = $3 "
+                "WHERE id = $4 AND status = 'processing' AND details = $5",
+                ref, details_json, new_status, order_pk, expected_details,
             )
             return res.split()[-1] != "0"
     async with _db_sqlite() as db:
         cur = await db.execute(
-            "UPDATE orders SET ref = ?, details = ? WHERE id = ? AND status = 'processing' AND details = ?",
-            (ref, details_json, order_pk, expected_details),
+            "UPDATE orders SET ref = ?, details = ?, status = ? "
+            "WHERE id = ? AND status = 'processing' AND details = ?",
+            (ref, details_json, new_status, order_pk, expected_details),
         )
         await db.commit()
         return cur.rowcount > 0
@@ -2224,13 +2227,16 @@ async def _apply_purchase_result(order_pk: int, result: dict) -> Optional[dict]:
     order_type = row["order_type"]
     ref = _purchase_ref(order_type, result)
     new_details = {**details, **result, "unsent": False}
-    if not await _claim_purchase_result(order_pk, row["details"], ref, new_details):
+    done = order_type in ("stars", "premium") and \
+        str(result.get("status") or "").lower() in ("done", "completed", "success")
+    new_status = "done" if done else "processing"          # Raqam — SMS kodgacha 'processing' qoladi
+    if not await _claim_purchase_result(order_pk, row["details"], ref, new_details, new_status):
         return None
     est_price = row["price"]
     charged = await final_price(row["user_id"], result, est_price, order_type)
     if charged != est_price:
         await _set_order_price(order_pk, charged)      # AYNAN yechilgan summa buyurtmaga yoziladi
-    return {"price": charged, "ref": ref}
+    return {"price": charged, "ref": ref, "status": new_status}
 
 
 def _log_task_exception(task) -> None:
@@ -2242,6 +2248,15 @@ def _log_task_exception(task) -> None:
 
 async def _quiet_send(*_a, **_k):
     return None
+
+
+async def _safe_send(send, *args, **kwargs):
+    """Foydalanuvchiga xabar (bot bloklangan bo'lishi mumkin): xato fon jarayonlarini (SMS kuzatuvi, kanal xabari) to'xtatmasin."""
+    try:
+        return await send(*args, **kwargs)
+    except Exception:
+        logging.warning("Foydalanuvchiga xabar yuborib bo'lmadi", exc_info=True)
+        return None
 
 
 async def _announce_purchase(bot, order_pk: int, order, result: dict, info: dict, *, buyer: str, send,
@@ -2261,7 +2276,7 @@ async def _announce_purchase(bot, order_pk: int, order, result: dict, info: dict
             return
     if order_type == "number":
         number = result.get("number", "?")
-        sent = await send(
+        sent = await _safe_send(send,
             f"\u2705 Raqam muvaffaqiyatli olindi!\n"
             f"\U0001F4F1 Raqam: <code>{html.escape(str(number))}</code>\n"
             f"\U0001F4B5 Narx: {fmt_money(price)} so'm\n"
@@ -2273,7 +2288,7 @@ async def _announce_purchase(bot, order_pk: int, order, result: dict, info: dict
         with contextlib.suppress(Exception):
             await notify_channel(bot, channel_number_notice(buyer, order["country"], price, number), order_type="number")
         task = asyncio.create_task(
-            _poll_code(bot, order["user_id"], order_pk, order["server"], result, sent.message_id))
+            _poll_code(bot, order["user_id"], order_pk, order["server"], result, sent.message_id if sent else None))
         _background_tasks.add(task)
         task.add_done_callback(_log_task_exception)
         return
@@ -2285,7 +2300,7 @@ async def _announce_purchase(bot, order_pk: int, order, result: dict, info: dict
     else:
         notice = channel_premium_notice(buyer, username, qty, price)
         what = f"\U0001F48E {qty} oy Premium"
-    await send(
+    await _safe_send(send,
         f"\u2705 Buyurtma qabul qilindi!\n"
         f"\U0001F464 @{username}\n"
         f"{what}\n"
@@ -5934,7 +5949,57 @@ async def uc_sweep_once(bot) -> int:
                     bot, f"\u23F0 UC buyurtma #{order_pk} {hours} soatdan beri 'processing' holatida "
                          f"\u2014 SmmUpper panelida tekshiring.")
             await asyncio.sleep(0.3)                   # SmmUpper rate limitini hurmat qilamiz
+    # Stars / Premium: provayderga yuborilgan, lekin yakuniy holati bazaga yozilmagan buyurtmalar
+    for order_pk in await _list_pending_sp_orders(30):
+        try:
+            await sp_sync_order(bot, order_pk)
+        except Exception:
+            logging.exception(f"Stars/Premium #{order_pk} holatini tekshirishda xato")
+        handled += 1
+        await asyncio.sleep(0.3)
     return handled
+
+
+SP_SYNC_WINDOW = 14 * 86400        # Stars/Premium: shuncha kungacha bo'lgan buyurtmalar fonda tekshiriladi
+
+
+async def _list_pending_sp_orders(limit: int = 30) -> list:
+    """Provayderga yuborilgan (ref bor), lekin yakunlanmagan Stars/Premium buyurtmalari."""
+    sql = ("SELECT id FROM orders WHERE order_type IN ('stars', 'premium') "
+           "AND status NOT IN ('done', 'refunded', 'failed', 'error') AND ref IS NOT NULL AND created_at > ")
+    since = int(time.time()) - SP_SYNC_WINDOW
+    if _PG:
+        async with _pool.acquire() as conn:
+            rows = await conn.fetch(sql + "$1 ORDER BY id LIMIT $2", since, limit)
+            return [r["id"] for r in rows]
+    async with _db_sqlite() as db:
+        cur = await db.execute(sql + "? ORDER BY id LIMIT ?", (since, limit))
+        rows = await cur.fetchall()
+        return [r[0] for r in rows]
+
+
+async def sp_sync_order(bot, order_pk: int) -> Optional[str]:
+    """Stars/Premium holatini provayderdan oladi: bajarilgan bo'lsa 'done', rad etilgan bo'lsa pulni qaytaradi."""
+    row = await get_order_row(order_pk)
+    if not row or row["order_type"] not in ("stars", "premium") or row["status"] in FINAL_STATUSES or not row["ref"]:
+        return None
+    try:
+        data = await client.get_order(row["ref"])
+    except (SmmUpperError,) + _NET_ERRORS:
+        return None
+    result = data.get("result") if isinstance(data, dict) else None
+    result = result if isinstance(result, dict) else {}
+    raw_status = str(result.get("status") or "").lower()
+    if raw_status in _UC_FAILED_STATUSES or (result.get("refunded") is True and raw_status != "done"):
+        refund = await refund_order(order_pk, any_open=True)
+        if refund:
+            label = _WA_LABELS.get(row["order_type"], row["order_type"])
+            await _notify_purchase_refund(bot, order_pk, row["user_id"], refund["price"], "provayder rad etdi", label)
+        return "refunded"
+    if raw_status in ("done", "completed", "success"):
+        await _set_order_status_if(order_pk, row["status"], "done", {**_order_details_from_row(row), **result})
+        return "done"
+    return "processing"
 
 
 async def uc_sweeper(bot):
@@ -6110,24 +6175,23 @@ async def check_order(callback: CallbackQuery, bot):
         return
 
     result = data.get("result", {})
-    status = result.get("status", row["status"])
-    if str(status).lower() in ("failed", "error"):
-        # Bajarilmagan Stars/Premium: hujjatga ko'ra pul SIZNING SmmUpper balansingizga qaytariladi, shuning uchun
-        # foydalanuvchi puli ham qaytariladi (atomik, faqat bir marta) — aks holda foydalanuvchi puldan ayrilib qolardi.
-        # any_open: provayder oraliq holati ('pending', 'waiting'...) bazaga yozilgan bo'lsa ham pul qaytadi
-        # (avval faqat 'processing' qaytarilardi — pul qotib qolardi, javob esa "refunded" der edi).
+    raw_status = str(result.get("status", row["status"])).lower()
+    if raw_status in _UC_FAILED_STATUSES or (result.get("refunded") is True and raw_status != "done"):
+        # Provayder bajarmadi/rad etdi/bekor qildi: foydalanuvchi puli qaytariladi (atomik, faqat bir marta).
+        # any_open: oraliq holat bazaga yozilgan bo'lsa ham pul qaytadi.
         refund = await refund_order(order_pk, any_open=True)
         if refund:
             text = "\u274C Buyurtma bajarilmadi \u2014 pul balansingizga qaytarildi."
         else:
             fresh = await get_order_row(order_pk)          # qaytarilmadi: haqiqiy joriy holatni ko'rsatamiz
-            text = f"Holat: {fresh['status'] if fresh else status}"
+            text = f"Holat: {fresh['status'] if fresh else raw_status}"
         await callback.answer(text, show_alert=True)
         return
-    # Provayder holatini FAQAT bazadagi holat biz o'qigan holatda turgan bo'lsa yozamiz (atomik): parallel qaytarish
+    # Provayder holati FAQAT bazadagi holat biz o'qigan holatda turgan bo'lsa yoziladi (atomik): parallel qaytarish
     # 'refunded'ni ustidan yozib, keyin ikkinchi marta qaytarishga yo'l ochmasin.
-    await _set_order_status_if(order_pk, row["status"], str(status), result)
-    await callback.answer(f"Holat: {status}", show_alert=True)
+    new_status = "done" if raw_status in ("done", "completed", "success") else raw_status
+    await _set_order_status_if(order_pk, row["status"], new_status, {**_order_details_from_row(row), **result})
+    await callback.answer(f"Holat: {new_status}", show_alert=True)
 
 
 def _format_order_detail(row, include_buyer: bool = False) -> str:
@@ -6144,8 +6208,17 @@ def _format_order_detail(row, include_buyer: bool = False) -> str:
         lines.append(f"\U0001F464 Foydalanuvchi ID: {row['user_id']}")
     lines.append(f"Holat: {status}")
     lines.append(f"\U0001F4B0 Narx: {fmt_money(row['price'])} so'm")
-    if row["order_type"] == "number" and row["country"]:
-        lines.append(f"\U0001F30E Davlat: {country_flag(row['country'])} {country_display_name(row['country'])}")
+    if row["order_type"] == "number":
+        if row["country"]:
+            lines.append(f"\U0001F30E Davlat: {country_flag(row['country'])} {country_display_name(row['country'])}")
+        details = _order_details_from_row(row)
+        if details.get("number"):
+            lines.append(f"\U0001F4F1 Raqam: {details['number']}")
+        if not include_buyer:          # SMS kod va 2FA parol — faqat buyurtma egasiga; admin ko'rinishida chiqarilmaydi
+            if details.get("code"):
+                lines.append(f"\U0001F522 SMS kod: {details['code']}")
+            if details.get("password"):
+                lines.append(f"\U0001F510 2FA parol: {details['password']}")
     target_username = row["target_username"] if "target_username" in row.keys() else None
     if target_username:
         lines.append(f"\U0001F3AF Kimga: @{target_username}")
@@ -7316,18 +7389,14 @@ async def admin_graph(callback: CallbackQuery):
 
 # ---------- To'lovlar paneli (barcha kutilayotgan so'rovlar ro'yxati) ----------
 
-@router_admin.callback_query(F.data == "adm:payments")
-async def admin_payments_panel(callback: CallbackQuery, state: FSMContext):
-    if not await _is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo'q.", show_alert=True)
-        return
-    await state.clear()
+_PAYMENTS_LIST_PREFIX = "\U0001F4B3 Kutilayotgan to'lov"     # ro'yxat xabari shu matn bilan boshlanadi
+
+
+async def _payments_panel():
+    """'To'lovlar' ro'yxati: (matn, tugmalar). Panel ham, tasdiqlash/rad etishdan keyingi yangilash ham shuni ishlatadi."""
     rows = await get_pending_topups(limit=15)
     if not rows:
-        await callback.message.edit_text("\U0001F4B3 Kutilayotgan to'lov so'rovlari yo'q.", reply_markup=admin_cancel_menu())
-        await callback.answer()
-        return
-
+        return "\U0001F4B3 Kutilayotgan to'lov so'rovlari yo'q.", admin_cancel_menu()
     lines = [f"\U0001F4B3 Kutilayotgan to'lovlar: {len(rows)}\n"]
     keyboard = []
     for row in rows:
@@ -7341,8 +7410,17 @@ async def admin_payments_panel(callback: CallbackQuery, state: FSMContext):
         ])
     keyboard.append([InlineKeyboardButton(text="\U0001F504 Yangilash", callback_data="adm:payments", style=STYLE_PRIMARY)])
     keyboard.append([InlineKeyboardButton(text="\u2B05\uFE0F Admin panelga qaytish", callback_data="adm:refresh", style=STYLE_DANGER)])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
 
-    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+@router_admin.callback_query(F.data == "adm:payments")
+async def admin_payments_panel(callback: CallbackQuery, state: FSMContext):
+    if not await _is_admin(callback.from_user.id):
+        await callback.answer("Ruxsat yo'q.", show_alert=True)
+        return
+    await state.clear()
+    text, markup = await _payments_panel()
+    await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer()
 
 
@@ -7460,19 +7538,18 @@ async def admin_orders_by_user_direct(callback: CallbackQuery):
 # ---------- Balansni to'ldirish so'rovlarini tasdiqlash / rad etish ----------
 
 async def _finalize_topup_message(callback: CallbackQuery, suffix: str):
-    """Ko'rib chiqilgan to'lov so'rovi xabarini yangilaydi. Xabar RASM
-    (skrinshot) bilan kelishi mumkin (individual bildirishnoma — caption
-    tahrirlanadi) yoki oddiy matn bo'lishi mumkin ("To'lovlar" ro'yxat
-    panelidan — matn tahrirlanadi). Xatolik chiqsa (masalan xabar juda
-    eski), adminga ta'sir qilmasligi uchun jimgina o'tkazib yuboriladi —
-    callback.answer() baribir tasdiqni ko'rsatadi."""
+    """Ko'rib chiqilgan to'lov so'rovi xabarini yangilaydi: rasm (individual bildirishnoma) — caption tahrirlanadi;
+    'To'lovlar' ro'yxati — qolgan so'rovlar tugmalari saqlanib ro'yxat yangilanadi; boshqa matn — natija qo'shiladi.
+    Xatolik (masalan xabar juda eski) adminga ta'sir qilmaydi — callback.answer() baribir tasdiqni ko'rsatadi."""
     try:
-        if callback.message.photo:
-            old = callback.message.caption or ""
-            await callback.message.edit_caption(caption=old + suffix)
+        msg = callback.message
+        if msg.photo or msg.document:
+            await msg.edit_caption(caption=(msg.caption or "") + suffix)
+        elif (msg.text or "").startswith(_PAYMENTS_LIST_PREFIX):
+            text, markup = await _payments_panel()
+            await msg.edit_text(text, reply_markup=markup)
         else:
-            old = callback.message.text or ""
-            await callback.message.edit_text(old + suffix)
+            await msg.edit_text((msg.text or "") + suffix)
     except Exception:
         pass
 
@@ -9302,6 +9379,7 @@ def _ma_order(row) -> dict:
     keys = list(row.keys())
     otype = row["order_type"]
     qty = row["qty"] if "qty" in keys else None
+    num = ""
     if otype == "stars":
         label = f"{fmt_money(qty)} Stars" if qty else "Stars"
     elif otype == "premium":
@@ -9311,8 +9389,12 @@ def _ma_order(row) -> dict:
     else:
         country = row["country"] if "country" in keys else None
         label = f"Raqam, {country_display_name(country)}" if country else "Raqam"
-    return {"id": row["id"], "t": _MA_ORDER_TYPE.get(otype, "topup"), "w": label, "d": _ma_when(row["created_at"]),
-            "p": int(row["price"]), "s": _MA_ORDER_STATUS.get(row["status"], "wait")}
+        num = str(_order_details_from_row(row).get("number") or "")
+    out = {"id": row["id"], "t": _MA_ORDER_TYPE.get(otype, "topup"), "w": label, "d": _ma_when(row["created_at"]),
+           "p": int(row["price"]), "s": _MA_ORDER_STATUS.get(row["status"], "wait")}
+    if num:
+        out["num"] = num
+    return out
 
 
 def _ma_sniff_image(data: bytes) -> Optional[str]:
@@ -9822,7 +9904,8 @@ async def _ma_do_buy(bot, uid: int, kind: str, price: int, *, username=None, qty
         if kind == "number":
             # DIQQAT: info["ref"] — bu hash_code (kod so'rash uchun ichki kalit), telefon raqami EMAS.
             number = result.get("number")
-    return _ma_json({"ok": True, "status": "ok", "order_id": order_pk, "price": (info or {}).get("price", price),
+    out_status = "ok" if (kind == "number" or (info or {}).get("status") == "done") else "wait"
+    return _ma_json({"ok": True, "status": out_status, "order_id": order_pk, "price": (info or {}).get("price", price),
                      "balance": await get_balance(uid), "number": number})
 
 
@@ -10010,23 +10093,22 @@ async def _ma_api_order_check(request: web.Request, user: dict) -> web.Response:
         raise _MaError(503, "net", "Tarmoq xatosi. Birozdan so'ng qayta tekshiring.")
     result = data.get("result") if isinstance(data, dict) else None
     result = result if isinstance(result, dict) else {}
-    status = str(result.get("status") or row["status"]).lower()
+    raw_status = str(result.get("status") or row["status"]).lower()
 
-    if status in ("failed", "error"):
-        # Bajarilmagan Stars/Premium: pul foydalanuvchiga qaytariladi (atomik, faqat bir marta; any_open — provayderning
-        # oraliq holati bazaga yozilgan bo'lsa ham qaytadi), aks holda foydalanuvchi puldan ayrilib qolardi.
+    if raw_status in _UC_FAILED_STATUSES or (result.get("refunded") is True and raw_status != "done"):
+        # Bajarilmagan/rad etilgan Stars/Premium: pul qaytariladi (atomik, faqat bir marta; any_open — oraliq holat yozilgan bo'lsa ham)
         refund = await refund_order(oid, any_open=True)
         if refund:
             return _ma_json({"ok": True, "status": "ref", "amount": refund["price"], "balance": await get_balance(uid)})
         fresh = await get_order_row(oid)       # qaytarilmadi: haqiqiy joriy holatni ko'rsatamiz
         return await _reply(fresh["status"] if fresh else row["status"])
 
-    if status != row["status"]:
-        # Provayder holati FAQAT bazadagi holat biz o'qigan holatda turgan bo'lsa yoziladi (atomik): parallel qaytarish
-        # 'refunded'ni ustidan yozib, ikkinchi marta qaytarishga yo'l ochmasin.
-        await _set_order_status_if(oid, row["status"], status, {**_order_details_from_row(row), **result})
+    new_status = "done" if raw_status in ("done", "completed", "success") else raw_status
+    if new_status != row["status"]:
+        # Provayder holati FAQAT bazadagi holat biz o'qigan holatda turgan bo'lsa yoziladi (atomik)
+        await _set_order_status_if(oid, row["status"], new_status, {**_order_details_from_row(row), **result})
         fresh = await get_order_row(oid)
-        return await _reply(fresh["status"] if fresh else status)
+        return await _reply(fresh["status"] if fresh else new_status)
     return await _reply(row["status"])
 
 
@@ -10080,10 +10162,19 @@ async def _ma_api_admin_stats(request: web.Request, user: dict) -> web.Response:
                       for r in await get_pending_topups(20)]
     day_ago = int(time.time()) - 86400
     async with _ap_conn() as tx:
-        out["topups_today"] = _ma_int(await tx.scalar(
+        manual_sum = _ma_int(await tx.scalar(
             "SELECT COALESCE(SUM(amount), 0) FROM topups WHERE status = 'approved' AND created_at >= ?", day_ago))
-        out["topups_today_n"] = _ma_int(await tx.scalar(
+        manual_cnt = _ma_int(await tx.scalar(
             "SELECT COUNT(*) FROM topups WHERE status = 'approved' AND created_at >= ?", day_ago))
+        try:           # avto-to'lov (autopay) — kreditlangan summa exact_amount
+            auto_sum = _ma_int(await tx.scalar(
+                "SELECT COALESCE(SUM(exact_amount), 0) FROM autopay_payments WHERE status = 'paid' AND paid_at >= ?", day_ago))
+            auto_cnt = _ma_int(await tx.scalar(
+                "SELECT COUNT(*) FROM autopay_payments WHERE status = 'paid' AND paid_at >= ?", day_ago))
+        except Exception:
+            auto_sum = auto_cnt = 0
+        out["topups_today"] = manual_sum + auto_sum
+        out["topups_today_n"] = manual_cnt + auto_cnt
         rows = await tx.fetchall(
             "SELECT o.order_type, o.price, o.status, o.country, o.created_at, o.user_id, u.full_name, u.username "
             "FROM orders o LEFT JOIN users u ON u.user_id = o.user_id ORDER BY o.id DESC LIMIT 15")
@@ -10191,6 +10282,8 @@ async def _ma_api_admin_user(request: web.Request, user: dict) -> web.Response:
 @_ma_route
 async def _ma_api_admin_balance(request: web.Request, user: dict) -> web.Response:
     admin_id = await _ma_admin(user)
+    if not _is_owner(admin_id):
+        raise _MaError(403, "owner_only", "Balansni faqat asosiy admin o'zgartira oladi.")
     b = await _ma_body(request)
     try:
         tid, amount = int(b.get("id")), int(b.get("amount"))

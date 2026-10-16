@@ -1443,8 +1443,9 @@ return k.length?`<section class="blk">${bare?"":`<div class="sec"><b>Xarajatlar<
 function ordSheet(o){hap();const s=$("#sh"),w=o.s=="wait",c=o.s=="bad"?" bad":o.s=="ref"?" ref":"",n=w?2:3;
 s.className="sh t-"+(SV[o.t]?o.t:"topup");
 const stp=["Yaratildi","Jarayonda",o.s=="bad"?"Bajarilmadi":o.s=="ref"?"Qaytarildi":"Bajarildi"];
-s.innerHTML=`<div class="grab"></div><div class="hd"><div class="ico">${IC[o.t]||IC.topup}</div><h2>${esc(o.w)}</h2></div><section class="pan" style="margin-top:12px"><div class="kv"><span>Narxi</span><b>${fmt(o.p)} so'm</b></div><div class="kv"><span>Sana</span><b>${esc(o.d)}</b></div>${o.id!=null?`<div class="kv"><span>Buyurtma raqami</span><b>#${esc(o.id)}</b></div>`:""}</section><div class="tl">${stp.map((x,i)=>`<div class="ts${i<n?" d":""}${w&&i==1?" a":""}${i==2?c:""}" style="--k:${i}"><i></i>${x}</div>`).join("")}</div>${o.t=="raqam"&&o.id&&(w||o.s=="ok")?`<button class="btn2" id="nk">${w?"Kodni tekshirish":"Kodni ko'rish"}</button>`:""}${w&&o.t=="raqam"&&o.id?'<button class="btn2 dng" id="rf">Pulni qaytarish</button>':w&&o.id&&["stars","premium","uc"].indexOf(o.t)>=0?'<button class="btn2" id="rf">Holatini tekshirish</button>':""}<button class="btn2 ghost" id="oh">Adminga yozish</button><button class="btn2 ghost" id="oc">Yopish</button>`;
-$("#oc").onclick=()=>show(false);$("#oh").onclick=()=>{hap();const u=ME&&ME.support&&ME.support.url,h=o.id!=null;if(h)copy("Buyurtma #"+o.id);if(u)setTimeout(()=>openUrl(u),h?350:0);else setTimeout(()=>toast(h?"Raqam nusxalandi — botga yozing":"Savolingizni botga yozing"),h?700:0)};const rf=$("#rf"),nk=$("#nk"),nr=o.t=="raqam"&&o.id;if(nk)nk.onclick=()=>numAct("check",o,1);if(rf)rf.onclick=nr?()=>numAct("refund",o,1):()=>ordCheck(o);show(true)}
+s.innerHTML=`<div class="grab"></div><div class="hd"><div class="ico">${IC[o.t]||IC.topup}</div><h2>${esc(o.w)}</h2></div><section class="pan" style="margin-top:12px">${o.num?`<div class="kv"><span>Raqam</span><b>${esc(o.num)}</b></div>`:""}<div class="kv"><span>Narxi</span><b>${fmt(o.p)} so'm</b></div><div class="kv"><span>Sana</span><b>${esc(o.d)}</b></div>${o.id!=null?`<div class="kv"><span>Buyurtma raqami</span><b>#${esc(o.id)}</b></div>`:""}</section>${o.num?`<button type="button" class="btn2 ghost" id="ocp" style="margin-top:10px">Raqamni nusxalash</button>`:""}<div class="tl">${stp.map((x,i)=>`<div class="ts${i<n?" d":""}${w&&i==1?" a":""}${i==2?c:""}" style="--k:${i}"><i></i>${x}</div>`).join("")}</div>${o.t=="raqam"&&o.id&&(w||o.s=="ok")?`<button class="btn2" id="nk">${w?"Kodni tekshirish":"Kodni ko'rish"}</button>`:""}${w&&o.t=="raqam"&&o.id?'<button class="btn2 dng" id="rf">Pulni qaytarish</button>':w&&o.id&&["stars","premium","uc"].indexOf(o.t)>=0?'<button class="btn2" id="rf">Holatini tekshirish</button>':""}<button class="btn2 ghost" id="oh">Adminga yozish</button><button class="btn2 ghost" id="oc">Yopish</button>`;
+const ocp=s.querySelector("#ocp");if(ocp)ocp.onclick=()=>copy(o.num);
+s.querySelector("#oc").onclick=()=>show(false);s.querySelector("#oh").onclick=()=>{hap();const u=ME&&ME.support&&ME.support.url,h=o.id!=null;if(h)copy("Buyurtma #"+o.id);if(u)setTimeout(()=>openUrl(u),h?350:0);else setTimeout(()=>toast(h?"Raqam nusxalandi — botga yozing":"Savolingizni botga yozing"),h?700:0)};const rf=s.querySelector("#rf"),nk=s.querySelector("#nk"),nr=o.t=="raqam"&&o.id;if(nk)nk.onclick=()=>numAct("check",o,1);if(rf)rf.onclick=nr?()=>numAct("refund",o,1):()=>ordCheck(o);show(true)}
 document.addEventListener("keydown",e=>{if(e.key!="Enter"&&e.key!=" ")return;const r=e.target.closest&&e.target.closest(".ord");if(r&&r.dataset.i!=null&&ords[+r.dataset.i]){e.preventDefault();ordSheet(ords[+r.dataset.i])}});
 document.addEventListener("click",e=>{const r=e.target.closest&&e.target.closest(".ord");if(r&&r.dataset.i!=null&&ords[+r.dataset.i])ordSheet(ords[+r.dataset.i])});
 /* pastga tortib yangilash */
@@ -1518,7 +1519,7 @@ fill=s.known?Math.min(100,Math.max(s.bal>0?3:0,s.bal/mx*100)):0,mk=s.lim>0?Math.
 msg=s.closed?`SmmUpper balansi chegaradan (${fmt(s.lim)} so'm) past — xaridlar to'xtatilgan.`:s.low?`SmmUpper balansi chegaradan (${fmt(s.lim)} so'm) past, lekin avto-to'xtatish o'chiq — xaridlar ochiq. Bajarilmagan xaridda pul foydalanuvchiga qaytariladi.`:!s.known?"SmmUpper balansini olib bo'lmadi. Xaridlar to'sqinliksiz ishlaydi.":s.lim<=0?"Chegara belgilanmagan — xaridlar doim ochiq.":"SmmUpper balansi yetarli — xaridlar ochiq.",
 sub=!s.own?"Buni faqat asosiy admin o'zgartira oladi":s.guard?"Yoqiq: balans chegaradan tushsa, xaridlar o'zi to'xtaydi":"O'chiq: balans qancha bo'lmasin, xaridlar ochiq turadi";
 return`<section class="ad-shop ${st}"><div class="ad-sh"><span class="ad-orb" aria-hidden="true"><i></i></span><div><b>${s.closed?"Do'kon yopiq":"Do'kon ochiq"}</b><small>SmmUpper hisobi</small></div><div class="ad-bl"><b>${s.known?fmt(s.bal):"—"}</b> <small>so'm</small></div></div><div class="ad-mt" role="img" aria-label="SmmUpper balansi ${s.known?fmt(s.bal):"noma'lum"} so'm, chegara ${fmt(s.lim)} so'm"><i style="width:${fill.toFixed(1)}%"></i>${mk!=null?`<u style="left:${mk.toFixed(1)}%"></u>`:""}</div><div class="ad-ml"><span class="tk"></span>Chegara: ${s.lim>0?fmt(s.lim)+" so'm":"belgilanmagan"}</div><p class="ad-msg" role="status">${msg}</p><button type="button" class="ad-sw" id="ag" role="switch" aria-checked="${s.guard}"${s.own?"":" disabled"}><span class="lk">Balans past bo'lsa xaridlarni to'xtatish<small>${sub}</small></span><span class="sw2"><i></i></span></button></section>`};
-const admOv=r=>{const T=r.by_type||{},ks=Object.keys(SV).filter(k=>T[k]&&T[k].revenue>0).sort((a,b)=>T[b].revenue-T[a].revenue),tot=ks.reduce((a,k)=>a+T[k].revenue,0),pd=r.pending.length,pdS=r.pending.reduce((a,p)=>a+(+p.amount||0),0),avg=r.orders_total?Math.round(r.revenue_total/r.orders_total):0,arpu=r.users_total?Math.round(r.revenue_total/r.users_total):0,dm=Math.round(r.revenue_month/Math.max(1,new Date().getDate())),lf=r.users_total?Math.round(100*r.users_left/r.users_total):0,K=(l,v,t,c)=>`<div class="ad-t${c?" "+c:""}"><small>${l}</small><b${String(v).length>9?' style="font-size:13px"':""}>${v}</b><span>${t}</span></div>`,pe=PER.find(x=>x[0]==AD.per)||PER[0];
+const admOv=r=>{const T=r.by_type||{},ks=Object.keys(SV).filter(k=>T[k]&&T[k].revenue>0).sort((a,b)=>T[b].revenue-T[a].revenue),tot=ks.reduce((a,k)=>a+T[k].revenue,0),pd=r.pending.length,pdS=r.pending.reduce((a,p)=>a+(+p.amount||0),0),avg=r.orders_total?Math.round(r.revenue_total/r.orders_total):0,arpu=r.users_total?Math.round(r.revenue_total/r.users_total):0,dm=Math.round(r.revenue_month/30),allU=(r.users_total||0)+(r.users_left||0),lf=allU?Math.round(100*r.users_left/allU):0,K=(l,v,t,c)=>`<div class="ad-t${c?" "+c:""}"><small>${l}</small><b${String(v).length>9?' style="font-size:13px"':""}>${v}</b><span>${t}</span></div>`,pe=PER.find(x=>x[0]==AD.per)||PER[0];
 return admShop(r)+(pd?`<button type="button" class="ad-pend" data-go="pay"><b>${pd} ta to'lov · ${fmt(pdS)} so'm tasdiq kutmoqda</b>${IC.chev}</button>`:"")
 +`<section class="hh ad-rev"><span class="hhi">${IC.topup}</span><div class="ad-pr">${PER.map(x=>`<button type="button" data-p="${x[0]}" aria-pressed="${x[0]==pe[0]}">${x[1]}</button>`).join("")}</div><small id="arl">${pe[2]}</small><div class="ad-big"><span id="arv">${fmt(r[pe[0]])}</span> <em>so'm</em></div><div class="ad-hm"><div><small>O'rt. chek</small><b>${fmt(avg)}</b></div><div><small>Kuniga (oy)</small><b>${fmt(dm)}</b></div><div><small>Mijozga</small><b>${fmt(arpu)}</b></div></div></section>`
 +`<div class="ad-g">${K("Mijozlar",fmt(r.users_total),"+"+fmt(r.users_new_today)+" bugun",r.users_new_today>0?"up":"")}${K("Buyurtmalar",fmt(r.orders_total),fmt(r.orders_today)+" ta bugun")}${K("To'ldirish 24s",fmt(r.topups_today),fmt(r.topups_today_n)+" ta · so'm")}${K("Ketganlar",fmt(r.users_left),lf+"% jami",r.users_left>0?"wn":"")}${K("Bloklangan",fmt(r.users_banned),"ta mijoz",r.users_banned>0?"bad":"")}${K("Kutilmoqda",fmt(pd),pd?fmt(pdS)+" so'm":"to'lov yo'q",pd?"wn":"")}${K("Mijozlar balansi",fmt(r.balance_total),"so'm, hamma hisobdagi jami","hi w3")}</div>`
@@ -1593,14 +1594,14 @@ if(t=="raqam")b+=`<label>Davlat — arzonidan boshlab</label><div class="row two
 b+=`</div><div class="sfoot" hidden><button type="button" class="hold" id="hold" aria-describedby="hint"><i></i><span id="hl"></span><b class="hp" id="hp"></b></button><p class="hint" id="hint"></p></div>`;
 s.innerHTML=b;show(true);bindSheet();s.querySelectorAll(".uchip").forEach(c=>c.onclick=()=>{hap();const u=$("#u");if(u){u.value=c.dataset.v;u.dispatchEvent(new Event("input"))}});
 }
-const price=()=>{const{t,a}=cur;if(a==null)return 0;return t=="stars"?a*P.star:t=="premium"?P.prem[a]:t=="uc"?P.uc.find(x=>x[0]==a)[1]:P.cty[a][2]};
+const price=()=>{const{t,a}=cur;if(a==null)return 0;return t=="stars"?Math.round(a*P.star):t=="premium"?P.prem[a]:t=="uc"?P.uc.find(x=>x[0]==a)[1]:P.cty[a][2]};
 const idok=()=>{const{t,a,u}=cur;return t=="raqam"?a!=null:t=="uc"?/^\d{6,12}$/.test(u):/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(u)};
 function err(){const{t,a,u}=cur;
-if(a==null||(t=="stars"&&a<50))return t=="stars"&&a!=null?"Eng kami 50 ta":(t=="raqam"?"Davlatni tanlang":t=="uc"?"Tarifni tanlang":t=="premium"?"Muddatni tanlang":"Miqdorni tanlang");
+if(a==null||(t=="stars"&&(a<50||a>1000000)))return t=="stars"&&a!=null?(a<50?"Eng kami 50 ta":"Eng ko'pi 1 000 000 ta"):(t=="raqam"?"Davlatni tanlang":t=="uc"?"Tarifni tanlang":t=="premium"?"Muddatni tanlang":"Miqdorni tanlang");
 if(SV[t].u&&!/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(u)&&t!="uc")return "Username kiriting";
 if(t=="uc"&&!/^\d{6,12}$/.test(u))return "PUBG ID kiriting (6–12 xona)";if(t=="uc"&&cur.chk&&cur.chk.found===false)return "Bunday PUBG ID topilmadi";return ""}
 function upd(){const e=err(),p=price(),h=$("#hold");
-{const f=$(".sfoot");if(f){let on;if(cur.t=="raqam")on=cur.a!=null;else{if(idok())cur.fs=1;else if(!cur.u)cur.fs=0;on=!!cur.fs}
+{const f=$(".sfoot");if(f){const on=cur.t=="raqam"?cur.a!=null:(cur.a!=null||!!cur.u||idok());
 if(on&&f.hidden){f.hidden=false;f.classList.remove("pop");void f.offsetWidth;f.classList.add("pop")}else if(!on)f.hidden=true;$("#sh").classList.toggle("nofoot",!on)}}
 const low=!e&&p>bal&&!cur.tok;   /* token bor = xarid urinib ko'rilgan, natijani server hal qiladi (balans eskirgan bo'lishi mumkin) */
 h.disabled=!!e||low;
@@ -1653,31 +1654,31 @@ if(e.code=="net"){h.disabled=false;$("#hl").textContent="Qayta urinish — bosib
 if(e.code=="unknown"){loadedAt=0;refresh();upd();h.disabled=true;$("#hl").textContent="Buyurtmalarni tekshiring";$("#hp").textContent="";$("#hint").textContent=e.message;return}
 cur.tok=null;upd();$("#hint").textContent=e.message;return}
 const be=$("#bal"),old=bal;bal=nb!=null?nb:bal-p;if(be)countTo(be,old,bal);if(ME)ME.balance=bal;
-saveUn(t,cur.u);ords.unshift({t,w,d:"Hozir",p,s:st,id:rr.order_id});renderOrd(true);show(false);
+saveUn(t,cur.u);ords.unshift({t,w,d:"Hozir",p,s:st,id:rr.order_id,num:rr.number||""});renderOrd(true);show(false);
 win(t,w,t=="raqam"&&rr.number?{num:rr.number,id:rr.order_id}:{h:st=="ok"?"Xarid bajarildi":"Buyurtma qabul qilindi",x:`<p class="mut">${st=="ok"?"Holatini «Buyurtmalar» bo'limidan ko'rishingiz mumkin.":"Natijani «Buyurtmalar» bo'limidan kuzating."}</p>`});
 loadedAt=0;setTimeout(()=>refresh(),1200)}
 
 function win(t,w,o){o=o||{};const e=$("#win");e.className="win on t-"+t;
-e.innerHTML=`<div class="wrap"><div class="burst"><div class="core"><svg viewBox="0 0 24 24" width="52" height="52" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path class="ck" d="M5 12.5l4.5 4.5L19 7.5"/></svg></div></div><h2 class="fd">${esc(o.h||(t=="raqam"?"Raqam tayyor":"To'lov qabul qilindi")).replace(/^SMS(?= )/,'<span class="g">SMS</span>')}</h2><p class="mut fd wpin">${t=="raqam"?PIN:""}${esc(w)}</p><div id="x" class="fd"></div><button type="button" class="btn2 fd" id="cl" data-af>Yopish</button></div>`;
-$("#cl").onclick=()=>{e.classList.add("out");setTimeout(()=>e.classList.remove("on","out"),250)};
+e.innerHTML=`<div class="wrap"><div class="burst"><div class="core"><svg viewBox="0 0 24 24" width="52" height="52" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path class="ck" d="M5 12.5l4.5 4.5L19 7.5"/></svg></div></div><h2 class="fd" id="wh">${esc(o.h||(t=="raqam"?"Raqam tayyor":"To'lov qabul qilindi")).replace(/^SMS(?= )/,'<span class="g">SMS</span>')}</h2><p class="mut fd wpin">${t=="raqam"?PIN:""}${esc(w)}</p><div id="x" class="fd"></div><button type="button" class="btn2 fd" id="cl" data-af>Yopish</button></div>`;
+$("#cl").onclick=()=>{e.classList.add("out");setTimeout(()=>{e.classList.remove("on","out");e.innerHTML=""},250)};
 if(t=="raqam"&&!o.x)numFlow(o.num,o.id);else $("#x").innerHTML=o.x}
 const codeHTML=(c,p)=>'<span style="display:grid;gap:12px;justify-items:center"><span class="code">'+[...String(c)].map((d,i)=>`<em style="--i:${i}">${esc(d)}</em>`).join("")+`</span><button type="button" class="cp kc" data-cc="${esc(c)}">${SHD}Kodni nusxalash</button>`+(p?`<span class="num" style="margin:0"><span class="ni">${SHD}</span><b>2FA: ${esc(p)}</b><button type="button" class="cp" data-cc="${esc(p)}">Nusxalash${IC.copy}</button></span>`:"")+"</span>";
 const bindCc=r=>(r||document).querySelectorAll("[data-cc]").forEach(b=>b.onclick=()=>{hap();copy(b.dataset.cc)});
-function numDone(c,p){const w=$("#wl");if(!w)return;w.dataset.done=1;w.innerHTML=codeHTML(c,p);hap();bindCc(w);["#nk","#nr"].forEach(k=>{const e=$(k);if(e)e.remove()})}
+function numDone(c,p){const winEl=$("#win"),w=winEl.querySelector("#wl"),wh=winEl.querySelector("#wh");if(!w)return;w.dataset.done=1;if(wh)wh.innerHTML='<span class="g">SMS</span> kodi keldi';w.innerHTML=codeHTML(c,p);hap();bindCc(w);["#nh","#nk","#nr"].forEach(k=>{const e=winEl.querySelector(k);if(e)e.remove()})}
 /* Raqam: kodni tekshirish / pulni qaytarish (server: /api/number/check va /api/number/refund) */
 async function numAct(k,o,man){
 try{const r=await call("/api/number/"+k,{body:{id:o.id}}),q=ords.find(x=>x.id==o.id);
-if(r.status=="done"){if(q)q.s="ok";renderOrd();const w=$("#wl");
-if(w&&$("#win").classList.contains("on"))numDone(r.code,r.password);
-else{show(false);const nm=r.number?`<div class="num"><span class="ni">${IC.raqam}</span><b>${esc(r.number)}</b><button type="button" class="cp" data-cc="${esc(r.number)}">Nusxalash${IC.copy}</button></div>`:"";win("raqam",(q&&q.w)||"Raqam",{h:"SMS kodi keldi",x:nm+`<div class="waitl" id="wl">${codeHTML(r.code,r.password)}</div>`});bindCc($("#win"))}}
-else if(r.status=="refunded"){const old=bal;bal=r.balance;if(ME)ME.balance=bal;if(q)q.s="ref";const w=$("#wl");if(w)w.dataset.done=1;paint(old);show(false);$("#win").classList.remove("on");toast("Qaytarildi: "+fmt(r.amount)+" so'm")}
+if(r.status=="done"){if(q){q.s="ok";if(r.number)q.num=r.number}renderOrd();const winEl=$("#win"),w=winEl.querySelector("#wl");
+if(w&&winEl.classList.contains("on"))numDone(r.code,r.password);
+else{show(false);const nm=r.number?`<div class="num"><span class="ni">${IC.raqam}</span><b>${esc(r.number)}</b><button type="button" class="cp" data-cc="${esc(r.number)}">Nusxalash${IC.copy}</button></div>`:"";win("raqam",(q&&q.w)||"Raqam",{h:"SMS kodi keldi",x:nm+`<div class="waitl" id="wl">${codeHTML(r.code,r.password)}</div>`});bindCc(winEl)}}
+else if(r.status=="refunded"){const old=bal;bal=r.balance;if(ME)ME.balance=bal;if(q)q.s="ref";const w=$("#win #wl");if(w)w.dataset.done=1;paint(old);show(false);$("#win").classList.remove("on");$("#win").innerHTML="";toast("Qaytarildi: "+fmt(r.amount)+" so'm")}
 else if(man)toast(r.status=="closed"?"Buyurtma yakunlangan":"Kod hali kelmagan")}
 catch(e){if(gateErr(e))return;if(man)toast(e.message)}}
-function numFlow(n,id){const x=$("#x");
-x.innerHTML=`<div class="num"><b>${esc(n)}</b><button class="cp" id="cn">Nusxalash</button></div><div class="waitl" id="wl"><span class="dots"><i></i><i></i><i></i></span> SMS kutilmoqda</div><p class="mut" style="font-size:13px;margin:6px 0 0">Kod kelmasa, biroz kutib pulni qaytarib olasiz.</p><button class="btn2 ghost" id="nk">Kodni tekshirish</button><button class="btn2 dng" id="nr">Pulni qaytarish</button>`;
-$("#cn").onclick=()=>copy(n);
-$("#nk").onclick=()=>numAct("check",{id},1);$("#nr").onclick=()=>numAct("refund",{id},1);
-const poll=async()=>{const w=$("#wl");if(!w||w.dataset.done||!$("#win").classList.contains("on"))return;await numAct("check",{id},0);setTimeout(poll,5000)};setTimeout(poll,4000)}
+function numFlow(n,id){const winEl=$("#win"),x=winEl.querySelector("#x");
+x.innerHTML=`<div class="num"><span class="ni">${IC.raqam}</span><b>${esc(n)}</b><button type="button" class="cp" id="cn">Nusxalash${IC.copy}</button></div><div class="waitl" id="wl"><span class="dots"><i></i><i></i><i></i></span> SMS kutilmoqda</div><p class="mut" id="nh" style="font-size:13px;margin:6px 0 0">Kod kelmasa, biroz kutib pulni qaytarib olasiz.</p><button class="btn2 ghost" id="nk">Kodni tekshirish</button><button class="btn2 dng" id="nr">Pulni qaytarish</button>`;
+winEl.querySelector("#cn").onclick=()=>copy(n);
+winEl.querySelector("#nk").onclick=()=>numAct("check",{id},1);winEl.querySelector("#nr").onclick=()=>numAct("refund",{id},1);
+const poll=async()=>{const w=winEl.querySelector("#wl");if(!w||w.dataset.done||!winEl.classList.contains("on"))return;await numAct("check",{id},0);setTimeout(poll,5000)};setTimeout(poll,4000)}
 
 /* ===== BALANSNI TO'LDIRISH =====
    1) Avto-to'lov: server unikal summa + karta beradi, foydalanuvchi o'tkazadi, bot to'lovni o'zi aniqlab balansni to'ldiradi.
@@ -1809,8 +1810,8 @@ async function boot(refresh){tpStop();$("#nav").innerHTML="";$("#app").innerHTML
 try{const m=await load(refresh);if(!m)return;first=true;tab="home";home();setTimeout(FX.watch,400)}catch(e){fail(e)}}
 boot();
 /* "Nusxalandi" belgisi */
-document.addEventListener("click",e=>{const c=e.target.closest&&e.target.closest(".cp");if(!c||c.dataset.o)return;c.dataset.o=c.textContent;c.textContent="✓ Nusxalandi";c.classList.add("okc");
-setTimeout(()=>{c.textContent=c.dataset.o;delete c.dataset.o;c.classList.remove("okc")},1300)});
+document.addEventListener("click",e=>{const c=e.target.closest&&e.target.closest(".cp");if(!c||c._orig)return;c._orig=c.innerHTML;c.textContent="✓ Nusxalandi";c.classList.add("okc");
+setTimeout(()=>{if(c._orig){c.innerHTML=c._orig;delete c._orig}c.classList.remove("okc")},1300)});
 document.addEventListener("visibilitychange",()=>{if(document.hidden)return;if(TP.run&&cur&&cur.p)poll(cur.p,0);else if(ME)refresh()});
 setInterval(()=>{if(!document.hidden&&ME&&!TP.run&&(ME.pending_topups>0||ME.open_payment))refresh()},15000);
 /* ===== KLAVIATURA BILAN ISHLASH =====
