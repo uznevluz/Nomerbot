@@ -7,6 +7,7 @@
 """
 import asyncio
 import contextlib
+import copy
 import functools
 import html
 import json
@@ -326,6 +327,8 @@ async def init_db():
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT")
             # Foydalanuvchi botni to'xtatgan/bloklagan (chiqib ketgan) bo'lsa TRUE (my_chat_member orqali yangilanadi)
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS left_bot BOOLEAN NOT NULL DEFAULT FALSE")
+            # admin_msgs: chek xabarlarining {admin_id: message_id} JSON'i (Mini App'dan ko'rib chiqilganda bot chatidagi tugmalarni yangilash uchun)
+            await conn.execute("ALTER TABLE topups ADD COLUMN IF NOT EXISTS admin_msgs TEXT")
     else:
         async with _db_sqlite() as db:
             # WAL rejimi baza faylida doimiy saqlanadi — shuning uchun bu
@@ -364,6 +367,10 @@ async def init_db():
                 pass
             try:
                 await db.execute("ALTER TABLE users ADD COLUMN left_bot INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass
+            try:
+                await db.execute("ALTER TABLE topups ADD COLUMN admin_msgs TEXT")
             except Exception:
                 pass
             await db.commit()
@@ -669,6 +676,8 @@ PHONE_PREFIXES = tuple("+" + p.strip().lstrip("+") for p in os.getenv("PHONE_PRE
 
 
 async def is_banned(user_id: int) -> bool:
+    if user_id in ADMIN_IDS:      # asosiy adminlar (.env) HECH QACHON bloklanmaydi: BanMiddleware ham, Mini App (_ma_auth) ham shu funksiyadan o'tadi
+        return False
     now = time.monotonic()
     hit = _BAN_CACHE.get(user_id)
     if hit is not None and now - hit[1] < _BAN_TTL:
@@ -762,6 +771,9 @@ async def _is_banned_db(user_id: int) -> bool:
 
 
 async def set_banned(user_id: int, banned: bool):
+    if banned and user_id in ADMIN_IDS:       # oxirgi himoya: asosiy adminni hech kim bloklay olmaydi (chaqiruvchilar ham oldindan tekshiradi)
+        logging.warning("set_banned: asosiy admin (%s) ni bloklashga urinish rad etildi", user_id)
+        return
     _BAN_CACHE[user_id] = (bool(banned), time.monotonic())
     if _PG:
         async with _pool.acquire() as conn:
@@ -923,6 +935,12 @@ async def top_spenders(limit: int = 10) -> list:
                 (limit,),
             )
             return await cur.fetchall()
+
+
+def _local_day_start() -> int:
+    """Bugungi kun boshi (Toshkent vaqti bo'yicha 00:00) — UNIX vaqt. "Bugun" statistikasi va daily_revenue()
+    grafigidagi bugungi ustun BIR XIL chegaradan hisoblansin deb shu yerda bitta joyda saqlanadi."""
+    return int(datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
 
 async def daily_revenue(days: int = 7) -> list:
@@ -1141,6 +1159,38 @@ async def get_topup(topup_id: int):
             db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT * FROM topups WHERE id = ?", (topup_id,))
             return await cur.fetchone()
+
+
+async def save_topup_admin_msgs(topup_id: int, msgs: Dict[int, int]) -> None:
+    """Chek xabarlarining {admin_id: message_id} ro'yxatini saqlaydi: so'rov Mini App ichidan ko'rib chiqilsa,
+    adminlarning bot chatidagi Tasdiqlash/Rad etish tugmalari ham yangilanadi (finalize_topup_admin_msgs)."""
+    if not msgs:
+        return
+    async with _ap_tx() as tx:
+        await tx.execute("UPDATE topups SET admin_msgs = ? WHERE id = ?",
+                         json.dumps({str(k): int(v) for k, v in msgs.items()}), topup_id)
+
+
+async def finalize_topup_admin_msgs(bot, topup_id: int, approved: bool) -> None:
+    """Mini App ichidan tasdiqlangan/rad etilgan so'rovning adminlarga yuborilgan chek xabarlaridagi tugmalarni
+    natija tugmasiga almashtiradi (bot chatida eskirgan tugmalar qolmasin). Xabar o'chirilgan/eski bo'lsa — e'tiborsiz."""
+    if bot is None:
+        return
+    try:
+        async with _ap_conn() as tx:
+            raw = await tx.scalar("SELECT admin_msgs FROM topups WHERE id = ?", topup_id)
+        msgs = json.loads(raw) if raw else {}
+    except Exception:
+        return
+    if not isinstance(msgs, dict) or not msgs:
+        return
+    label = "\u2705 Tasdiqlandi (Mini App)" if approved else "\u274C Rad etildi (Mini App)"
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=label, callback_data="topup:done",
+                             style=STYLE_SUCCESS if approved else STYLE_DANGER)]])
+    for admin_id, message_id in msgs.items():
+        with contextlib.suppress(Exception):
+            await bot.edit_message_reply_markup(chat_id=int(admin_id), message_id=int(message_id), reply_markup=markup)
 
 
 async def get_pending_topups(limit: int = 15) -> list:
@@ -1504,7 +1554,7 @@ async def get_stats() -> dict:
     (turlari bo'yicha), tushum (bugun/hafta/oy va turlar kesimida) va
     kutilayotgan to'ldirish so'rovlari."""
     now = int(time.time())
-    day_ago = now - 86400
+    day_ago = _local_day_start()      # "Bugun" = Toshkent vaqti bo'yicha yarim tundan (oxirgi 24 soat EMAS) — grafikdagi bugungi ustun bilan mos
     week_ago = now - 7 * 86400
     month_ago = now - 30 * 86400
     order_types = ("number", "stars", "premium", "uc")
@@ -1625,6 +1675,10 @@ class SmmUpperError(Exception):
         super().__init__(message)
 
 
+# Provayder JSON o'rniga HTML/matn (502/504, Cloudflare/nginx sahifasi) qaytarsa — foydalanuvchiga xom javob emas, shu xabar ko'rsatiladi.
+SMMUPPER_DOWN_MESSAGE = "Xizmat serveri vaqtincha javob bermayapti, birozdan so'ng urinib ko'ring."
+
+
 def new_request_id() -> str:
     """Xarid so'rovlari (buyStars/buyPremium/getNumber) uchun noyob request_id.
     Hujjatga ko'ra 6-64 belgi: harf, raqam, . _ - bo'lishi kerak — uuid4().hex (32 ta belgi) mos keladi.
@@ -1634,6 +1688,7 @@ def new_request_id() -> str:
 
 class SmmUpperClient:
     PRICES_CACHE_TTL = 90  # soniya — shu vaqt ichida getPrices() qayta so'ralmaydi (narxlar soniyama-soniya o'zgarmaydi)
+    COUNTRIES_CACHE_TTL = 30  # soniya — available_countries() shu vaqt ichida (server bo'yicha) keshdan qaytadi
 
     def __init__(self, api_key: str = SMMUPPER_API_KEY, base_url: str = SMMUPPER_BASE_URL):
         self.api_key = api_key  # .env'dagi standart qiymat — DB bo'sh bo'lsa shu ishlatiladi
@@ -1641,6 +1696,7 @@ class SmmUpperClient:
         self._session: Optional[aiohttp.ClientSession] = None  # so'rovlar orasida qayta ishlatiladi
         self._prices_cache: Optional[dict] = None
         self._prices_cache_ts: float = 0.0
+        self._countries_cache: Dict[int, tuple] = {}   # server -> (javob, vaqt)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Bitta umumiy sessiyani qayta ishlatadi — har bir so'rovda yangi TCP/TLS ulanish ochish
@@ -1685,8 +1741,15 @@ class SmmUpperClient:
             try:
                 data = await resp.json(content_type=None)
             except Exception:
-                text = await resp.text()
-                raise SmmUpperError(f"Server javobini o'qib bo'lmadi: {text[:200]}", resp.status)
+                # JSON emas (odatda 502/504 HTML sahifa): tafsilot faqat logga yoziladi, foydalanuvchiga tushunarli xabar beriladi
+                text = ""
+                with contextlib.suppress(Exception):
+                    text = await resp.text()
+                logging.warning("SmmUpper %s: JSON emas javob (HTTP %s): %s", action, resp.status, " ".join(text[:200].split()))
+                raise SmmUpperError(SMMUPPER_DOWN_MESSAGE, resp.status)
+            if not isinstance(data, dict):
+                logging.warning("SmmUpper %s: kutilmagan javob turi (HTTP %s): %r", action, resp.status, str(data)[:200])
+                raise SmmUpperError(SMMUPPER_DOWN_MESSAGE, resp.status)
 
             if raise_on_error and not data.get("success"):
                 raise SmmUpperError(data.get("error", "Noma'lum xato"), resp.status)
@@ -1712,8 +1775,21 @@ class SmmUpperClient:
         return data
 
     # 3. Davlatlar ro'yxati
-    async def available_countries(self, server: int) -> dict:
-        return await self._request("available_countries", server=server)
+    async def available_countries(self, server: int, *, force_refresh: bool = False) -> dict:
+        """COUNTRIES_CACHE_TTL soniya ichida keshdan qaytadi: Mini App'da «Raqam» oynasini ochish ham, «Sotib olish» ham
+        shu ro'yxatni ketma-ket so'raydi — har safar SmmUpper'ga bormaslik uchun. Bo'sh javob keshlanmaydi (provayderda
+        davlat paydo bo'lsa — darhol ko'rinadi). Har safar NUSXA qaytariladi: chaqiruvchi o'zgartirsa ham kesh buzilmaydi.
+        Xato bo'lsa (_request istisno ko'taradi) hech narsa keshlanmaydi. `force_refresh=True` keshni chetlab o'tadi."""
+        now = time.monotonic()
+        hit = self._countries_cache.get(server)
+        if not force_refresh and hit is not None and now - hit[1] < self.COUNTRIES_CACHE_TTL:
+            return copy.deepcopy(hit[0])
+        data = await self._request("available_countries", server=server)
+        if isinstance(data, dict) and data.get("countries"):
+            self._countries_cache[server] = (copy.deepcopy(data), now)
+        else:
+            self._countries_cache.pop(server, None)
+        return data
 
     # 4. Raqam olish
     async def get_number(self, server: int, country: str, request_id: Optional[str] = None) -> dict:
@@ -2023,42 +2099,43 @@ async def _call_idempotent(fn, *args, request_id=None, attempts: int = 3, **kwar
     raise PurchaseUnknownError(request_id, last)
 
 
-async def _refund_unknown_purchase(bot, callback, state, est_price: int, label: str, err,
-                                   order_pk: Optional[int] = None) -> None:
-    """Xarid natijasi noma'lum (Raqam/Stars/Premium): pul foydalanuvchiga qaytariladi, adminga request_id bilan
-    ogohlantirish yuboriladi (xarid SmmUpper'da amalga oshgan bo'lishi ham mumkin).
-    `order_pk` berilsa (write-ahead yozuvi) — pul refund_order orqali BIR MARTA va atomik qaytariladi; buyurtma
-    'refunded' bo'lib request_id bilan bazada qoladi (keyin SmmUpper panelida solishtirish uchun)."""
+async def _park_unknown_purchase(bot, callback, state, est_price: int, label: str, err,
+                                 order_pk: Optional[int] = None) -> None:
+    """Xarid natijasi noma'lum (Raqam/Stars/Premium): pul DARHOL qaytarilmaydi. SmmUpper so'rovni qabul qilib bajargan,
+    faqat javobi tarmoqda uzilgan bo'lishi mumkin — shu payt pulni qaytarsak, foydalanuvchi ham xaridni, ham pulini
+    olib qolardi. Buyurtma 'processing' (yuborilmagan) holida qoladi, fon jarayoni (recover_purchase_order) XUDDI SHU
+    request_id bilan qayta uradi: natija topilsa yakunlaydi; aniq rad etilsa yoki WA_RECOVER_GIVE_UP dan keyin ham
+    noma'lum bo'lsa — pulni qaytaradi (UC oqimidagi kabi).
+    `order_pk` bo'lmasa (tiklash yozuvi yo'q, natijani keyin aniqlab bo'lmaydi) — pul darhol qaytariladi."""
     user_id = callback.from_user.id
-    if order_pk is not None:
-        if not await refund_order(order_pk):
-            # Yozuv shu orada boshqa jarayon tomonidan yakunlangan (masalan, fon jarayoni natijani topdi) —
-            # ikkinchi marta qaytarmaymiz.
-            logging.warning(f"{label} #{order_pk}: natija noma'lum edi, lekin buyurtma allaqachon yakunlangan "
-                            f"— pul qayta qaytarilmadi")
-            await state.clear()
-            return
-    else:
-        await change_balance(user_id, est_price)
     request_id = getattr(err, "request_id", "?")
-    order_line = f" Buyurtma: #{order_pk}." if order_pk is not None else ""
     logging.error(f"{label} xaridi: SmmUpper javobi olinmadi user={user_id} request_id={request_id}: {err}")
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"\u26A0\uFE0F {label} xaridi: SmmUpper javobi olinmadi (tarmoq).\n"
-                f"Foydalanuvchi ID: {user_id}, summa: {fmt_money(est_price)} so'm.{order_line}\nrequest_id: {request_id}\n"
-                f"Foydalanuvchi puli balansga qaytarildi. Xarid SmmUpper'da amalga oshgan bo'lishi ham mumkin "
-                f"\u2014 uni SmmUpper panelida tekshiring.")
-        except Exception:
-            pass
+    if order_pk is None:
+        await change_balance(user_id, est_price)
+        await _uc_alert_admins(
+            bot,
+            f"\u26A0\uFE0F {label} xaridi: SmmUpper javobi olinmadi (tarmoq).\n"
+            f"Foydalanuvchi ID: {user_id}, summa: {fmt_money(est_price)} so'm.\nrequest_id: {request_id}\n"
+            f"Foydalanuvchi puli balansga qaytarildi. Xarid SmmUpper'da amalga oshgan bo'lishi ham mumkin "
+            f"\u2014 uni SmmUpper panelida tekshiring.")
+        with contextlib.suppress(Exception):
+            await callback.message.answer(
+                "\u274C SmmUpper bilan aloqa uzildi, buyurtma tasdiqlanmadi.\n"
+                "\U0001F4B0 Pulingiz balansga qaytarildi. Birozdan so'ng qayta urinib ko'ring.",
+                reply_markup=main_menu(),
+            )
+        await state.clear()
+        return
+    await _uc_alert_admins(
+        bot,
+        f"\u26A0\uFE0F {label} #{order_pk}: SmmUpper javobi olinmadi (tarmoq). request_id: {request_id}\n"
+        f"Foydalanuvchi ID: {user_id}, summa: {fmt_money(est_price)} so'm.\n"
+        f"Bot shu request_id bilan avtomatik qayta uradi (takroriy xarid bo'lmaydi).")
     with contextlib.suppress(Exception):
         await callback.message.answer(
-            "\u274C SmmUpper bilan aloqa uzildi, buyurtma tasdiqlanmadi.\n"
-            "\U0001F4B0 Pulingiz balansga qaytarildi. Birozdan so'ng qayta urinib ko'ring.",
-            reply_markup=main_menu(),
-        )
+            f"\u23F3 Buyurtmangiz (#{order_pk}) qabul qilindi, lekin SmmUpper bilan aloqa sekin.\n"
+            "Natijani tez orada o'zimiz xabar qilamiz \u2014 pulingiz yo'qolmaydi.",
+            reply_markup=main_menu())
     await state.clear()
 
 
@@ -2273,6 +2350,12 @@ async def _announce_purchase(bot, order_pk: int, order, result: dict, info: dict
             with contextlib.suppress(Exception):
                 await notify_channel(bot, channel_number_notice(buyer, order["country"], price, result.get("number", "?")),
                                      order_type="number")
+            # Foydalanuvchi ilovadan chiqib ketsa ham kod yo'qolmasin: fonda kuzatiladi va buyurtmaga yoziladi
+            # (chatga xabarsiz — ilova "Buyurtmalar"da kodni o'zi ko'rsatadi).
+            task = asyncio.create_task(
+                _poll_code(bot, order["user_id"], order_pk, order["server"], result, None, silent=True))
+            _background_tasks.add(task)
+            task.add_done_callback(_log_task_exception)
             return
     if order_type == "number":
         number = result.get("number", "?")
@@ -2597,7 +2680,8 @@ ASK_BALANCE_AMOUNT = (
 )
 ASK_BAN_ID = "Bloklamoqchi bo'lgan foydalanuvchi ID raqamini yuboring:"
 ASK_UNBAN_ID = "Blokdan chiqarmoqchi bo'lgan foydalanuvchi ID raqamini yuboring:"
-ASK_BROADCAST_TEXT = "Barcha foydalanuvchilarga yuboriladigan xabar matnini kiriting:"
+ASK_BROADCAST_TEXT = ("Barcha foydalanuvchilarga yuboriladigan xabarni yuboring.\n"
+                      "Matn, rasm yoki video (izoh bilan) bo'lishi mumkin — qalin yozuv, havola va emojilar asl holida saqlanadi:")
 ASK_API_KEY = (
     "SmmUpper hamkorlik API kalitini yuboring (SmmUpper botida \"API (hamkorlik)\" "
     "bo'limidan olinadi).\n\n"
@@ -4361,13 +4445,13 @@ async def topup_amount(message: Message, state: FSMContext):
     await message.answer(topup_instructions(amount, card_number, card_holder), reply_markup=_card_copy_menu(card_number))
 
 
-@router_balance.message(TopUp.photo, F.photo)
-async def topup_photo(message: Message, state: FSMContext, bot):
+async def _topup_submit_receipt(message: Message, state: FSMContext, bot, file_id: str, as_document: bool = False):
+    """Chekni (rasm yoki rasm-fayl) so'rov sifatida saqlab, adminlarga yuboradi. Fayl bo'lsa adminga ham fayl bo'lib
+    boradi; saqlangan file_id'ni Mini App'dagi admin ko'rinishi (_ma_api_admin_receipt) ham ikkala holatda ochadi."""
     data = await state.get_data()
     amount = data.get("amount", 0)
-    photo_file_id = message.photo[-1].file_id
 
-    topup_id = await create_topup(message.from_user.id, amount, photo_file_id)
+    topup_id = await create_topup(message.from_user.id, amount, file_id)
     await state.clear()
 
     other_pending = await count_other_pending_topups(message.from_user.id, topup_id)
@@ -4381,20 +4465,52 @@ async def topup_photo(message: Message, state: FSMContext, bot):
     if other_pending:
         caption += duplicate_topup_warning(other_pending)
 
+    admin_msgs: Dict[int, int] = {}          # {admin_id: message_id} — Mini App'dan ko'rib chiqilganda tugmalarni yangilash uchun
     for admin_id in (set(ADMIN_IDS) | set(await get_extra_admin_ids())):
         try:
-            await bot.send_photo(
-                admin_id, photo_file_id, caption=caption,
+            send = bot.send_document if as_document else bot.send_photo
+            sent_msg = await send(
+                admin_id, file_id, caption=caption,
                 reply_markup=topup_review_menu(topup_id),
             )
+            admin_msgs[admin_id] = sent_msg.message_id
         except Exception:
             pass
+    with contextlib.suppress(Exception):
+        await save_topup_admin_msgs(topup_id, admin_msgs)
 
     await message.answer(TOPUP_SENT_TO_ADMIN, reply_markup=main_menu())
 
 
+@router_balance.message(TopUp.photo, F.photo)
+async def topup_photo(message: Message, state: FSMContext, bot):
+    await _topup_submit_receipt(message, state, bot, message.photo[-1].file_id)
+
+
+_RECEIPT_IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif")
+
+
+@router_balance.message(TopUp.photo, F.document)
+async def topup_document(message: Message, state: FSMContext, bot):
+    """Skrinshot sifati buzilmasligi uchun «Fayl» sifatida yuborilsa ham qabul qilinadi (rasm fayllari);
+    boshqa turdagi fayl — rasm yuborish haqida eslatma (jim turib qolmaydi)."""
+    doc = message.document
+    mime = (doc.mime_type or "").lower()
+    name = (doc.file_name or "").lower()
+    if not (mime.startswith("image/") or name.endswith(_RECEIPT_IMAGE_EXT)):
+        await message.answer(TOPUP_SEND_PHOTO)
+        return
+    await _topup_submit_receipt(message, state, bot, doc.file_id, as_document=True)
+
+
 @router_balance.message(TopUp.photo, is_free_text)
 async def topup_photo_missing(message: Message):
+    await message.answer(TOPUP_SEND_PHOTO)
+
+
+@router_balance.message(TopUp.photo, ~F.text)
+async def topup_photo_other(message: Message):
+    """Sticker, video, ovozli xabar va h.k. — chek kutilayotganda javobsiz qolmasin (matnlar yuqoridagi handlerlarda)."""
     await message.answer(TOPUP_SEND_PHOTO)
 
 
@@ -4755,7 +4871,7 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
     try:
         result = await _send_purchase_request("number", request_id, server=server, country=country)
     except PurchaseUnknownError as e:
-        await _refund_unknown_purchase(bot, callback, state, est_price, "Raqam", e, order_pk=order_pk)
+        await _park_unknown_purchase(bot, callback, state, est_price, "Raqam", e, order_pk=order_pk)
         return
     except SmmUpperError as e:
         await _reject_purchase(callback, state, order_pk, e, bot=bot)
@@ -4792,7 +4908,8 @@ async def _clear_buttons(bot, user_id: int, message_id: Optional[int]):
 
 
 async def _poll_code(bot, user_id: int, order_pk: int, server: int, result: dict,
-                      purchase_message_id: Optional[int] = None):
+                      purchase_message_id: Optional[int] = None, silent: bool = False):
+    # silent=True (Mini App xaridi): kod faqat buyurtmaga yoziladi, foydalanuvchi chatiga HECH QANDAY xabar yuborilmaydi.
     for _ in range(POLL_ATTEMPTS):
         await asyncio.sleep(POLL_DELAY_SECONDS)
         try:
@@ -4811,6 +4928,8 @@ async def _poll_code(bot, user_id: int, order_pk: int, server: int, result: dict
             if not await _set_order_status_if(order_pk, "processing", "done",
                                               {**result, "code": code, "password": password}):
                 return
+            if silent:
+                return
             await _clear_buttons(bot, user_id, purchase_message_id)
             try:
                 await bot.send_message(user_id, text, parse_mode="HTML", reply_markup=_code_copy_menu(code, password))
@@ -4818,6 +4937,8 @@ async def _poll_code(bot, user_id: int, order_pk: int, server: int, result: dict
                 pass
             return
 
+    if silent:
+        return
     try:
         _row = await get_order_row(order_pk)
         if not _row or _row["status"] != "processing":
@@ -5141,7 +5262,7 @@ async def confirm_stars(callback: CallbackQuery, state: FSMContext, bot):
     try:
         result = await _send_purchase_request("stars", request_id, target_username=username, qty=amount)
     except PurchaseUnknownError as e:
-        await _refund_unknown_purchase(bot, callback, state, est_price, "Stars", e, order_pk=order_pk)
+        await _park_unknown_purchase(bot, callback, state, est_price, "Stars", e, order_pk=order_pk)
         return
     except SmmUpperError as e:
         await _reject_purchase(callback, state, order_pk, e, bot=bot)
@@ -5306,7 +5427,7 @@ async def confirm_premium(callback: CallbackQuery, state: FSMContext, bot):
     try:
         result = await _send_purchase_request("premium", request_id, target_username=username, qty=months)
     except PurchaseUnknownError as e:
-        await _refund_unknown_purchase(bot, callback, state, est_price, "Premium", e, order_pk=order_pk)
+        await _park_unknown_purchase(bot, callback, state, est_price, "Premium", e, order_pk=order_pk)
         return
     except SmmUpperError as e:
         await _reject_purchase(callback, state, order_pk, e, bot=bot)
@@ -5355,6 +5476,7 @@ UC_ASK_ID = (
     "\u26A0\uFE0F ID ni diqqat bilan tekshiring \u2014 UC noto'g'ri ID ga yuborilsa, qaytarib bo'lmaydi."
 )
 _UC_FAILED_STATUSES = {"failed", "error", "cancelled", "canceled", "rejected", "refunded"}
+_DONE_STATUSES = frozenset({"done", "completed", "success"})   # provayderning "bajarildi" holatlari (Stars/Premium/UC uchun bir xil)
 _uc_sweep_cursor = {"last_id": 0}          # navbat kursori: oxirgi tekshirilgan buyurtma ID si
 _uc_stale_alerted: set = set()
 
@@ -5686,7 +5808,7 @@ async def _uc_apply_buy_result(bot, order_pk: int, result: dict) -> Optional[dic
 
     total_uc = int(result.get("total_uc") or details.get("total_uc") or row["qty"] or 0)
     account_id = str(result.get("account_id") or details.get("account_id") or "")
-    status = "done" if str(result.get("status") or "").lower() == "done" else "processing"
+    status = "done" if str(result.get("status") or "").lower() in _DONE_STATUSES else "processing"
     new_details = {**details, **result, "account_id": account_id, "unsent": False}
     await _uc_write_final(order_pk, charged_price, total_uc or None, new_details, status)
     if status == "done":
@@ -5878,7 +6000,7 @@ async def uc_sync_order(bot, order_pk: int) -> Optional[str]:
     user_id = row["user_id"]
     old_details = _uc_details_from_row(row)
 
-    if api_status == "done":
+    if api_status in _DONE_STATUSES:
         if await _set_order_status_if(order_pk, "processing", "done", {**old_details, **result}):
             account_id = old_details.get("account_id") or result.get("account_id") or ""
             total_uc = row["qty"] or result.get("total_uc") or 0
@@ -5893,7 +6015,7 @@ async def uc_sync_order(bot, order_pk: int) -> Optional[str]:
             await notify_channel(bot, channel_uc_notice(buyer, account_id, total_uc, row["price"]), order_type="uc")
         return "done"
 
-    if api_status in _UC_FAILED_STATUSES or (result.get("refunded") is True and api_status != "done"):
+    if api_status in _UC_FAILED_STATUSES or (result.get("refunded") is True and api_status not in _DONE_STATUSES):
         refund = await refund_order(order_pk)          # atomik: faqat 'processing' bo'lsa, bir marta
         if refund:
             await _uc_notify_refund(bot, order_pk, user_id, refund["price"], "administrator rad etdi")
@@ -5997,7 +6119,19 @@ async def sp_sync_order(bot, order_pk: int) -> Optional[str]:
             await _notify_purchase_refund(bot, order_pk, row["user_id"], refund["price"], "provayder rad etdi", label)
         return "refunded"
     if raw_status in ("done", "completed", "success"):
-        await _set_order_status_if(order_pk, row["status"], "done", {**_order_details_from_row(row), **result})
+        # Holat atomik o'zgargandagina xabar ketadi — parallel tekshiruvlarda foydalanuvchiga ikki marta yuborilmaydi (UC dagi kabi).
+        if await _set_order_status_if(order_pk, row["status"], "done", {**_order_details_from_row(row), **result}):
+            qty, username = row["qty"], row["target_username"]
+            if row["order_type"] == "stars":
+                head, what = "\u2705 Stars yuborildi!", (f"\u2B50 {qty} Stars" if qty else "\u2B50 Stars")
+            else:
+                head, what = "\u2705 Premium faollashtirildi!", (f"\U0001F48E {qty} oy Premium" if qty else "\U0001F48E Premium")
+            lines = [head]
+            if username:
+                lines.append(f"\U0001F464 @{username}")
+            lines += [what, f"\U0001F522 Buyurtma #{order_pk}", "", "Rahmat! \U0001F64C"]
+            with contextlib.suppress(Exception):
+                await bot.send_message(row["user_id"], "\n".join(lines))
         return "done"
     return "processing"
 
@@ -6172,6 +6306,9 @@ async def check_order(callback: CallbackQuery, bot):
         data = await client.get_order(row["ref"])
     except SmmUpperError as e:
         await callback.answer(f"Xatolik: {e.message}", show_alert=True)
+        return
+    except _NET_ERRORS:
+        await callback.answer("Tarmoq xatosi. Birozdan so'ng qayta tekshiring.", show_alert=True)
         return
 
     result = data.get("result", {})
@@ -6430,6 +6567,8 @@ async def _panel_text() -> str:
         balance_line = f"\U0001F4B0 SmmUpper balans: {fmt_money(balance)} so'm"
     except (SmmUpperError, KeyError) as e:
         balance_line = f"\u26A0\uFE0F SmmUpper balansini olishda xatolik: {e}"
+    except _NET_ERRORS:       # SmmUpper sekinlashgan/uzilgan: /admin paneli baribir ochilsin
+        balance_line = "\u26A0\uFE0F SmmUpper balansini olishda xatolik: server vaqtincha javob bermayapti"
     return f"{ADMIN_TITLE}\n\n{balance_line}\n\nKerakli bo'limni tanlang \U0001F447"
 
 
@@ -6622,6 +6761,9 @@ async def admin_quick_ban(callback: CallbackQuery):
         await callback.answer("Ruxsat yo'q.", show_alert=True)
         return
     target_id = int(callback.data.split(":")[2])
+    if await _is_admin(target_id):             # qo'shimcha admin asosiy adminni (yoki boshqa adminni) bloklab qo'ymasin
+        await callback.answer("Adminni bloklab bo'lmaydi.", show_alert=True)
+        return
     await set_banned(target_id, True)
     await callback.answer(f"\U0001F6AB {target_id} bloklandi.", show_alert=True)
     user = await find_user(str(target_id))
@@ -6683,7 +6825,15 @@ async def admin_balance_amount_receive(message: Message, state: FSMContext, bot)
     user_id = data["target_id"]
     amount = int(text)
 
-    await change_balance(user_id, amount)
+    if amount < 0:
+        # Atomik: balans yetarli bo'lsagina ayiriladi — admin xatosi balansni manfiyga tushirmaydi
+        if not await try_deduct_balance(user_id, -amount):
+            await _panel_edit(bot, state, message,
+                              f"\u274C Balans yetarli emas: hozir {fmt_money(await get_balance(user_id))} so'm. "
+                              f"Kichikroq summa kiriting.", users_cancel_menu())
+            return
+    else:
+        await change_balance(user_id, amount)
     new_balance = await get_balance(user_id)
     await log_admin_action(message.from_user.id, "balance_adjust", target_id=user_id, amount=amount,
                            note=f"yangi balans: {new_balance}")
@@ -6723,6 +6873,10 @@ async def admin_ban_receive(message: Message, state: FSMContext, bot):
                            users_cancel_menu())
         return
     user_id = int(text)
+    if await _is_admin(user_id):               # qo'shimcha admin asosiy adminni (yoki boshqa adminni) bloklab qo'ymasin
+        await _panel_edit(bot, state, message,
+                           "\u274C Adminni bloklab bo'lmaydi. Boshqa ID kiriting.", users_cancel_menu())
+        return
     await set_banned(user_id, True)
     await _panel_edit(bot, state, message, f"\U0001F6AB {user_id} bloklandi.", users_cancel_menu())
     await state.clear()
@@ -6766,30 +6920,29 @@ async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
 
 
 @router_admin.message(AdminPanel.broadcast_text, is_free_text)
+@router_admin.message(AdminPanel.broadcast_text,
+                      F.photo | F.video | F.animation | F.document | F.audio | F.voice | F.video_note)
 async def admin_broadcast_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
-    text = message.text
     data = await state.get_data()
     chat_id = data.get("panel_chat_id", message.chat.id)
     message_id = data.get("panel_message_id")
     await state.clear()
 
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
+    # Admin xabari DARROV o'chirilmaydi: copy_message uni (qalin yozuv, yashirin havola, emoji, rasm/video + izoh) asl holida
+    # nusxalaydi. Yuborish tugagach _run_broadcast xabarni o'zi o'chiradi.
     # Fonda (background task) ishga tushiriladi — shunda 1000+ foydalanuvchiga
     # yuborish davomida admin panel "qotib" qolmaydi va bot boshqa
     # foydalanuvchilarga bemalol javob berishda davom etadi.
-    task = asyncio.create_task(_run_broadcast(bot, chat_id, message_id, text))
+    task = asyncio.create_task(_run_broadcast(bot, chat_id, message_id, message.chat.id, message.message_id))
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 
 
-async def _run_broadcast(bot, chat_id: int, message_id: Optional[int], text: str):
-    """Xabarni barcha foydalanuvchiga fonda yuboradi. Telegram flood-limit
+async def _run_broadcast(bot, chat_id: int, message_id: Optional[int], src_chat_id: int, src_message_id: int):
+    """Admin yuborgan xabarni (matn / rasm / video / hujjat...) barcha foydalanuvchiga fonda NUSXALAYDI (copy_message):
+    formatlash (qalin, havola, emoji) va media saqlanadi. Telegram flood-limit
     bersa (TelegramRetryAfter), ko'rsatilgan vaqtcha kutib O'SHA
     foydalanuvchiga qayta uriniladi (o'tkazib yuborilmaydi); botni
     bloklagan foydalanuvchilar (TelegramForbiddenError) alohida hisoblanadi."""
@@ -6807,30 +6960,45 @@ async def _run_broadcast(bot, chat_id: int, message_id: Optional[int], text: str
     sent = 0
     blocked = 0
     failed = 0
-    for user_id in user_ids:
-        while True:
-            try:
-                await bot.send_message(user_id, text)
-                sent += 1
+    stopped = False
+    try:
+        for user_id in user_ids:
+            while True:
+                try:
+                    await bot.copy_message(chat_id=user_id, from_chat_id=src_chat_id, message_id=src_message_id)
+                    sent += 1
+                    break
+                except TelegramRetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 0.5)
+                    continue
+                except TelegramForbiddenError:
+                    blocked += 1
+                    with contextlib.suppress(Exception):
+                        await set_user_left(user_id, True)      # keyingi hisobotlarda "chiqib ketgan" bo'lib ko'rinadi
+                    break
+                except TelegramBadRequest as e:
+                    failed += 1
+                    low = str(e).lower()
+                    if "to copy not found" in low or "can't be copied" in low or "cannot be copied" in low:
+                        stopped = True      # admin xabarining o'zi yo'q / nusxalab bo'lmaydi — qolganlarga urinish befoyda
+                    break
+                except Exception:
+                    failed += 1
+                    break
+            if stopped:
                 break
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after + 0.5)
-                continue
-            except TelegramForbiddenError:
-                blocked += 1
-                with contextlib.suppress(Exception):
-                    await set_user_left(user_id, True)      # keyingi hisobotlarda "chiqib ketgan" bo'lib ko'rinadi
-                break
-            except Exception:
-                failed += 1
-                break
-        await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05)
+    finally:
+        with contextlib.suppress(Exception):
+            await bot.delete_message(src_chat_id, src_message_id)     # admin yuborgan xabar chatda qolib ketmasin
 
     result_text = (
         f"\u2705 Yuborildi: {sent}\n"
         f"\U0001F6AB Botni bloklagan: {blocked}\n"
         f"\u274C Boshqa xatolik: {failed}"
     )
+    if stopped:
+        result_text += "\n\n\u26A0\uFE0F Yuborish to'xtatildi: xabarni nusxalab bo'lmadi. Xabarni qayta yuboring."
     try:
         await bot.edit_message_text(result_text, chat_id=chat_id, message_id=message_id, reply_markup=admin_cancel_menu())
     except Exception:
@@ -7554,6 +7722,12 @@ async def _finalize_topup_message(callback: CallbackQuery, suffix: str):
         pass
 
 
+@router_admin.callback_query(F.data == "topup:done")
+async def topup_done_info(callback: CallbackQuery):
+    """Mini App'dan ko'rib chiqilgan so'rovning natija tugmasi bosilsa — jimgina tushuntirish."""
+    await callback.answer("Bu so'rov allaqachon ko'rib chiqilgan.")
+
+
 @router_admin.callback_query(F.data.startswith("topup:edit:"))
 async def topup_edit_amount_start(callback: CallbackQuery, state: FSMContext, bot):
     if not await _is_admin(callback.from_user.id):
@@ -7572,6 +7746,10 @@ async def topup_edit_amount_start(callback: CallbackQuery, state: FSMContext, bo
     # Xabarning o'zini (rasm captioni yoki oddiy matn) va uning chat/message
     # ID'sini saqlab qo'yamiz — yangi summa kiritilgach, aynan shu xabarni
     # (Tasdiqlash/Rad etish tugmalari turgan joyni) yangilaymiz.
+    prev = await state.get_data()
+    if prev.get("edit_topup_prompt_id"):      # oldingi tugallanmagan tahrirning so'rov xabari chatda qolib ketmasin
+        with contextlib.suppress(Exception):
+            await bot.delete_message(prev.get("edit_topup_prompt_chat_id"), prev["edit_topup_prompt_id"])
     await state.update_data(
         edit_topup_id=topup_id,
         edit_topup_chat_id=callback.message.chat.id,
@@ -7581,11 +7759,32 @@ async def topup_edit_amount_start(callback: CallbackQuery, state: FSMContext, bo
     )
     await state.set_state(AdminPanel.topup_amount)
     await callback.answer()
-    await callback.message.answer(
+    prompt_text = (
         f"\u270F\uFE0F #{topup_id} so'rovi uchun YANGI summani kiriting (so'mda).\n"
-        f"Foydalanuvchi ko'rsatgan summa: {fmt_money(topup['amount'])} so'm.",
-        reply_markup=admin_cancel_menu(),
+        f"Foydalanuvchi ko'rsatgan summa: {fmt_money(topup['amount'])} so'm."
     )
+    prompt = await callback.message.answer(prompt_text, reply_markup=admin_cancel_menu())
+    await state.update_data(edit_topup_prompt_chat_id=prompt.chat.id, edit_topup_prompt_id=prompt.message_id,
+                            edit_topup_prompt_text=prompt_text)
+
+
+async def _topup_edit_notice(bot, data: dict, message: Message, text: str, keep_cancel: bool = False):
+    """Admin yozgan xabarni o'chiradi, so'rov (prompt) xabarini shu matn bilan almashtiradi — chatda ortiqcha xabar qolmaydi.
+    (Boshqa admin sozlamalaridagi _panel_edit kabi: bitta xabar ichida.)"""
+    with contextlib.suppress(Exception):
+        await message.delete()
+    pcid, pmid = data.get("edit_topup_prompt_chat_id"), data.get("edit_topup_prompt_id")
+    if pcid and pmid:
+        try:
+            await bot.edit_message_text(text, chat_id=pcid, message_id=pmid,
+                                        reply_markup=admin_cancel_menu() if keep_cancel else None)
+            return
+        except TelegramBadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+        except Exception:
+            pass
+    await bot.send_message(message.chat.id, text)
 
 
 @router_admin.message(AdminPanel.topup_amount, is_free_text)
@@ -7593,12 +7792,15 @@ async def topup_edit_amount_receive(message: Message, state: FSMContext, bot):
     if not await _is_admin(message.from_user.id):
         return
     text = message.text.strip().replace(" ", "")
+    data = await state.get_data()
     if not text.isdigit() or int(text) <= 0:
-        await message.answer("\u274C Noto'g'ri summa. Faqat musbat butun son kiriting.")
+        await _topup_edit_notice(
+            bot, data, message,
+            "\u274C Noto'g'ri summa. Faqat musbat butun son kiriting.\n\n" + (data.get("edit_topup_prompt_text") or ""),
+            keep_cancel=True)
         return
     new_amount = int(text)
 
-    data = await state.get_data()
     topup_id = data.get("edit_topup_id")
     chat_id = data.get("edit_topup_chat_id")
     message_id = data.get("edit_topup_message_id")
@@ -7607,18 +7809,20 @@ async def topup_edit_amount_receive(message: Message, state: FSMContext, bot):
     await state.clear()
 
     if not topup_id:
-        await message.answer("\u274C Xatolik: qaysi so'rov ekanligi topilmadi. Qaytadan urinib ko'ring.")
+        await _topup_edit_notice(bot, data, message,
+                                 "\u274C Xatolik: qaysi so'rov ekanligi topilmadi. Qaytadan urinib ko'ring.")
         return
 
     topup = await get_topup(topup_id)
     if not topup or topup["status"] != "pending":
-        await message.answer("Bu so'rov endi mavjud emas yoki allaqachon ko'rib chiqilgan.")
+        await _topup_edit_notice(bot, data, message, "Bu so'rov endi mavjud emas yoki allaqachon ko'rib chiqilgan.")
         return
 
     old_amount = topup["amount"]
     updated = await set_topup_amount(topup_id, new_amount)
     if not updated:
-        await message.answer(
+        await _topup_edit_notice(
+            bot, data, message,
             "\u26A0\uFE0F Bu so'rovni shu payt ichida boshqa admin allaqachon ko'rib "
             "chiqib ulgurdi — summa o'zgartirilmadi."
         )
@@ -7643,6 +7847,7 @@ async def topup_edit_amount_receive(message: Message, state: FSMContext, bot):
             new_lines.append(line)
     new_text = "\n".join(new_lines) if replaced else old_text
 
+    edited = False
     if chat_id and message_id:
         try:
             if is_photo:
@@ -7655,13 +7860,24 @@ async def topup_edit_amount_receive(message: Message, state: FSMContext, bot):
                     chat_id=chat_id, message_id=message_id,
                     text=new_text, reply_markup=topup_review_menu(topup_id),
                 )
+            edited = True
         except Exception:
             pass
 
-    await message.answer(
-        f"\u2705 #{topup_id} so'rovi uchun summa {fmt_money(new_amount)} so'mga o'zgartirildi.\n"
-        f"Endi yuqoridagi xabardan \u2705 Tasdiqlashingiz mumkin."
-    )
+    # Natija so'rov xabarining o'zida (summa qatori) ko'rinadi: admin yozgan raqam va so'rov (prompt) xabari o'chiriladi.
+    # Alohida tasdiq xabari faqat so'rov xabarini yangilab bo'lmaganda (masalan, u o'chirib yuborilgan) yuboriladi.
+    with contextlib.suppress(Exception):
+        await message.delete()
+    pcid, pmid = data.get("edit_topup_prompt_chat_id"), data.get("edit_topup_prompt_id")
+    if pcid and pmid:
+        with contextlib.suppress(Exception):
+            await bot.delete_message(pcid, pmid)
+    if not edited:
+        await bot.send_message(
+            message.chat.id,
+            f"\u2705 #{topup_id} so'rovi uchun summa {fmt_money(new_amount)} so'mga o'zgartirildi.\n"
+            f"Endi so'rov xabaridan \u2705 Tasdiqlashingiz mumkin."
+        )
 
 
 @router_admin.callback_query(F.data.startswith("topup:approve:"))
@@ -7781,6 +7997,7 @@ AUTOPAY_DEFAULT_TTL_MIN = 20       # to'lov muddati (daqiqa) — admin panelda o
 AUTOPAY_MAX_OPEN = 3               # bitta foydalanuvchida bir vaqtda ochiq to'lovlar soni
 AUTOPAY_HOLD_SECONDS = 3 * 3600    # bir xil summa shuncha vaqt qayta berilmaydi; eski xabarlar e'tiborsiz
 AUTOPAY_GRACE_SECONDS = 30 * 60    # muddati o'tgan to'lov shuncha vaqtdan keyin "expired" qilinadi
+AUTOPAY_REUSE_MIN_LEFT = 180       # ochiq to'lov faqat tugashiga shuncha soniyadan ko'p qolgan bo'lsa qayta beriladi (muddat kamida 5 daqiqa, shuning uchun yangi so'rov doim qayta ishlatiladi)
 AUTOPAY_LEASE_BEAT = 15            # "men tirikman" belgisi va tekshiruv qadami (soniya)
 AUTOPAY_LEASE_TTL = 60             # shundan keyin qulf bo'shaydi (bir vaqtda faqat BITTA nusxa ishlashi uchun)
 AUTOPAY_CATCHUP_EVERY = 3          # har 3 qadamda (~45 s) zaxira tekshiruv: xabar o'tib ketmasligi uchun
@@ -8285,8 +8502,12 @@ class Autopay:
             open_rows = await tx.fetchall(
                 "SELECT id, base_amount, exact_amount, card_id, expires_at FROM autopay_payments "
                 "WHERE user_id = ? AND status = 'pending' AND expires_at > ? ORDER BY id", user_id, now)
-            for r in open_rows:                        # shu summaga ochiq to'lov bo'lsa — o'shani qaytaramiz
-                if r["base_amount"] == amount and r["card_id"] in cards_by_id:
+            # Shu summaga ochiq to'lov bo'lsa — o'shani qaytaramiz, LEKIN tugashiga kamida AUTOPAY_REUSE_MIN_LEFT soniya qolgan
+            # bo'lsa. Aks holda foydalanuvchiga 3 soniyalik taymer chiqib, darhol "Vaqt tugadi" bo'lardi — yangisi yaratiladi
+            # (eskisi o'z muddatigacha kutiladi: shu orada pul o'tkazilgan bo'lsa ham hisobga olinadi).
+            for r in open_rows:
+                if (r["base_amount"] == amount and r["card_id"] in cards_by_id
+                        and r["expires_at"] > now + AUTOPAY_REUSE_MIN_LEFT):
                     c = cards_by_id[r["card_id"]]
                     return ApPayment(r["id"], r["exact_amount"], amount, c["number"], c["holder"] or "",
                                      c["last4"], r["expires_at"], ttl)
@@ -9236,6 +9457,12 @@ def _ma_full_name(u: dict) -> str:
     return " ".join(x for x in (u.get("first_name"), u.get("last_name")) if x) or (u.get("username") or "")
 
 
+def _ma_photo_url(u: dict) -> str:
+    """Telegram profil rasmi (initData'dagi photo_url). Faqat https havola qaytariladi — Mini App uni avatar sifatida ko'rsatadi."""
+    url = str(u.get("photo_url") or "").strip()
+    return url if url.startswith("https://") and len(url) <= 512 else ""
+
+
 async def _ma_auth(request: web.Request) -> dict:
     """initData'ni tekshiradi, so'ng botdagi middleware'lar bilan BIR XIL cheklovlarni qo'llaydi:
     bloklangan foydalanuvchi va majburiy obuna (adminlar obunadan ozod) \u2014 Mini App ularni chetlab o'tmasin."""
@@ -9394,6 +9621,18 @@ def _ma_order(row) -> dict:
            "p": int(row["price"]), "s": _MA_ORDER_STATUS.get(row["status"], "wait")}
     if num:
         out["num"] = num
+    # Kimga yuborilgani (Mini App buyurtma tafsilotida ko'rsatiladi): Stars/Premium — @username, UC — PUBG ID (+ o'yin nomi)
+    if otype in ("stars", "premium"):
+        target = row["target_username"] if "target_username" in keys else None
+        if target:
+            out["to"] = str(target).lstrip("@")
+    elif otype == "uc":
+        acc = _uc_account_from_row(row)
+        if acc:
+            out["acc"] = acc
+            nick = str(_uc_details_from_row(row).get("nick") or "")
+            if nick:
+                out["nick"] = nick
     return out
 
 
@@ -9496,7 +9735,7 @@ async def _ma_api_me(request: web.Request, user: dict) -> web.Response:
         "user": {"id": uid, "name": user.get("first_name") or user.get("username") or "Foydalanuvchi",
                  "username": user.get("username") or "", "phone": info.get("phone") or "",
                  "joined": datetime.fromtimestamp(int(created), LOCAL_TZ).strftime("%d.%m.%Y") if created else "",
-                 "spent": int(info.get("total_spent") or 0)},
+                 "spent": int(info.get("total_spent") or 0), "photo": _ma_photo_url(user)},
         "balance": balance, "orders": orders, "orders_total": total, "topups_ok": topups_ok, "pending_topups": pending,
         "min_topup": MIN_TOPUP, "max_topup": MINIAPP_MAX_TOPUP,
         "autopay": {"ready": ap_ready, "ttl_min": ttl},
@@ -9568,18 +9807,18 @@ async def _ma_read_part(part, limit: int, message: str) -> bytes:
 
 
 async def _ma_send_receipt(bot, admin_id: int, data: bytes, ext: str, caption: str, markup):
-    """Chekni BIR adminga yuklab yuboradi; (file_id, "photo"|"document") qaytaradi. Telegram rasmni rad etsa
+    """Chekni BIR adminga yuklab yuboradi; (file_id, "photo"|"document", message_id) qaytaradi. Telegram rasmni rad etsa
     (masalan, o'lchami noto'g'ri) \u2014 fayl sifatida yuboriladi."""
     try:
         msg = await bot.send_photo(admin_id, BufferedInputFile(data, filename=f"check.{ext}"),
                                    caption=caption, reply_markup=markup)
-        return msg.photo[-1].file_id, "photo"
+        return msg.photo[-1].file_id, "photo", msg.message_id
     except TelegramBadRequest as e:
         if "PHOTO_" not in str(e).upper() and "IMAGE_PROCESS" not in str(e).upper():
             raise
     msg = await bot.send_document(admin_id, BufferedInputFile(data, filename=f"check.{ext}"),
                                   caption=caption, reply_markup=markup)
-    return msg.document.file_id, "document"
+    return msg.document.file_id, "document", msg.message_id
 
 
 @_ma_route
@@ -9622,6 +9861,16 @@ async def _ma_api_manual(request: web.Request, user: dict) -> web.Response:
         admin_ids = list(dict.fromkeys([*ADMIN_IDS, *await get_extra_admin_ids()]))
         if bot is None or not admin_ids:
             raise _MaError(503, "no_admin", "Hozircha chek qabul qilib bo'lmaydi. Keyinroq urinib ko'ring.")
+        pid_raw = fields.get("payment_id", "")
+        ap_pid = int(pid_raw) if re.fullmatch(r"[0-9]{1,18}", pid_raw) else 0
+        if ap_pid:       # avto-to'lovdan o'tilgan: pul bank xabari orqali allaqachon tushgan bo'lsa — chek so'rovi yaratilmaydi (ikki marta hisoblanmasin)
+            try:
+                ap_info = await AUTOPAY.payment_info(ap_pid)
+            except Exception:
+                ap_info = None
+            if ap_info and ap_info["user_id"] == uid and ap_info["status"] == "paid":
+                raise _MaError(409, "already_paid",
+                               "To'lovingiz avto-to'lov orqali allaqachon qabul qilingan — balansingiz to'ldirilgan. Chek yuborish shart emas.")
         await _ma_touch(user)
 
         topup_id = await create_topup(uid, amount, None)
@@ -9636,15 +9885,16 @@ async def _ma_api_manual(request: web.Request, user: dict) -> web.Response:
         if other:
             caption += duplicate_topup_warning(other)
         markup = topup_review_menu(topup_id)
-        sent, ref = 0, None
+        sent, ref, admin_msgs = 0, None, {}
         for admin_id in admin_ids:
             try:
                 if ref is None:
                     ref = await _ma_send_receipt(bot, admin_id, photo, ext, caption, markup)
+                    admin_msgs[admin_id] = ref[2]
                 elif ref[1] == "photo":
-                    await bot.send_photo(admin_id, ref[0], caption=caption, reply_markup=markup)
+                    admin_msgs[admin_id] = (await bot.send_photo(admin_id, ref[0], caption=caption, reply_markup=markup)).message_id
                 else:
-                    await bot.send_document(admin_id, ref[0], caption=caption, reply_markup=markup)
+                    admin_msgs[admin_id] = (await bot.send_document(admin_id, ref[0], caption=caption, reply_markup=markup)).message_id
                 sent += 1
             except Exception as e:
                 logging.warning("miniapp: chekni adminga (%s) yuborib bo'lmadi: %r", admin_id, e)
@@ -9656,11 +9906,12 @@ async def _ma_api_manual(request: web.Request, user: dict) -> web.Response:
                 await tx.execute("UPDATE topups SET photo_file_id = ? WHERE id = ?", ref[0], topup_id)
         except Exception:
             logging.exception("miniapp: chek file_id'sini saqlab bo'lmadi (topup #%s)", topup_id)
+        with contextlib.suppress(Exception):      # bot chatidagi chek xabarlari: Mini App'dan ko'rib chiqilganda tugmalari yangilanadi
+            await save_topup_admin_msgs(topup_id, admin_msgs)
 
-        pid_raw = fields.get("payment_id", "")
-        if pid_raw.isdigit():    # foydalanuvchi avto-to'lovdan qo'lda usulga o'tgan \u2014 ochiq avto-so'rov bekor qilinadi (botdagi apay:manual kabi)
+        if ap_pid:    # foydalanuvchi avto-to'lovdan qo'lda usulga o'tgan \u2014 ochiq avto-so'rov bekor qilinadi (botdagi apay:manual kabi)
             try:
-                await AUTOPAY.cancel(int(pid_raw), uid)
+                await AUTOPAY.cancel(ap_pid, uid)
             except Exception:
                 logging.exception("miniapp: avto-to'lovni bekor qilib bo'lmadi")
         pending = int(await _ma_scalar("SELECT COUNT(*) FROM topups WHERE user_id = ? AND status = 'pending'", uid) or 0)
@@ -9688,9 +9939,13 @@ async def _ma_api_prices(request: web.Request, user: dict) -> web.Response:
     """Mini App uchun narxlar (botdagi bilan bir xil). ?k=number (davlatlar) | uc (tariflar) | boshqasi: Stars/Premium."""
     k = request.query.get("k", "")
     try:
-        if k == "number":
+        if k in ("number", "ready"):
             mult = _markup_multiplier(await get_markup_percent("number"))
-            _, countries = await _fetch_countries_with_fallback(1, 2)
+            sv = _ma_int(request.query.get("server")) or (3 if k == "ready" else 0)
+            if sv in (1, 2, 3):     # foydalanuvchi serverni o'zi tanlagan — zaxira server bilan aralashtirilmaydi
+                used, countries = await _fetch_countries_with_fallback(sv, None)
+            else:                   # avtomatik: 1-server, u bo'lmasa 2-server
+                used, countries = await _fetch_countries_with_fallback(1, 2)
             out = []
             for code, info in countries.items():
                 p = (info or {}).get("price")
@@ -9698,16 +9953,18 @@ async def _ma_api_prices(request: web.Request, user: dict) -> web.Response:
                     out.append({"c": code, "n": country_display_name(code), "f": country_flag(code) or "",
                                 "p": round(float(p) * mult)})
             out.sort(key=lambda x: x["n"])
-            return _ma_json({"ok": True, "countries": out})
+            return _ma_json({"ok": True, "countries": out, "server": used})
         if k == "uc":
             return _ma_json({"ok": True, "uc": [{"id": t["tariff_id"], "uc": t["total_uc"], "p": t["price"]}
                                                 for t in await load_uc_tariffs()]})
         prices = await client.get_prices()
-        star = await with_markup(prices["stars"]["price_per_star"] * 1000, "stars")
+        # Aniq (yaxlitlanmagan) narx: ilova round(miqdor * star) qiladi — xarid paytidagi round(narx * miqdor) bilan aynan bir xil
+        _pps = _positive_number(prices["stars"]["price_per_star"])
+        star = _pps * _markup_multiplier(await get_markup_percent("stars")) if _pps else 0
         prem = {str(m): await with_markup(prices["premium"][str(m)]["price"], "premium") for m in (3, 6, 12)}
     except _MA_FETCH_ERRORS as e:
         raise _MaError(503, "prices", f"Narxlarni olib bo'lmadi: {_err_text(e)}")
-    return _ma_json({"ok": True, "star": star / 1000, "premium": prem, "min_stars": MIN_STARS})
+    return _ma_json({"ok": True, "star": star, "premium": prem, "min_stars": MIN_STARS})
 
 
 @_ma_route
@@ -9793,7 +10050,11 @@ async def _ma_buy_core(request: web.Request, user: dict, body: dict) -> web.Resp
             price = await with_markup(base, kind)
         elif kind == "number":
             country = str(body.get("amount") or "").strip()
-            server, countries = await _fetch_countries_with_fallback(1, 2)
+            sv = 3 if body.get("ready") is True else _ma_int(body.get("server"))
+            if sv in (1, 2, 3):                 # foydalanuvchi tanlagan server (zaxira bilan aralashtirilmaydi)
+                server, countries = await _fetch_countries_with_fallback(sv, None)
+            else:                               # avtomatik: 1-server, u bo'lmasa 2-server
+                server, countries = await _fetch_countries_with_fallback(1, 2)
             info = countries.get(country)
             price = await with_markup(info.get("price"), "number") if info else 0
         else:
@@ -9829,7 +10090,7 @@ async def _ma_buy_core(request: web.Request, user: dict, body: dict) -> web.Resp
 async def _ma_do_buy(bot, uid: int, kind: str, price: int, *, username=None, qty=None, server=None,
                      country=None, tariff=None, nick=None) -> web.Response:
     label, uc = _MA_LABEL[kind], kind == "uc"
-    if not await _ma_shop_open():      # SmmUpper hisobi chegaradan past: pul yechilmaydi, xarid to'xtatiladi
+    if not await _ma_shop_open(fresh=True):      # SmmUpper hisobi chegaradan past: pul yechilmaydi, xarid to'xtatiladi
         raise _MaError(503, "shop_closed", PROVIDER_BUSY_TEXT)
     if not await try_deduct_balance(uid, price):
         raise _MaError(402, "balance", "Balansingiz yetarli emas.", balance=await get_balance(uid))
@@ -9860,14 +10121,12 @@ async def _ma_do_buy(bot, uid: int, kind: str, price: int, *, username=None, qty
             result = await _send_purchase_request(kind, request_id, server=server, country=country,
                                                   target_username=username, qty=qty)
     except PurchaseUnknownError:
-        if uc:       # UC: pul yo'qolmaydi — buyurtma 'processing' qoladi, fon jarayoni shu request_id bilan qayta uradi
-            await _uc_alert_admins(bot, f"\u26A0\uFE0F UC (Mini App): SmmUpper javobi olinmadi. {who}\nBot avtomatik qayta uradi.")
-            return pending
-        if not await refund_order(order_pk):
-            return pending                  # shu orada fon jarayoni yakunlagan — qayta qaytarilmaydi
-        await _uc_alert_admins(bot, f"\u26A0\uFE0F {label} xaridi (Mini App): SmmUpper javobi olinmadi. {who}\n"
-                                    "Pul foydalanuvchiga qaytarildi; xarid SmmUpper'da bajarilgan bo'lishi ham mumkin — panelda tekshiring.")
-        raise _MaError(502, "unknown", "SmmUpper bilan aloqa uzildi. Pulingiz balansga qaytarildi, birozdan so'ng qayta urinib ko'ring.")
+        # Natija noma'lum (UC, Raqam, Stars, Premium): pul DARHOL qaytarilmaydi — SmmUpper so'rovni bajargan bo'lishi
+        # mumkin (faqat javobi uzilgan). Buyurtma 'processing' qoladi, fon jarayoni shu request_id bilan qayta uradi
+        # va natijaga qarab yakunlaydi yoki (aniq rad / uzoq vaqtdan keyin ham noma'lum bo'lsa) pulni qaytaradi.
+        await _uc_alert_admins(bot, f"\u26A0\uFE0F {label} (Mini App): SmmUpper javobi olinmadi. {who}\n"
+                                    "Bot shu request_id bilan avtomatik qayta uradi (takroriy xarid bo'lmaydi).")
+        return pending
     except SmmUpperError as e:
         refunded = bool(await refund_order(order_pk)) if uc else await discard_unsent_order(order_pk)
         if is_provider_funds_error(e):          # hamkor hisobida pul yetmadi: foydalanuvchiga sabab SIR, adminga xabar
@@ -9970,14 +10229,15 @@ async def check_pubg_account(account_id: str, username: str = "") -> dict:
         return out
     headers = {"Authorization": f"Bearer {PUBG_LOOKUP_KEY}"} if PUBG_LOOKUP_KEY else {}
     try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as sess:
-            async with sess.get(PUBG_LOOKUP_URL.replace("{id}", account_id), headers=headers) as resp:
-                if resp.status in (400, 404):
-                    out["found"] = False
-                    return out
-                if resp.status != 200:
-                    return out
-                data = await resp.json(content_type=None)
+        sess = await client._get_session()      # umumiy sessiya: har so'rovda yangi TCP/TLS ulanish ochilmaydi
+        async with sess.get(PUBG_LOOKUP_URL.replace("{id}", account_id), headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status in (400, 404):
+                out["found"] = False
+                return out
+            if resp.status != 200:
+                return out
+            data = await resp.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
         return out
     nick = _pubg_pick_nick(data)
@@ -10114,19 +10374,43 @@ async def _ma_api_order_check(request: web.Request, user: dict) -> web.Response:
 
 
 # ---- SmmUpper hisobi chegaradan past bo'lsa — Mini App xaridlari to'xtaydi (60 soniya keshlanadi) ----
-_MA_SHOP: Dict[str, float] = {"ts": 0.0, "open": 1.0}
+_MA_SHOP: Dict[str, float] = {"ts": 0.0, "open": 1.0, "busy": 0.0}
+_MA_SHOP_TASKS: set = set()
 
 
-async def _ma_shop_open() -> bool:
-    now = time.monotonic()
-    if now - _MA_SHOP["ts"] > 60:
-        _MA_SHOP["ts"] = now
-        try:
-            low, bal, guard = await _provider_low_limit(), await _provider_balance(), await _provider_guard_on()
-            # himoya o'chiq, chegara 0 bo'lsa yoki balansni bilib bo'lmasa — xaridga TO'SQINLIK QILINMAYDI
-            _MA_SHOP["open"] = 1.0 if (not guard or low <= 0 or bal is None or bal >= low) else 0.0
-        except Exception:
-            _MA_SHOP["open"] = 1.0
+async def _ma_shop_refresh() -> None:
+    """SmmUpper balansini JONLI so'rab, keshni yangilaydi."""
+    _MA_SHOP["ts"] = time.monotonic()
+    try:
+        low, bal, guard = await _provider_low_limit(), await _provider_balance(), await _provider_guard_on()
+        # himoya o'chiq, chegara 0 bo'lsa yoki balansni bilib bo'lmasa — xaridga TO'SQINLIK QILINMAYDI
+        _MA_SHOP["open"] = 1.0 if (not guard or low <= 0 or bal is None or bal >= low) else 0.0
+    except Exception:
+        _MA_SHOP["open"] = 1.0
+
+
+async def _ma_shop_refresh_bg() -> None:
+    try:
+        await _ma_shop_refresh()
+    finally:
+        _MA_SHOP["busy"] = 0.0
+
+
+async def _ma_shop_open(fresh: bool = False) -> bool:
+    """Mini App xaridlari ochiqmi? Natija 60 soniya keshlanadi.
+    fresh=False (standart: /api/me, admin statistikasi): kesh eskirgan bo'lsa ham SmmUpper javobini KUTMAYDI —
+    eski qiymatni darrov qaytaradi, yangilashni fon vazifasiga topshiradi (SmmUpper sekin bo'lsa ham Mini App
+    yuklanishda qotib qolmaydi).
+    fresh=True (xarid, himoyani o'zgartirish): kesh eskirgan bo'lsa yangi qiymat kutiladi — pul yechishdan oldin
+    aniq holat kerak."""
+    if time.monotonic() - _MA_SHOP["ts"] > 60:
+        if fresh:
+            await _ma_shop_refresh()
+        elif not _MA_SHOP["busy"]:
+            _MA_SHOP["busy"] = 1.0
+            task = asyncio.create_task(_ma_shop_refresh_bg())
+            _MA_SHOP_TASKS.add(task)
+            task.add_done_callback(_MA_SHOP_TASKS.discard)
     return bool(_MA_SHOP["open"])
 
 
@@ -10160,7 +10444,7 @@ async def _ma_api_admin_stats(request: web.Request, user: dict) -> web.Response:
     out["pending"] = [{"id": r["id"], "user_id": r["user_id"], "amount": r["amount"], "created_at": r["created_at"],
                        "name": r["full_name"] or (("@" + r["username"]) if r["username"] else str(r["user_id"]))}
                       for r in await get_pending_topups(20)]
-    day_ago = int(time.time()) - 86400
+    day_ago = _local_day_start()      # "Bugun" — Toshkent vaqti bo'yicha yarim tundan (get_stats / grafik bilan bir xil)
     async with _ap_conn() as tx:
         manual_sum = _ma_int(await tx.scalar(
             "SELECT COALESCE(SUM(amount), 0) FROM topups WHERE status = 'approved' AND created_at >= ?", day_ago))
@@ -10206,7 +10490,7 @@ async def _ma_api_admin_shop(request: web.Request, user: dict) -> web.Response:
     await set_setting(SETTINGS_KEY_PROVIDER_GUARD, "1" if guard else "0")
     await log_admin_action(admin_id, "shop_guard", note="yoqildi" if guard else "o'chirildi (Mini App)")
     _MA_SHOP["ts"] = 0.0          # kesh eskirdi: yangi holat darrov kuchga kiradi
-    return _ma_json({"ok": True, "guard": guard, "shop_open": await _ma_shop_open()})
+    return _ma_json({"ok": True, "guard": guard, "shop_open": await _ma_shop_open(fresh=True)})
 
 
 @_ma_route
@@ -10241,6 +10525,7 @@ async def _ma_api_admin_topup(request: web.Request, user: dict) -> web.Response:
                 await bot.send_message(topup["user_id"], TOPUP_REJECTED_USER)
     else:
         raise _MaError(400, "bad_request", "So'rov noto'g'ri.")
+    await finalize_topup_admin_msgs(bot, tid, act == "approve")      # adminlarning bot chatidagi chek xabarlari: tugmalar natijaga almashadi
     return _ma_json({"ok": True})
 
 
@@ -10307,6 +10592,24 @@ async def _ma_api_admin_balance(request: web.Request, user: dict) -> web.Respons
     return _ma_json({"ok": True, "balance": new})
 
 
+@_ma_route
+async def _ma_api_admin_ban(request: web.Request, user: dict) -> web.Response:
+    admin_id = await _ma_admin(user)
+    b = await _ma_body(request)
+    try:
+        tid = int(b.get("id"))
+    except (TypeError, ValueError):
+        raise _MaError(400, "bad_request", "So'rov noto'g'ri.")
+    ban = b.get("banned") is True
+    if ban and await _is_admin(tid):
+        raise _MaError(403, "forbidden", "Adminni bloklab bo'lmaydi.")
+    if not await find_user(str(tid)):
+        raise _MaError(404, "not_found", "Foydalanuvchi topilmadi.")
+    await set_banned(tid, ban)
+    await log_admin_action(admin_id, "ban" if ban else "unban", target_id=tid, note="Mini App")
+    return _ma_json({"ok": True, "banned": ban})
+
+
 # ---- shrift: Google Fonts o'rniga o'z serverimizdan (sekin tarmoqda ham tez; tashqi domen kutilmaydi) ----
 # Fayllar bot.py yonidagi fonts/ papkasida turadi (yoki MINIAPP_FONT_DIR). Faqat shu papkadagi *.woff2 beriladi.
 MINIAPP_FONT_DIR = (os.getenv("MINIAPP_FONT_DIR", "").strip()
@@ -10354,6 +10657,7 @@ def miniapp_setup_routes(app: web.Application) -> None:
     app.router.add_post("/api/admin/receipt", _ma_api_admin_receipt)
     app.router.add_post("/api/admin/user", _ma_api_admin_user)
     app.router.add_post("/api/admin/balance", _ma_api_admin_balance)
+    app.router.add_post("/api/admin/ban", _ma_api_admin_ban)
     app.router.add_post("/api/admin/shop", _ma_api_admin_shop)
 
 
