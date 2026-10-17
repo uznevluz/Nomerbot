@@ -10,7 +10,9 @@ import contextlib
 import copy
 import functools
 import html
+import io
 import json
+import zipfile
 import logging
 import math
 import os
@@ -329,6 +331,14 @@ async def init_db():
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS left_bot BOOLEAN NOT NULL DEFAULT FALSE")
             # admin_msgs: chek xabarlarining {admin_id: message_id} JSON'i (Mini App'dan ko'rib chiqilganda bot chatidagi tugmalarni yangilash uchun)
             await conn.execute("ALTER TABLE topups ADD COLUMN IF NOT EXISTS admin_msgs TEXT")
+            # cost_price: SmmUpper haqiqatda yechgan ASL narx (so'm) — sof foyda hisobi uchun.
+            # Eski buyurtmalarda NULL qoladi (ularning tannarxi noma'lum).
+            await conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS cost_price BIGINT")
+            # referral_log: har bir referal keshbek (vaqti bilan) — "Bugun/Hafta/Oy" sof foydasidan ayirish uchun
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS referral_log (id BIGSERIAL PRIMARY KEY, referrer_id BIGINT NOT NULL, "
+                "from_user_id BIGINT, amount BIGINT NOT NULL, created_at BIGINT NOT NULL)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS ix_reflog_time ON referral_log (created_at)")
     else:
         async with _db_sqlite() as db:
             # WAL rejimi baza faylida doimiy saqlanadi — shuning uchun bu
@@ -373,6 +383,15 @@ async def init_db():
                 await db.execute("ALTER TABLE topups ADD COLUMN admin_msgs TEXT")
             except Exception:
                 pass
+            try:
+                await db.execute("ALTER TABLE orders ADD COLUMN cost_price INTEGER")
+            except Exception:
+                pass
+            await db.execute(
+                "CREATE TABLE IF NOT EXISTS referral_log (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "referrer_id INTEGER NOT NULL, from_user_id INTEGER, amount INTEGER NOT NULL, "
+                "created_at INTEGER NOT NULL)")
+            await db.execute("CREATE INDEX IF NOT EXISTS ix_reflog_time ON referral_log (created_at)")
             await db.commit()
 
 
@@ -1219,7 +1238,7 @@ async def get_pending_topups(limit: int = 15) -> list:
             return await cur.fetchall()
 
 
-async def approve_topup_atomic(topup_id: int) -> Optional[dict]:
+async def approve_topup_atomic(topup_id: int, amount_override: Optional[int] = None) -> Optional[dict]:
     """Qo'lda to'ldirishni tasdiqlash — BITTA tranzaksiyada: 'pending' -> 'approved' + foydalanuvchi balansi +
     referal keshbek (Autopay._credit bilan bir xil mantiq). Orada xato yoki uzilish bo'lsa HAMMASI bekor bo'ladi
     (so'rov 'pending' qoladi, admin qayta bosadi) — "tasdiqlandi, lekin balans qo'shilmadi" holati bo'lmaydi.
@@ -1232,6 +1251,11 @@ async def approve_topup_atomic(topup_id: int) -> Optional[dict]:
         if await tx.execute("UPDATE topups SET status = 'approved' WHERE id = ? AND status = 'pending'", topup_id) == 0:
             return None
         user_id, amount = row["user_id"], row["amount"]
+        orig_amount = amount
+        if amount_override and amount_override > 0 and amount_override != amount:
+            # foydalanuvchi summani xato yozgan: admin haqiqiy summani kiritadi (balansga VA keshbekka shu summa ketadi)
+            await tx.execute("UPDATE topups SET amount = ? WHERE id = ?", amount_override, topup_id)
+            amount = amount_override
         await tx.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", amount, user_id)
         ref = await tx.fetchone("SELECT referred_by FROM users WHERE user_id = ?", user_id)
         referrer = ref["referred_by"] if ref else None
@@ -1242,7 +1266,10 @@ async def approve_topup_atomic(topup_id: int) -> Optional[dict]:
                 await tx.execute(
                     "UPDATE users SET balance = balance + ?, referral_earnings = referral_earnings + ? "
                     "WHERE user_id = ?", cashback, cashback, referrer)
-    return {"user_id": user_id, "amount": amount,
+                await tx.execute(
+                    "INSERT INTO referral_log (referrer_id, from_user_id, amount, created_at) VALUES (?, ?, ?, ?)",
+                    referrer, user_id, cashback, int(time.time()))
+    return {"user_id": user_id, "amount": amount, "orig_amount": orig_amount,
             "referrer": referrer if cashback > 0 else None, "cashback": cashback}
 
 
@@ -1387,6 +1414,24 @@ async def set_setting(key: str, value: str):
             )
             await db.commit()
     _SETTINGS_CACHE.pop(key, None)      # keyingi o'qish yangi qiymatni oladi
+
+
+# ---------------- Xizmatlarni alohida yoqish/o'chirish (Mini App > Admin > Xizmatlar) ----------------
+SVC_KINDS = ("stars", "premium", "number", "uc")
+SVC_OFF_TEXT = "Bu xizmat vaqtincha o'chirilgan. Birozdan keyin qayta urinib ko'ring."
+
+
+def _svc_key(kind: str) -> str:
+    return f"svc_off_{kind}"
+
+
+async def svc_is_off(kind: str) -> bool:
+    """Xizmat (stars / premium / number / uc) admin tomonidan VAQTINCHA o'chirilganmi. Qolganlari ishlayveradi."""
+    return (await get_setting(_svc_key(kind), default="0")) == "1"
+
+
+async def svc_off_list() -> list:
+    return [k for k in SVC_KINDS if await svc_is_off(k)]
 
 
 # ==============================================================
@@ -1651,6 +1696,40 @@ async def get_stats() -> dict:
         "revenue_by_type": revenue_by_type,
         "topups_pending": topups_pending,
     }
+
+
+async def get_profit_report() -> dict:
+    """Sof foyda hisoboti (Bugun / Hafta / Oy / Jami) — chegaralar get_stats() bilan BIR XIL.
+    Foyda = (tannarxi MA'LUM buyurtmalar tushumi) - (SmmUpper tannarxi) - (referal keshbeklar).
+    Tannarx (cost_price) faqat shu funksiya qo'shilgandan keyingi buyurtmalarda yoziladi; eski buyurtmalar
+    `no_cost` sifatida sanaladi va foyda hisobiga KIRMAYDI (taxmin qilinmaydi)."""
+    now = int(time.time())
+    periods = {"today": _local_day_start(), "week": now - 7 * 86400, "month": now - 30 * 86400, "total": 0}
+    out: Dict[str, Any] = {}
+    async with _ap_conn() as tx:
+        for key, since in periods.items():
+            row = await tx.fetchone(
+                "SELECT COUNT(*) AS n, "
+                "COALESCE(SUM(CASE WHEN cost_price IS NOT NULL THEN price ELSE 0 END), 0) AS rev, "
+                "COALESCE(SUM(cost_price), 0) AS cost, "
+                "COALESCE(SUM(CASE WHEN cost_price IS NULL THEN 1 ELSE 0 END), 0) AS no_cost, "
+                "COALESCE(SUM(CASE WHEN cost_price IS NULL THEN price ELSE 0 END), 0) AS rev_no_cost "
+                "FROM orders WHERE status != 'refunded' AND created_at >= ?", since)
+            ref = await tx.scalar("SELECT COALESCE(SUM(amount), 0) FROM referral_log WHERE created_at >= ?", since)
+            types = await tx.fetchall(
+                "SELECT order_type, COUNT(*) AS n, COALESCE(SUM(price), 0) AS rev, COALESCE(SUM(cost_price), 0) AS cost "
+                "FROM orders WHERE status != 'refunded' AND cost_price IS NOT NULL AND created_at >= ? "
+                "GROUP BY order_type", since)
+            rev, cost, refs = int(row["rev"] or 0), int(row["cost"] or 0), int(ref or 0)
+            out[key] = {
+                "orders": int(row["n"] or 0), "revenue": rev, "cost": cost, "referral": refs,
+                "profit": rev - cost - refs,
+                "margin": round(100.0 * (rev - cost - refs) / rev, 1) if rev > 0 else 0.0,
+                "no_cost": int(row["no_cost"] or 0), "rev_no_cost": int(row["rev_no_cost"] or 0),
+                "by_type": {t["order_type"]: {"orders": int(t["n"]), "revenue": int(t["rev"]),
+                                              "profit": int(t["rev"]) - int(t["cost"])} for t in types},
+            }
+    return out
 
 
 # ==============================================================
@@ -2193,6 +2272,22 @@ async def _claim_purchase_result(order_pk: int, expected_details: Optional[str],
         return cur.rowcount > 0
 
 
+def _result_cost(result: dict) -> Optional[int]:
+    """Provayder (SmmUpper) javobidagi ASL narx — ustamasiz tannarx (so'm). Javobda narx yo'q/noto'g'ri bo'lsa None."""
+    raw = _positive_number((result or {}).get("price"))
+    return int(round(raw)) if raw is not None else None
+
+
+async def _set_order_cost(order_pk: int, cost: int) -> None:
+    if _PG:
+        async with _pool.acquire() as conn:
+            await conn.execute("UPDATE orders SET cost_price = $1 WHERE id = $2", cost, order_pk)
+    else:
+        async with _db_sqlite() as db:
+            await db.execute("UPDATE orders SET cost_price = ? WHERE id = ?", (cost, order_pk))
+            await db.commit()
+
+
 async def _set_order_price(order_pk: int, price: int) -> None:
     if _PG:
         async with _pool.acquire() as conn:
@@ -2313,6 +2408,12 @@ async def _apply_purchase_result(order_pk: int, result: dict) -> Optional[dict]:
     charged = await final_price(row["user_id"], result, est_price, order_type)
     if charged != est_price:
         await _set_order_price(order_pk, charged)      # AYNAN yechilgan summa buyurtmaga yoziladi
+    cost = _result_cost(result)
+    if cost is not None:                                # tannarx (sof foyda hisobi uchun); xato asosiy jarayonni to'xtatmasin
+        try:
+            await _set_order_cost(order_pk, cost)
+        except Exception:
+            logging.exception("#%s: tannarxni yozib bo'lmadi", order_pk)
     return {"price": charged, "ref": ref, "status": new_status}
 
 
@@ -4847,6 +4948,13 @@ async def confirm_number(callback: CallbackQuery, state: FSMContext, bot):
     except Exception:
         pass
 
+    if await svc_is_off("number"):      # admin shu xizmatni vaqtincha o'chirgan
+        await state.clear()
+        sent = await callback.message.answer(SVC_OFF_TEXT)
+        await track_flow_msg(sent)
+        await _safe_answer(callback, SVC_OFF_TEXT, show_alert=True)
+        return
+
     # Balansni SHU YERDA, bitta atomik amal bilan tekshirib-va-yechib qo'yamiz: ikki marta tez bosish yoki parallel
     # xaridlar balansni manfiyga tushira olmaydi. Provayderdan haqiqiy narx kelgach, farq final_price() bilan tuzatiladi.
     if not await try_deduct_balance(user_id, est_price):
@@ -5240,6 +5348,13 @@ async def confirm_stars(callback: CallbackQuery, state: FSMContext, bot):
     except Exception:
         pass
 
+    if await svc_is_off("stars"):      # admin shu xizmatni vaqtincha o'chirgan
+        await state.clear()
+        sent = await callback.message.answer(SVC_OFF_TEXT)
+        await track_flow_msg(sent)
+        await _safe_answer(callback, SVC_OFF_TEXT, show_alert=True)
+        return
+
     # Atomik "tekshir-va-yech" — qo'sh bosish yoki parallel xarid balansni manfiyga tushira olmaydi.
     if not await try_deduct_balance(user_id, est_price):
         balance = await get_balance(user_id)
@@ -5404,6 +5519,13 @@ async def confirm_premium(callback: CallbackQuery, state: FSMContext, bot):
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
+
+    if await svc_is_off("premium"):      # admin shu xizmatni vaqtincha o'chirgan
+        await state.clear()
+        sent = await callback.message.answer(SVC_OFF_TEXT)
+        await track_flow_msg(sent)
+        await _safe_answer(callback, SVC_OFF_TEXT, show_alert=True)
+        return
 
     # Atomik "tekshir-va-yech" — qo'sh bosish yoki parallel xarid balansni manfiyga tushira olmaydi.
     if not await try_deduct_balance(user_id, est_price):
@@ -5811,6 +5933,12 @@ async def _uc_apply_buy_result(bot, order_pk: int, result: dict) -> Optional[dic
     status = "done" if str(result.get("status") or "").lower() in _DONE_STATUSES else "processing"
     new_details = {**details, **result, "account_id": account_id, "unsent": False}
     await _uc_write_final(order_pk, charged_price, total_uc or None, new_details, status)
+    cost = _result_cost(result)
+    if cost is not None:                                # tannarx (sof foyda hisobi uchun)
+        try:
+            await _set_order_cost(order_pk, cost)
+        except Exception:
+            logging.exception("UC #%s: tannarxni yozib bo'lmadi", order_pk)
     if status == "done":
         buyer = await _uc_buyer_name(bot, user_id)
         await notify_channel(bot, channel_uc_notice(buyer, account_id, total_uc, charged_price), order_type="uc")
@@ -5857,6 +5985,13 @@ async def confirm_uc(callback: CallbackQuery, state: FSMContext, bot):
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
+
+    if await svc_is_off("uc"):      # admin shu xizmatni vaqtincha o'chirgan
+        await state.clear()
+        sent = await callback.message.answer(SVC_OFF_TEXT)
+        await track_flow_msg(sent)
+        await _safe_answer(callback, SVC_OFF_TEXT, show_alert=True)
+        return
 
     if not await try_deduct_balance(user_id, est_price):
         balance = await get_balance(user_id)
@@ -6909,6 +7044,300 @@ async def admin_unban_receive(message: Message, state: FSMContext, bot):
     await state.clear()
 
 
+# ==============================================================
+# PROMOKODLAR, KUNLIK HISOBOT va ANTI-FRAUD (qo'shimcha adminlar uchun kunlik limit)
+# ==============================================================
+router_promo = Router(name="promo")      # oddiy foydalanuvchilar: /promo KOD (main() da router_common'dan keyin ulanadi)
+
+SETTINGS_KEY_PROMOS = "promo_codes"            # JSON: {KOD: {amount, max, exp, used: [user_id, ...]}}
+SETTINGS_KEY_DIGEST_LAST = "digest_last_day"   # oxirgi hisobot yuborilgan kun (YYYYMMDD) — kuniga 1 marta
+SETTINGS_KEY_DIGEST_OFF = "digest_off"         # "1" bo'lsa kunlik hisobot yuborilmaydi
+SETTINGS_KEY_ADMIN_LIMIT = "extra_admin_daily_limit"
+ADMIN_DAILY_LIMIT_DEFAULT = 500_000            # qo'shimcha admin bir kunda tasdiqlay oladigan jami summa (so'm)
+_PROMO_RE = re.compile(r"^[A-Z0-9_-]{3,32}$")
+_promo_lock = asyncio.Lock()
+_promo_fails: Dict[int, list] = {}             # user_id -> noto'g'ri urinishlar vaqti (kodni terib topishdan himoya)
+_fraud_alert_at: Dict[int, float] = {}
+
+
+async def _promo_load() -> Dict[str, dict]:
+    try:
+        data = json.loads(await get_setting(SETTINGS_KEY_PROMOS, default="") or "{}")
+    except ValueError:
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+async def _promo_save(data: Dict[str, dict]) -> None:
+    await set_setting(SETTINGS_KEY_PROMOS, json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+
+
+async def promo_redeem(user_id: int, raw_code: str) -> tuple:
+    """Balans beruvchi promokodni ishlatadi. Qaytadi: (holat, summa); holat: ok | none | expired | used | full | wait."""
+    code = (raw_code or "").strip().upper()
+    now = time.time()
+    fails = [t for t in _promo_fails.get(user_id, []) if now - t < 3600]
+    if len(fails) >= 10:
+        _promo_fails[user_id] = fails
+        return "wait", 0
+    async with _promo_lock:
+        data = await _promo_load()
+        promo = data.get(code) if _PROMO_RE.match(code) else None
+        if not promo:
+            fails.append(now)
+            _promo_fails[user_id] = fails
+            return "none", 0
+        if promo.get("exp") and now > promo["exp"]:
+            return "expired", 0
+        used = promo.get("used") or []
+        if user_id in used:
+            return "used", 0
+        if promo.get("max") and len(used) >= promo["max"]:
+            return "full", 0
+        amount = int(promo.get("amount") or 0)
+        used.append(user_id)
+        promo["used"] = used
+        await _promo_save(data)                     # avval o'rin band qilinadi, keyin pul qo'shiladi
+        try:
+            await change_balance(user_id, amount)
+        except Exception:
+            promo["used"] = [u for u in used if u != user_id]
+            await _promo_save(data)                 # pul qo'shilmadi — o'rin qaytariladi
+            raise
+    logging.info("PROMO user=%s code=%s amount=%s", user_id, code, amount)
+    return "ok", amount
+
+
+_PROMO_MSG = {
+    "none": "\u274C Bunday promokod topilmadi.",
+    "expired": "\u231B Bu promokodning muddati tugagan.",
+    "used": "\u2139\uFE0F Bu promokodni siz allaqachon ishlatgansiz.",
+    "full": "\U0001F615 Bu promokodning limiti tugagan.",
+    "wait": "\u23F3 Juda ko'p noto'g'ri urinish. Bir soatdan so'ng qayta urinib ko'ring.",
+}
+
+
+@router_promo.message(Command("promo"))
+async def promo_use_cmd(message: Message, command: CommandObject):
+    parts = (command.args or "").split()
+    if not parts:
+        await message.answer("Promokodni shunday yuboring:\n/promo KOD")
+        return
+    try:
+        status, amount = await promo_redeem(message.from_user.id, parts[0])
+    except Exception:
+        logging.exception("Promokodni ishlatishda xato")
+        await message.answer("Vaqtinchalik xatolik. Birozdan so'ng qayta urinib ko'ring.")
+        return
+    if status == "ok":
+        await message.answer(f"\U0001F381 Promokod qabul qilindi! Balansingizga {fmt_money(amount)} so'm qo'shildi.\n"
+                             f"Hozirgi balans: {fmt_money(await get_balance(message.from_user.id))} so'm")
+    else:
+        await message.answer(_PROMO_MSG[status])
+
+
+_PROMO_HELP = ("Promokod yaratish:\n/promo_new KOD SUMMA [SONI] [KUN]\n\n"
+               "Masalan: /promo_new BONUS5000 5000 100 30\n"
+               "\u2014 5 000 so'm, birinchi 100 kishi, 30 kun amal qiladi.\n"
+               "SONI va KUN yozilmasa \u2014 cheklanmaydi.\n\n"
+               "Ro'yxat: /promo_list \u00B7 O'chirish: /promo_del KOD")
+
+
+@router_admin.message(Command("promo_new"))
+async def promo_new_cmd(message: Message, command: CommandObject):
+    if not _is_owner(message.from_user.id):
+        return
+    parts = (command.args or "").split()
+    if not 2 <= len(parts) <= 4:
+        await message.answer(_PROMO_HELP)
+        return
+    code, nums = parts[0].upper(), parts[1:]
+    if not _PROMO_RE.match(code) or not all(x.isdigit() for x in nums):
+        await message.answer("\u274C Kod 3\u201332 ta lotin harf/raqam/_- bo'lishi, qolganlari raqam bo'lishi kerak.\n\n" + _PROMO_HELP)
+        return
+    amount = int(nums[0])
+    max_uses = int(nums[1]) if len(nums) > 1 else 0
+    days = int(nums[2]) if len(nums) > 2 else 0
+    if not 1 <= amount <= 10_000_000 or max_uses > 1_000_000 or days > 3650:
+        await message.answer("\u274C Summa 1 dan 10 000 000 so'mgacha bo'lishi kerak.")
+        return
+    async with _promo_lock:
+        data = await _promo_load()
+        if code in data:
+            await message.answer(f"\u274C {code} allaqachon mavjud. Avval /promo_del {code} qiling.")
+            return
+        now = int(time.time())
+        data[code] = {"amount": amount, "max": max_uses, "exp": now + days * 86400 if days else 0,
+                      "used": [], "created": now}
+        await _promo_save(data)
+    await log_admin_action(message.from_user.id, "promo_new", amount=amount,
+                           note=f"{code}: soni={max_uses or 'cheksiz'}, kun={days or 'cheksiz'}")
+    await message.answer(f"\u2705 Promokod yaratildi: {code}\n\U0001F4B0 {fmt_money(amount)} so'm\n"
+                         f"\U0001F465 Soni: {max_uses or 'cheksiz'}\n\u23F3 Muddat: {str(days) + ' kun' if days else 'cheksiz'}\n\n"
+                         f"Foydalanuvchi: /promo {code}")
+
+
+@router_admin.message(Command("promo_del"))
+async def promo_del_cmd(message: Message, command: CommandObject):
+    if not _is_owner(message.from_user.id):
+        return
+    code = (command.args or "").strip().upper()
+    async with _promo_lock:
+        data = await _promo_load()
+        if not code or code not in data:
+            await message.answer("Masalan: /promo_del BONUS5000\nRo'yxat: /promo_list")
+            return
+        data.pop(code)
+        await _promo_save(data)
+    await log_admin_action(message.from_user.id, "promo_del", note=code)
+    await message.answer(f"\u2705 {code} o'chirildi.")
+
+
+@router_admin.message(Command("promo_list"))
+async def promo_list_cmd(message: Message):
+    if not _is_owner(message.from_user.id):
+        return
+    data = await _promo_load()
+    if not data:
+        await message.answer("Promokodlar yo'q.\n\n" + _PROMO_HELP)
+        return
+    now, lines = time.time(), ["\U0001F381 Promokodlar:\n"]
+    for code, p in list(data.items())[-40:]:
+        exp = p.get("exp") or 0
+        left = "cheksiz" if not exp else ("tugagan" if now > exp else datetime.fromtimestamp(exp, LOCAL_TZ).strftime("%d.%m.%Y"))
+        cap = p.get("max") or "\u221E"
+        lines.append(f"{code} \u2014 {fmt_money(p.get('amount') or 0)} so'm \u00B7 {len(p.get('used') or [])}/{cap} \u00B7 muddat: {left}")
+    await message.answer("\n".join(lines))
+
+
+# ---------- Kunlik hisobot (Daily Digest) ----------
+
+async def _build_daily_digest() -> str:
+    rep = (await get_profit_report()).get("today", {})
+    since = _local_day_start()
+    async with _ap_conn() as tx:
+        new_users = int(await tx.scalar("SELECT COUNT(*) FROM users WHERE created_at >= ?", since) or 0)
+        tops = await tx.fetchall("SELECT order_type, COUNT(*) AS n FROM orders WHERE status != 'refunded' "
+                                 "AND created_at >= ? GROUP BY order_type ORDER BY n DESC", since)
+    bal = await _provider_balance()
+    bal_txt = f"{fmt_money(bal)} so'm" if bal is not None else "aniqlanmadi"
+    top = f"{_MA_LABEL.get(tops[0]['order_type'], tops[0]['order_type'])} ({int(tops[0]['n'])} ta)" if tops else "\u2014"
+    return (f"\U0001F4CA Kunlik hisobot \u2014 {datetime.now(LOCAL_TZ).strftime('%d.%m.%Y')}\n\n"
+            f"\U0001F4B0 Sof foyda: {fmt_money(rep.get('profit', 0))} so'm\n"
+            f"\U0001F9FE Tushum: {fmt_money(rep.get('revenue', 0))} \u00B7 SmmUpper: {fmt_money(rep.get('cost', 0))} "
+            f"\u00B7 Keshbek: {fmt_money(rep.get('referral', 0))} so'm\n"
+            f"\U0001F6D2 Buyurtmalar: {int(rep.get('orders', 0))} ta\n"
+            f"\U0001F465 Yangi mijozlar: {new_users} ta\n"
+            f"\U0001F3C6 Eng ko'p sotilgan: {top}\n"
+            f"\U0001F3E6 SmmUpper balansi: {bal_txt}")
+
+
+async def daily_digest_loop(bot):
+    """Har kuni Toshkent vaqti bilan 23:59 da asosiy adminlarga qisqa hisobot yuboradi (kuniga bir marta)."""
+    while True:
+        try:
+            await asyncio.sleep(20)
+            now = datetime.now(LOCAL_TZ)
+            if not (now.hour == 23 and now.minute >= 59):
+                continue
+            day = now.strftime("%Y%m%d")
+            if await get_setting(SETTINGS_KEY_DIGEST_OFF, default="") == "1" \
+                    or await get_setting(SETTINGS_KEY_DIGEST_LAST, default="") == day:
+                continue
+            await set_setting(SETTINGS_KEY_DIGEST_LAST, day)     # avval belgilanadi: xato bo'lsa ham kuniga 1 marta
+            text = await _build_daily_digest()
+            for admin_id in ADMIN_IDS:
+                with contextlib.suppress(Exception):
+                    await bot.send_message(admin_id, text)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("Kunlik hisobotda xato")
+
+
+@router_admin.message(Command("kunlik"))
+async def daily_digest_cmd(message: Message, command: CommandObject):
+    if not _is_owner(message.from_user.id):
+        return
+    arg = (command.args or "").strip().lower()
+    if arg == "now":
+        await message.answer(await _build_daily_digest())
+    elif arg in ("on", "off"):
+        await set_setting(SETTINGS_KEY_DIGEST_OFF, "" if arg == "on" else "1")
+        await message.answer("\u2705 Kunlik hisobot yoqildi (har kuni 23:59)." if arg == "on" else "\u2705 Kunlik hisobot o'chirildi.")
+    else:
+        off = await get_setting(SETTINGS_KEY_DIGEST_OFF, default="") == "1"
+        state = "o'chiq" if off else "yoqiq (har kuni 23:59)"
+        await message.answer(f"Kunlik hisobot: {state}\n\n"
+                             f"/kunlik now \u2014 hozir yuborish\n/kunlik on \u2014 yoqish\n/kunlik off \u2014 o'chirish")
+
+
+# ---------- Anti-fraud: qo'shimcha adminlarning kunlik tasdiqlash limiti ----------
+
+async def _fraud_limit() -> int:
+    raw = await get_setting(SETTINGS_KEY_ADMIN_LIMIT, default=None)
+    return int(raw) if raw and str(raw).isdigit() else ADMIN_DAILY_LIMIT_DEFAULT
+
+
+def _fraud_key(admin_id: int) -> str:
+    return f"fraud_sum_{admin_id}_{datetime.now(LOCAL_TZ).strftime('%Y%m%d')}"
+
+
+async def fraud_check(admin_id: int, amount: int) -> tuple:
+    """(ruxsat, bugun_tasdiqlangan, limit). Asosiy adminlar (ADMIN_IDS) uchun limit yo'q."""
+    if _is_owner(admin_id):
+        return True, 0, 0
+    limit = await _fraud_limit()
+    if limit <= 0:
+        return True, 0, limit
+    raw = await get_setting(_fraud_key(admin_id), default="0")
+    used = int(raw) if raw and str(raw).isdigit() else 0
+    return used + int(amount) <= limit, used, limit
+
+
+async def fraud_record(admin_id: int, amount: int) -> None:
+    """Muvaffaqiyatli tasdiqlangan summani adminning bugungi hisobiga qo'shadi."""
+    if _is_owner(admin_id) or await _fraud_limit() <= 0:
+        return
+    raw = await get_setting(_fraud_key(admin_id), default="0")
+    used = int(raw) if raw and str(raw).isdigit() else 0
+    await set_setting(_fraud_key(admin_id), str(used + int(amount)))
+
+
+async def fraud_alert(bot, admin_id: int, amount: int, used: int, limit: int) -> None:
+    """Limitdan oshgan urinish haqida asosiy adminlarga xabar (bir admin uchun 10 daqiqada bir marta)."""
+    now = time.monotonic()
+    if admin_id in _fraud_alert_at and now - _fraud_alert_at[admin_id] < 600:
+        return
+    _fraud_alert_at[admin_id] = now
+    await log_admin_action(admin_id, "fraud_block", amount=amount, note=f"kunlik limit: {used}+{amount} > {limit}")
+    if bot is None:
+        return
+    text = (f"\u26A0\uFE0F Shubhali holat!\nAdmin {admin_id} bugun {fmt_money(used)} so'm tasdiqlagan, "
+            f"yana {fmt_money(amount)} so'm qo'shmoqchi edi.\nKunlik limit: {fmt_money(limit)} so'm \u2014 amal BLOKLANDI.\n"
+            f"Kerak bo'lsa, o'zingiz tasdiqlang yoki /adminlimit bilan limitni o'zgartiring.")
+    for owner_id in ADMIN_IDS:
+        with contextlib.suppress(Exception):
+            await bot.send_message(owner_id, text)
+
+
+@router_admin.message(Command("adminlimit"))
+async def admin_limit_cmd(message: Message, command: CommandObject):
+    if not _is_owner(message.from_user.id):
+        return
+    arg = (command.args or "").strip().replace(" ", "")
+    if not arg.isdigit():
+        lim = await _fraud_limit()
+        lim_txt = "cheklanmagan" if lim <= 0 else f"{fmt_money(lim)} so'm"
+        await message.answer(f"Qo'shimcha admin bir kunda tasdiqlay oladigan jami summa: "
+                             f"{lim_txt}\n\n"
+                             f"O'zgartirish: /adminlimit 500000  (0 \u2014 limitni o'chirish)")
+        return
+    await set_setting(SETTINGS_KEY_ADMIN_LIMIT, str(int(arg)))
+    await log_admin_action(message.from_user.id, "admin_limit", amount=int(arg))
+    await message.answer("\u2705 Limit o'chirildi." if int(arg) == 0 else f"\u2705 Kunlik limit: {fmt_money(int(arg))} so'm.")
+
+
 # ---------- Broadcast ----------
 
 @router_admin.callback_query(F.data == "adm:broadcast")
@@ -7900,10 +8329,17 @@ async def approve_topup(callback: CallbackQuery, bot):
     # tasdiqlash BITTA tranzaksiyada bajariladi: 'pending' -> 'approved' + balans + referal keshbek. Kimdir ulgurib
     # bo'lgan bo'lsa None qaytadi va balans EKKI MARTA qo'shilmaydi; orada jarayon to'xtasa — hammasi bekor bo'ladi
     # (so'rov 'pending' qoladi, admin qayta bosadi): "tasdiqlandi, lekin balans qo'shilmadi" holati bo'lmaydi.
+    if not _is_owner(callback.from_user.id):          # anti-fraud: qo'shimcha adminning kunlik limiti
+        ok, used, limit = await fraud_check(callback.from_user.id, int(topup["amount"]))
+        if not ok:
+            await fraud_alert(bot, callback.from_user.id, int(topup["amount"]), used, limit)
+            await callback.answer("Kunlik limitdan oshdi. Bu so'rovni asosiy admin tasdiqlaydi.", show_alert=True)
+            return
     done = await approve_topup_atomic(topup_id)
     if not done:
         await callback.answer("Bu so'rovni aynan shu daqiqada boshqa admin ko'rib chiqdi.", show_alert=True)
         return
+    await fraud_record(callback.from_user.id, int(done["amount"]))
 
     amount = done["amount"]                       # tranzaksiya ichida o'qilgan (tahrirlangan bo'lsa — yangi) summa
     new_balance = await get_balance(done["user_id"])
@@ -8590,6 +9026,9 @@ class Autopay:
                 await tx.execute(
                     "UPDATE users SET balance = balance + ?, referral_earnings = referral_earnings + ? "
                     "WHERE user_id = ?", cashback, cashback, referrer)
+                await tx.execute(
+                    "INSERT INTO referral_log (referrer_id, from_user_id, amount, created_at) VALUES (?, ?, ?, ?)",
+                    referrer, user_id, cashback, int(time.time()))
         return {"referrer": referrer if cashback > 0 else None, "cashback": cashback}
 
     async def force_paid(self, payment_id: int) -> Optional[dict]:
@@ -9741,7 +10180,7 @@ async def _ma_api_me(request: web.Request, user: dict) -> web.Response:
         "autopay": {"ready": ap_ready, "ttl_min": ttl},
         "card": {"number": card_number, "holder": card_holder},
         "support": {"url": await get_support_url()},
-        "shop_open": await _ma_shop_open(), "is_admin": await _is_admin(uid),
+        "shop_open": await _ma_shop_open(), "svc_off": await svc_off_list(), "is_admin": await _is_admin(uid),
         "open_payment": open_payment, "server_time": now})
 
 
@@ -10029,6 +10468,8 @@ async def _ma_buy_core(request: web.Request, user: dict, body: dict) -> web.Resp
     kind = body.get("kind")
     if kind not in _MA_LABEL:
         raise _MaError(400, "kind", "Bu xizmat Mini App'da mavjud emas. Botdan foydalaning.")
+    if await svc_is_off(kind):      # admin shu xizmatni vaqtincha o'chirgan: narx hisoblanmaydi, pul yechilmaydi
+        raise _MaError(503, "svc_off", SVC_OFF_TEXT)
     bot = request.app.get(_MA_BOT_KEY)
     if bot is None:
         raise _MaError(503, "server", "Xizmat hozir mavjud emas. Botdan foydalaning.")
@@ -10460,7 +10901,7 @@ async def _ma_api_admin_stats(request: web.Request, user: dict) -> web.Response:
         out["topups_today"] = manual_sum + auto_sum
         out["topups_today_n"] = manual_cnt + auto_cnt
         rows = await tx.fetchall(
-            "SELECT o.order_type, o.price, o.status, o.country, o.created_at, o.user_id, u.full_name, u.username "
+            "SELECT o.id, o.order_type, o.price, o.status, o.country, o.created_at, o.user_id, u.full_name, u.username "
             "FROM orders o LEFT JOIN users u ON u.user_id = o.user_id ORDER BY o.id DESC LIMIT 15")
     recent = []
     for r in rows:
@@ -10468,7 +10909,7 @@ async def _ma_api_admin_stats(request: web.Request, user: dict) -> web.Response:
         label = _MA_LABEL.get(k, k)
         if k == "number" and r["country"]:
             label += " · " + country_display_name(r["country"])
-        recent.append({"t": _MA_ORDER_TYPE.get(k, k), "w": label, "p": r["price"], "at": r["created_at"],
+        recent.append({"id": r["id"], "t": _MA_ORDER_TYPE.get(k, k), "w": label, "p": r["price"], "at": r["created_at"],
                        "s": _MA_ORDER_STATUS.get(r["status"], "wait"),
                        "u": r["full_name"] or (("@" + r["username"]) if r["username"] else str(r["user_id"]))})
     out["recent"] = recent
@@ -10493,6 +10934,82 @@ async def _ma_api_admin_shop(request: web.Request, user: dict) -> web.Response:
     return _ma_json({"ok": True, "guard": guard, "shop_open": await _ma_shop_open(fresh=True)})
 
 
+async def _ma_services_payload() -> dict:
+    """Xizmatlar: yoqiq/o'chiq holati + har birining ustama foizi (Mini App > Admin > Xizmatlar)."""
+    ov = await get_markup_overview()
+    items = []
+    for k in _MA_LABEL:                      # stars, premium, number, uc
+        pct, own = ov["items"].get(k, (ov["general"], False))
+        items.append({"k": k, "name": _MA_LABEL[k], "on": not await svc_is_off(k),
+                      "markup": round(float(pct), 2), "own": bool(own)})
+    return {"ok": True, "items": items, "general": round(float(ov["general"]), 2)}
+
+
+@_ma_route
+async def _ma_api_admin_services(request: web.Request, user: dict) -> web.Response:
+    """Xizmatlar holati. Narx va savdoga ta'sir qiladi — FAQAT asosiy adminlar (.env ADMIN_IDS)."""
+    admin_id = await _ma_admin(user)
+    if not _is_owner(admin_id):
+        raise _MaError(403, "owner_only", "Buni faqat asosiy admin ko'ra oladi.")
+    return _ma_json(await _ma_services_payload())
+
+
+@_ma_route
+async def _ma_api_admin_service_set(request: web.Request, user: dict) -> web.Response:
+    """Bitta xizmatni yoqish/o'chirish (`on`: true/false) va/yoki ustamasini o'zgartirish (`markup`: 0..1000 %).
+    Avval HAMMASI tekshiriladi, keyin yoziladi — yarim-yarti saqlanmaydi."""
+    admin_id = await _ma_admin(user)
+    if not _is_owner(admin_id):
+        raise _MaError(403, "owner_only", "Buni faqat asosiy admin o'zgartira oladi.")
+    body = await _ma_body(request)
+    kind = body.get("k")
+    if kind not in _MA_LABEL or not ("on" in body or "markup" in body):
+        raise _MaError(400, "bad_request", "So'rov noto'g'ri.")
+    if "on" in body and not isinstance(body["on"], bool):
+        raise _MaError(400, "bad_request", "So'rov noto'g'ri.")
+    pct = None
+    if "markup" in body:
+        raw = body["markup"]
+        pct = None if isinstance(raw, bool) else _parse_markup(raw)
+        if pct is None or not (0 <= pct <= 1000):
+            raise _MaError(400, "bad_request", "Ustama noto'g'ri. 0 dan 1000 gacha raqam kiriting (masalan: 12.5).")
+    notes = []
+    if "on" in body:
+        await set_setting(_svc_key(kind), "0" if body["on"] else "1")
+        notes.append("yoqildi" if body["on"] else "o'chirildi")
+    if pct is not None:
+        await set_setting(_markup_key(kind), str(pct))
+        notes.append(f"ustama {pct:g}%")
+    await log_admin_action(admin_id, "service_set", note=f"{_MA_LABEL[kind]}: {', '.join(notes)} (Mini App)")
+    return _ma_json(await _ma_services_payload())
+
+
+@_ma_route
+async def _ma_api_admin_log(request: web.Request, user: dict) -> web.Response:
+    """Admin amallari jurnali (oxirgi 60 ta): kim, kimga, qancha, qachon. FAQAT asosiy adminlar."""
+    admin_id = await _ma_admin(user)
+    if not _is_owner(admin_id):
+        raise _MaError(403, "owner_only", "Jurnalni faqat asosiy admin ko'ra oladi.")
+    async with _ap_conn() as tx:
+        rows = await tx.fetchall(
+            "SELECT l.id, l.admin_id, l.action, l.target_id, l.amount, l.note, l.created_at, "
+            "a.full_name AS an, a.username AS au, t.full_name AS tn, t.username AS tu "
+            "FROM admin_log l LEFT JOIN users a ON a.user_id = l.admin_id "
+            "LEFT JOIN users t ON t.user_id = l.target_id ORDER BY l.id DESC LIMIT 60")
+
+    def _nm(full, uname, uid):
+        if full:
+            return full
+        if uname:
+            return "@" + uname
+        return str(uid) if uid is not None else ""
+
+    items = [{"id": r["id"], "act": r["action"], "an": _nm(r["an"], r["au"], r["admin_id"]),
+              "tn": _nm(r["tn"], r["tu"], r["target_id"]) if r["target_id"] is not None else "",
+              "am": r["amount"], "note": r["note"] or "", "at": r["created_at"]} for r in rows]
+    return _ma_json({"ok": True, "items": items})
+
+
 @_ma_route
 async def _ma_api_admin_topup(request: web.Request, user: dict) -> web.Response:
     admin_id = await _ma_admin(user)
@@ -10503,11 +11020,31 @@ async def _ma_api_admin_topup(request: web.Request, user: dict) -> web.Response:
         raise _MaError(400, "bad_request", "So'rov noto'g'ri.")
     act, bot = b.get("action"), request.app.get(_MA_BOT_KEY)
     if act == "approve":
-        done = await approve_topup_atomic(tid)
+        override = None
+        if b.get("amount") not in (None, ""):
+            if not _is_owner(admin_id):
+                raise _MaError(403, "owner_only", "Summani faqat asosiy admin o'zgartira oladi.")
+            try:
+                override = int(str(b.get("amount")).strip().replace(" ", ""))
+            except (TypeError, ValueError):
+                raise _MaError(400, "amount", "Summani to'g'ri kiriting.")
+            if isinstance(b.get("amount"), bool) or override < 1 or override > MINIAPP_MAX_TOPUP:
+                raise _MaError(400, "amount", f"Summa 1 dan {fmt_money(MINIAPP_MAX_TOPUP)} so'mgacha bo'lishi kerak.")
+        if not _is_owner(admin_id):                   # anti-fraud: qo'shimcha adminning kunlik limiti
+            t0 = await get_topup(tid)
+            amt0 = int(t0["amount"]) if t0 else 0
+            ok, used, limit = await fraud_check(admin_id, amt0)
+            if not ok:
+                await fraud_alert(bot, admin_id, amt0, used, limit)
+                raise _MaError(403, "limit", "Kunlik limitdan oshdi. Bu so'rovni asosiy admin tasdiqlaydi.")
+        done = await approve_topup_atomic(tid, override)
         if not done:
             raise _MaError(409, "closed", "Bu so'rov allaqachon ko'rib chiqilgan.")
+        await fraud_record(admin_id, int(done["amount"]))
+        changed = done.get("orig_amount") not in (None, done["amount"])
         await log_admin_action(admin_id, "topup_approve", target_id=done["user_id"], amount=done["amount"],
-                               note=f"topup #{tid} (Mini App)")
+                               note=f"topup #{tid} (Mini App)" + (
+                                   f", summa o'zgartirildi: {done['orig_amount']} -> {done['amount']}" if changed else ""))
         if bot is not None:
             with contextlib.suppress(Exception):
                 await bot.send_message(done["user_id"], topup_approved_text(done["amount"], await get_balance(done["user_id"])))
@@ -10610,6 +11147,403 @@ async def _ma_api_admin_ban(request: web.Request, user: dict) -> web.Response:
     return _ma_json({"ok": True, "banned": ban})
 
 
+# ---- Mini App admin: moliya (sof foyda), chek rasmi, avto-to'lov boshqaruvi, Excel hisobot ----
+async def _ma_owner(user: dict) -> int:
+    """Faqat asosiy admin (.env ADMIN_IDS): moliya, karta va hisobotlar qo'shimcha adminlarga ochilmaydi."""
+    uid = await _ma_admin(user)
+    if not _is_owner(uid):
+        raise _MaError(403, "owner_only", "Bu bo'limga faqat asosiy admin kira oladi.")
+    return uid
+
+
+@_ma_route
+async def _ma_api_admin_profit(request: web.Request, user: dict) -> web.Response:
+    await _ma_owner(user)
+    return _ma_json({"ok": True, **(await get_profit_report())})
+
+
+def _ma_sniff_mime(data: bytes) -> str:
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return ""
+
+
+@_ma_route
+async def _ma_api_admin_receipt_img(request: web.Request, user: dict) -> web.Response:
+    """Chek rasmining o'zini qaytaradi (Mini App uni modal oynada kattalashtirib ko'rsatadi)."""
+    await _ma_admin(user)
+    try:
+        topup = await get_topup(int((await _ma_body(request)).get("id")))
+    except (TypeError, ValueError):
+        topup = None
+    fid = topup["photo_file_id"] if topup and "photo_file_id" in list(topup.keys()) else None
+    bot = request.app.get(_MA_BOT_KEY)
+    if not fid or bot is None:
+        raise _MaError(404, "not_found", "Chek rasmi topilmadi.")
+    try:
+        f = await bot.get_file(fid)
+        buf = io.BytesIO()
+        await bot.download_file(f.file_path, destination=buf)
+    except Exception:
+        raise _MaError(502, "download", "Chek rasmini yuklab bo'lmadi.")
+    data = buf.getvalue()
+    ctype = _ma_sniff_mime(data)
+    if not ctype or len(data) > 12 * 1024 * 1024:
+        raise _MaError(415, "not_image", "Chek rasm emas (hujjat bo'lishi mumkin) — «Botga yuborish» tugmasidan foydalaning.")
+    return web.Response(body=data, content_type=ctype,
+                        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+
+
+_AP_STATE_SHORT = {"off": "Sozlanmagan", "waiting": "Navbat kutmoqda", "connecting": "Ulanmoqda",
+                   "connected": "Ulangan", "error": "Xato"}
+
+
+@_ma_route
+async def _ma_api_admin_autopay(request: web.Request, user: dict) -> web.Response:
+    await _ma_owner(user)
+    now = int(time.time())
+    cards = await ap_cards_list()
+    st = await AUTOPAY.stats_today()
+    late, recent = [], []
+    try:
+        async with _ap_conn() as tx:
+            rows = await tx.fetchall(
+                "SELECT p.id, p.user_id, p.exact_amount, p.status, p.created_at, u.full_name, u.username "
+                "FROM autopay_payments p LEFT JOIN users u ON u.user_id = p.user_id "
+                "WHERE p.status <> 'paid' AND p.created_at > ? AND EXISTS ("
+                "SELECT 1 FROM autopay_events e WHERE e.amount = p.exact_amount AND e.result = 'late' "
+                "AND e.seen_at >= p.created_at) ORDER BY p.id DESC LIMIT 20", now - AUTOPAY_HOLD_SECONDS)
+        late = [{"id": r["id"], "user_id": r["user_id"], "amount": r["exact_amount"], "at": r["created_at"],
+                 "name": r["full_name"] or (("@" + r["username"]) if r["username"] else str(r["user_id"]))}
+                for r in rows]
+        recent = [{"id": r["id"], "amount": r["exact_amount"], "status": r["status"], "at": r["created_at"],
+                   "name": ("@" + r["username"]) if r.get("username") else str(r["user_id"])}
+                  for r in await AUTOPAY.recent(8)]
+    except Exception:
+        logging.exception("miniapp: avto-to'lov ro'yxatini o'qib bo'lmadi")
+    return _ma_json({
+        "ok": True, "enabled": await AUTOPAY.is_enabled(), "ready": await AUTOPAY.is_ready(),
+        "state": AUTOPAY.state, "state_label": _AP_STATE_SHORT.get(AUTOPAY.state, AUTOPAY.state),
+        "error": (AUTOPAY.last_error or "")[:160] if AUTOPAY.state == "error" else "",
+        "ttl": await AUTOPAY.ttl_minutes(), "max_cards": AUTOPAY_MAX_CARDS,
+        "last_event_min": max(0, int((now - AUTOPAY.last_event_at) // 60)) if AUTOPAY.last_event_at else None,
+        "today": {"count": st["count"], "sum": st["sum"], "pending": st["pending"]},
+        "cards": [{"id": c["id"], "num": ap_fmt_card(c["number"], mask=True), "last4": c["last4"],
+                   "holder": c["holder"] or "", "active": bool(c["active"])} for c in cards],
+        "late": late, "recent": recent})
+
+
+@_ma_route
+async def _ma_api_admin_ap_toggle(request: web.Request, user: dict) -> web.Response:
+    admin_id = await _ma_owner(user)
+    on = (await _ma_body(request)).get("on")
+    if not isinstance(on, bool):
+        raise _MaError(400, "bad_request", "So'rov noto'g'ri.")
+    await AUTOPAY.set_enabled(on)
+    await log_admin_action(admin_id, "autopay_toggle", note="yoqildi (Mini App)" if on else "o'chirildi (Mini App)")
+    return _ma_json({"ok": True, "enabled": on, "ready": await AUTOPAY.is_ready()})
+
+
+@_ma_route
+async def _ma_api_admin_ap_card(request: web.Request, user: dict) -> web.Response:
+    admin_id = await _ma_owner(user)
+    b = await _ma_body(request)
+    act = b.get("action")
+    if act == "add":
+        digits = re.sub(r"\D", "", str(b.get("number") or ""))
+        if len(digits) != 16:
+            raise _MaError(400, "bad_card", "Karta raqami 16 ta raqamdan iborat bo'lishi kerak.")
+        if not ap_luhn_ok(digits) and b.get("force") is not True:
+            raise _MaError(409, "luhn", "Bu raqam tekshiruvdan o'tmadi — xato terilgan bo'lishi mumkin.")
+        holder = str(b.get("holder") or "").strip()[:60]
+        try:
+            await ap_card_add(digits, holder)
+        except ValueError as e:
+            raise _MaError(409, "card_" + str(e),
+                           "Kartalar limitiga yetildi." if str(e) == "max" else "Bu karta allaqachon qo'shilgan.")
+        await log_admin_action(admin_id, "autopay_card_add", note=f"...{digits[-4:]} (Mini App)")
+    elif act in ("toggle", "delete"):
+        try:
+            cid = int(b.get("id"))
+        except (TypeError, ValueError):
+            raise _MaError(400, "bad_request", "So'rov noto'g'ri.")
+        card = next((c for c in await ap_cards_list() if c["id"] == cid), None)
+        if not card:
+            raise _MaError(404, "not_found", "Karta topilmadi.")
+        if act == "toggle":
+            await ap_card_toggle(cid)
+        else:
+            await ap_card_delete(cid)
+        await log_admin_action(admin_id, "autopay_card_" + act, note=f"...{card['last4']} (Mini App)")
+    else:
+        raise _MaError(400, "bad_request", "So'rov noto'g'ri.")
+    return _ma_json({"ok": True})
+
+
+@_ma_route
+async def _ma_api_admin_ap_force(request: web.Request, user: dict) -> web.Response:
+    """Kechikkan / boshqa kartaga tushgan to'lovni qo'lda balansga o'tkazadi (botdagi «Balansga qo'shish» tugmasi bilan bir xil)."""
+    admin_id = await _ma_owner(user)
+    try:
+        pid = int((await _ma_body(request)).get("id"))
+    except (TypeError, ValueError):
+        raise _MaError(400, "bad_request", "So'rov noto'g'ri.")
+    info = await AUTOPAY.force_paid(pid)
+    if not info:
+        raise _MaError(409, "closed", "To'lov topilmadi yoki allaqachon balansga qo'shilgan.")
+    await log_admin_action(admin_id, "autopay_force", target_id=info["user_id"], amount=info["amount"],
+                           note=f"to'lov #{pid} (Mini App)")
+    return _ma_json({"ok": True, "amount": info["amount"]})
+
+
+# ---- Excel (.xlsx) hisobot: tashqi kutubxonasiz (zipfile) — openpyxl o'rnatilmagan serverda ham ishlaydi ----
+_XML_BAD = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff]")
+
+
+def _xl_col(i: int) -> str:
+    s, n = "", i + 1
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _xl_esc(v) -> str:
+    return html.escape(_XML_BAD.sub("", str(v)), quote=False)
+
+
+def _xlsx_bytes(sheet: str, headers: list, rows: list, money_cols: tuple = ()) -> bytes:
+    """Bitta varaqli .xlsx: qalin sarlavha, qotirilgan birinchi qator, ustun kengliklari, pul ustunlari «1 234 567» ko'rinishida."""
+    widths = [min(42, max(len(str(h)) + 2, 8)) for h in headers]
+    out = []
+    for ri, row in enumerate([headers] + rows, 1):
+        cells = []
+        for ci, v in enumerate(row):
+            if v is None or v == "":
+                continue
+            ref = f"{_xl_col(ci)}{ri}"
+            if ri == 1:
+                cells.append(f'<c r="{ref}" s="1" t="inlineStr"><is><t>{_xl_esc(v)}</t></is></c>')
+                continue
+            if isinstance(v, bool):
+                v = "Ha" if v else "Yo'q"
+            if isinstance(v, (int, float)):
+                style = ' s="2"' if ci in money_cols else ""
+                cells.append(f'<c r="{ref}"{style}><v>{v}</v></c>')
+                widths[ci] = max(widths[ci], min(42, len(f"{v:,}") + 2))
+            else:
+                text = _xl_esc(v)
+                cells.append(f'<c r="{ref}" t="inlineStr"><is><t xml:space="preserve">{text}</t></is></c>')
+                widths[ci] = max(widths[ci], min(42, len(str(v)) + 2))
+        out.append(f'<row r="{ri}">{"".join(cells)}</row>')
+    cols = "".join(f'<col min="{i + 1}" max="{i + 1}" width="{w}" customWidth="1"/>' for i, w in enumerate(widths))
+    ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    sheet_xml = (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="{ns}">'
+        '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+        f'</sheetView></sheetViews><cols>{cols}</cols><sheetData>{"".join(out)}</sheetData></worksheet>')
+    styles = (
+        f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="{ns}">'
+        '<numFmts count="1"><numFmt numFmtId="164" formatCode="#,##0"/></numFmts>'
+        '<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>'
+        '<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFE3E8FF"/><bgColor indexed="64"/></patternFill></fill></fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>'
+        '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>')
+    rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml",
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                   '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                   '<Default Extension="xml" ContentType="application/xml"/>'
+                   '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+                   '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+                   '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+                   '</Types>')
+        z.writestr("_rels/.rels",
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   f'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   f'<Relationship Id="rId1" Type="{rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+        z.writestr("xl/workbook.xml",
+                   f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="{ns}" xmlns:r="{rel}">'
+                   f'<sheets><sheet name="{_xl_esc(sheet)[:31]}" sheetId="1" r:id="rId1"/></sheets></workbook>')
+        z.writestr("xl/_rels/workbook.xml.rels",
+                   '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                   '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                   f'<Relationship Id="rId1" Type="{rel}/worksheet" Target="worksheets/sheet1.xml"/>'
+                   f'<Relationship Id="rId2" Type="{rel}/styles" Target="styles.xml"/></Relationships>')
+        z.writestr("xl/styles.xml", styles)
+        z.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    return buf.getvalue()
+
+
+def _xl_time(ts) -> str:
+    try:
+        return datetime.fromtimestamp(int(ts), LOCAL_TZ).strftime("%Y-%m-%d %H:%M") if ts else ""
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ""
+
+
+_XL_ORDER_STATUS = {"done": "Bajarildi", "processing": "Jarayonda", "refunded": "Qaytarildi"}
+_XL_TOPUP_STATUS = {"approved": "Tasdiqlandi", "pending": "Kutilmoqda", "rejected": "Rad etildi"}
+_XL_PAY_STATUS = {"paid": "To'langan", "pending": "Kutilmoqda", "expired": "Muddati o'tgan", "cancelled": "Bekor qilingan"}
+_XL_LIMIT = 50000
+
+
+async def _xl_dataset(kind: str):
+    """(varaq nomi, fayl nomi, sarlavhalar, qatorlar, pul ustunlari) yoki None."""
+    async with _ap_conn() as tx:
+        if kind == "users":
+            rows = await tx.fetchall(
+                "SELECT u.user_id, u.username, u.full_name, u.phone, u.balance, u.banned, u.left_bot, u.referred_by, "
+                "u.referral_earnings, u.created_at, "
+                "(SELECT COUNT(*) FROM orders o WHERE o.user_id = u.user_id AND o.status != 'refunded') AS orders_n, "
+                "(SELECT COALESCE(SUM(o.price), 0) FROM orders o WHERE o.user_id = u.user_id AND o.status != 'refunded') AS spent "
+                "FROM users u ORDER BY u.created_at DESC LIMIT ?", _XL_LIMIT)
+            head = ["ID", "Username", "Ism", "Telefon", "Balans", "Bloklangan", "Botdan chiqqan", "Taklif qilgan (ID)",
+                    "Referal keshbek", "Buyurtmalar", "Jami xarid", "Ro'yxatdan o'tgan"]
+            data = [[r["user_id"], ("@" + r["username"]) if r["username"] else "", r["full_name"] or "", r["phone"] or "",
+                     int(r["balance"] or 0), bool(r["banned"]), bool(r["left_bot"]), r["referred_by"] or "",
+                     int(r["referral_earnings"] or 0), int(r["orders_n"] or 0), int(r["spent"] or 0),
+                     _xl_time(r["created_at"])] for r in rows]
+            return "Mijozlar", "mijozlar", head, data, (4, 8, 10)
+        if kind == "orders":
+            rows = await tx.fetchall(
+                "SELECT o.id, o.user_id, u.username, o.order_type, o.status, o.price, o.cost_price, o.country, "
+                "o.target_username, o.qty, o.ref, o.created_at "
+                "FROM orders o LEFT JOIN users u ON u.user_id = o.user_id ORDER BY o.id DESC LIMIT ?", _XL_LIMIT)
+            head = ["Buyurtma #", "Mijoz ID", "Username", "Xizmat", "Holat", "Sotuv narxi", "Tannarx (SmmUpper)", "Foyda",
+                    "Davlat", "Qabul qiluvchi", "Miqdor", "SmmUpper ID", "Sana"]
+            data = []
+            for r in rows:
+                cost = r["cost_price"]
+                profit = (int(r["price"]) - int(cost)) if cost is not None and r["status"] != "refunded" else ""
+                data.append([r["id"], r["user_id"], ("@" + r["username"]) if r["username"] else "",
+                             _MA_LABEL.get(r["order_type"], r["order_type"]),
+                             _XL_ORDER_STATUS.get(r["status"], r["status"]), int(r["price"] or 0),
+                             int(cost) if cost is not None else "", profit, r["country"] or "",
+                             ("@" + r["target_username"]) if r["target_username"] else "", r["qty"] or "",
+                             r["ref"] or "", _xl_time(r["created_at"])])
+            return "Buyurtmalar", "buyurtmalar", head, data, (5, 6, 7)
+        if kind == "topups":
+            rows = await tx.fetchall(
+                "SELECT t.id, t.user_id, u.username, t.amount, t.status, t.created_at "
+                "FROM topups t LEFT JOIN users u ON u.user_id = t.user_id ORDER BY t.id DESC LIMIT ?", _XL_LIMIT)
+            head = ["So'rov #", "Mijoz ID", "Username", "Summa", "Holat", "Sana"]
+            data = [[r["id"], r["user_id"], ("@" + r["username"]) if r["username"] else "", int(r["amount"] or 0),
+                     _XL_TOPUP_STATUS.get(r["status"], r["status"]), _xl_time(r["created_at"])] for r in rows]
+            return "To'lovlar (chek)", "tolovlar_chek", head, data, (3,)
+        if kind == "payments":
+            rows = await tx.fetchall(
+                "SELECT p.id, p.user_id, u.username, p.base_amount, p.exact_amount, p.status, p.card_last4, "
+                "p.created_at, p.paid_at FROM autopay_payments p LEFT JOIN users u ON u.user_id = p.user_id "
+                "ORDER BY p.id DESC LIMIT ?", _XL_LIMIT)
+            head = ["To'lov #", "Mijoz ID", "Username", "So'ralgan summa", "Aniq summa", "Holat", "Karta (oxirgi 4)",
+                    "Yaratilgan", "To'langan"]
+            data = [[r["id"], r["user_id"], ("@" + r["username"]) if r["username"] else "", int(r["base_amount"] or 0),
+                     int(r["exact_amount"] or 0), _XL_PAY_STATUS.get(r["status"], r["status"]), r["card_last4"] or "",
+                     _xl_time(r["created_at"]), _xl_time(r["paid_at"])] for r in rows]
+            return "Avto-to'lovlar", "avto_tolovlar", head, data, (3, 4)
+    return None
+
+
+@_ma_route
+async def _ma_api_admin_order(request: web.Request, user: dict) -> web.Response:
+    """Buyurtma tafsiloti (admin): kim, nima, qancha, tannarx, SmmUpper ID, qabul qiluvchi, PUBG ID."""
+    await _ma_admin(user)
+    try:
+        oid = int((await _ma_body(request)).get("id"))
+    except (TypeError, ValueError):
+        raise _MaError(400, "bad_request", "So'rov noto'g'ri.")
+    row = await get_order_row(oid)
+    if not row:
+        raise _MaError(404, "not_found", "Buyurtma topilmadi.")
+    u = await find_user(str(row["user_id"])) or {}
+    k = row["order_type"]
+    cost = row["cost_price"] if "cost_price" in row.keys() else None
+    extra = {}
+    try:
+        for dk, dv in (_order_details_from_row(row) or {}).items():
+            if isinstance(dv, (str, int)) and any(s in str(dk).lower() for s in ("pubg", "player", "uid")):
+                extra[str(dk)] = str(dv)[:64]
+    except Exception:
+        extra = {}
+    tu = row["target_username"] if "target_username" in row.keys() else None
+    qty = row["qty"] if "qty" in row.keys() else None
+    return _ma_json({"ok": True, "id": row["id"], "uid": row["user_id"], "name": u.get("full_name") or "",
+                     "username": u.get("username") or "", "w": _MA_LABEL.get(k, k),
+                     "country": country_display_name(row["country"]) if row["country"] else "",
+                     "s": _MA_ORDER_STATUS.get(row["status"], "wait"), "raw": row["status"],
+                     "p": _ma_int(row["price"]), "cost": None if cost is None else _ma_int(cost),
+                     "ref": row["ref"] or "", "to": tu or "", "qty": qty or "", "extra": extra,
+                     "at": row["created_at"], "can": row["status"] not in ("refunded", "done")})
+
+
+@_ma_route
+async def _ma_api_admin_order_refund(request: web.Request, user: dict) -> web.Response:
+    """Buyurtmani majburan qaytarish: pul balansga atomik qaytadi (ikki marta qaytmaydi). FAQAT asosiy admin."""
+    admin_id = await _ma_owner(user)
+    try:
+        oid = int((await _ma_body(request)).get("id"))
+    except (TypeError, ValueError):
+        raise _MaError(400, "bad_request", "So'rov noto'g'ri.")
+    row = await get_order_row(oid)
+    if not row:
+        raise _MaError(404, "not_found", "Buyurtma topilmadi.")
+    refund = await refund_order(oid, any_open=True)
+    if not refund:
+        raise _MaError(409, "closed", "Qaytarib bo'lmadi: buyurtma yakunlangan yoki allaqachon qaytarilgan.")
+    await log_admin_action(admin_id, "force_refund", target_id=refund["user_id"], amount=refund["price"],
+                           note=f"Buyurtma #{oid} majburan qaytarildi (Mini App)")
+    if _NOTIFY_BOT is not None:
+        await _notify_purchase_refund(_NOTIFY_BOT, oid, refund["user_id"], refund["price"],
+                                      "admin tomonidan bekor qilindi", _MA_LABEL.get(row["order_type"], row["order_type"]))
+    return _ma_json({"ok": True, "status": "refunded", "amount": refund["price"]})
+
+
+@_ma_route
+async def _ma_api_admin_export(request: web.Request, user: dict) -> web.Response:
+    """Mijozlar / buyurtmalar / to'lovlar tarixini .xlsx qilib adminning Telegram chatiga yuboradi."""
+    admin_id = await _ma_owner(user)
+    if not _ma_rate_ok(admin_id, "export", 8, 600):
+        raise _MaError(429, "rate", "Juda ko'p hisobot so'raldi. Birozdan so'ng urinib ko'ring.")
+    kind = (await _ma_body(request)).get("kind")
+    bot = request.app.get(_MA_BOT_KEY)
+    if kind not in ("users", "orders", "topups", "payments"):
+        raise _MaError(400, "bad_request", "So'rov noto'g'ri.")
+    if bot is None:
+        raise _MaError(503, "no_bot", "Bot hozir javob bermayapti.")
+    try:
+        ds = await _xl_dataset(kind)
+    except Exception:
+        logging.exception("miniapp: hisobot ma'lumotini o'qib bo'lmadi (%s)", kind)
+        raise _MaError(500, "server", "Hisobotni tayyorlab bo'lmadi.")
+    sheet, fname, head, data, money = ds
+    blob = await asyncio.to_thread(_xlsx_bytes, sheet, head, data, money)
+    name = f"{fname}_{datetime.now(LOCAL_TZ):%Y-%m-%d_%H%M}.xlsx"
+    try:
+        await bot.send_document(admin_id, BufferedInputFile(blob, filename=name),
+                                caption=f"\U0001F4CA {sheet}: {len(data)} ta qator" +
+                                        (f" (oxirgi {_XL_LIMIT})" if len(data) >= _XL_LIMIT else ""))
+    except Exception:
+        logging.exception("miniapp: hisobotni yuborib bo'lmadi")
+        raise _MaError(502, "send", "Faylni yuborib bo'lmadi. Botda /start bosilganini tekshiring.")
+    await log_admin_action(admin_id, "export", note=f"{kind}: {len(data)} qator (Mini App)")
+    return _ma_json({"ok": True, "rows": len(data)})
+
+
 # ---- shrift: Google Fonts o'rniga o'z serverimizdan (sekin tarmoqda ham tez; tashqi domen kutilmaydi) ----
 # Fayllar bot.py yonidagi fonts/ papkasida turadi (yoki MINIAPP_FONT_DIR). Faqat shu papkadagi *.woff2 beriladi.
 MINIAPP_FONT_DIR = (os.getenv("MINIAPP_FONT_DIR", "").strip()
@@ -10659,6 +11593,18 @@ def miniapp_setup_routes(app: web.Application) -> None:
     app.router.add_post("/api/admin/balance", _ma_api_admin_balance)
     app.router.add_post("/api/admin/ban", _ma_api_admin_ban)
     app.router.add_post("/api/admin/shop", _ma_api_admin_shop)
+    app.router.add_get("/api/admin/profit", _ma_api_admin_profit)
+    app.router.add_post("/api/admin/receipt/image", _ma_api_admin_receipt_img)
+    app.router.add_get("/api/admin/autopay", _ma_api_admin_autopay)
+    app.router.add_post("/api/admin/autopay/toggle", _ma_api_admin_ap_toggle)
+    app.router.add_post("/api/admin/autopay/card", _ma_api_admin_ap_card)
+    app.router.add_post("/api/admin/autopay/force", _ma_api_admin_ap_force)
+    app.router.add_post("/api/admin/export", _ma_api_admin_export)
+    app.router.add_get("/api/admin/services", _ma_api_admin_services)
+    app.router.add_post("/api/admin/services", _ma_api_admin_service_set)
+    app.router.add_get("/api/admin/log", _ma_api_admin_log)
+    app.router.add_post("/api/admin/order", _ma_api_admin_order)
+    app.router.add_post("/api/admin/order/refund", _ma_api_admin_order_refund)
 
 
 async def miniapp_setup_bot(bot) -> None:
@@ -10940,6 +11886,7 @@ async def main():
     # Diqqat: router_common (bosh menyu tugmalari uchun umumiy filtr) va
     # router_admin birinchi bo'lib qo'shiladi, keyin qolgan bo'limlar.
     dp.include_router(router_common)
+    dp.include_router(router_promo)
     dp.include_router(router_admin)
     dp.include_router(router_start)
     dp.include_router(router_menu)
@@ -10973,6 +11920,10 @@ async def main():
     pw_task = asyncio.create_task(provider_balance_watch(bot))
     _background_tasks.add(pw_task)
     pw_task.add_done_callback(_background_tasks.discard)
+
+    digest_task = asyncio.create_task(daily_digest_loop(bot))      # kunlik hisobot (23:59, Toshkent vaqti)
+    _background_tasks.add(digest_task)
+    digest_task.add_done_callback(_background_tasks.discard)
 
     # MUHIM (Render "zero-downtime deploy"ga oid): yangi deploy paytida
     # Render eski va yangi instansiyani BIR NECHA O'N SONIYA (hattoki

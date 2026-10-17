@@ -980,14 +980,6 @@ html[data-theme="dark"]:has(.pv-card.adm){--bg:#0B0905;--panel:#15110A;--soft:#2
 .qk button{justify-content:space-between;min-height:96px;padding:12px 10px}
 .pgh{margin-bottom:30px}
 .pgh .sp-bot{top:-4px;right:-8px;width:80px;height:80px}
-.ckb{margin-top:8px}
-.ckr{margin-top:8px;font-size:13px;line-height:1.4;color:var(--mut)}
-.ckr:empty{display:none}
-.ckr b{color:var(--tx);overflow-wrap:anywhere}
-.ckr.ok,.ckr.warn,.ckr.bad{padding:10px 12px;border-radius:14px}
-.ckr.ok{color:#34D399;background:rgba(52,211,153,.1);border:1px solid rgba(52,211,153,.35)}
-.ckr.warn{color:#FBBF24;background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.35)}
-.ckr.bad{color:#F87171;background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.35)}
 .act[hidden]{display:none}
 /* ==== Profil: yangi tartib ==== */
 /* ===== Profil v4: tungi osmon hero, rangli ko'rsatkichlar, hisob ro'yxati, taklif banneri ===== */
@@ -1150,6 +1142,22 @@ html.gh-on{--ng:242,182,50}html[data-theme=dark]:not(.gh-on){--ng:var(--prgb)}
 :is(html.gh-on,html[data-theme=dark]) .nav>button.on::after{top:auto;bottom:3px;left:50%;width:26px;height:3px;margin-left:-13px;border-radius:3px;background:rgb(var(--ng));box-shadow:0 0 8px rgba(var(--ng),.75);-webkit-mask:none;mask:none}
 :is(html.gh-on,html[data-theme=dark]) .nav>button+button::before{display:none}
 :is(html.gh-on,html[data-theme=dark]) .nav>button:nth-child(2)::before{display:block;top:50%;height:30px;margin-top:-15px;background:rgba(var(--ng),.2)}
+/* ============ ADMIN: Moliya (sof foyda), Avto-to'lov, chek oynasi ============ */
+.ad-tb{position:relative;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}.ad-tb::-webkit-scrollbar{display:none}
+.ad-tb button{flex:1 0 auto;padding-left:13px;padding-right:13px}
+.apx{display:flex;justify-content:space-between;align-items:center;gap:14px;padding:14px 0;border-top:1px solid var(--line)}.apx:first-child{border-top:0}.apx>div:first-child{min-width:0}
+.apx b{display:block;font-size:14.5px;overflow-wrap:anywhere}.apx .amt{display:block;margin-top:2px;font:800 17px Manrope,sans-serif}.apx small{display:block;margin-top:1px;color:var(--mut);font-size:12px}
+.fn-ok{color:var(--ok)}.fn-bad{color:var(--badt)}
+.ad-rev .ad-big{overflow-wrap:anywhere}
+.rci{display:grid;place-items:center;min-height:150px;border-radius:18px;background:var(--soft);overflow:hidden}
+.rci img{display:block;width:100%;max-height:32vh;object-fit:contain;cursor:zoom-in}
+.rcl{padding:30px 16px;color:var(--mut);font-size:13.5px;font-weight:600;text-align:center;line-height:1.45}
+.rcz{position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.94)}
+.rcs{position:absolute;inset:0;overflow:auto;display:flex;-webkit-overflow-scrolling:touch}
+.rcs img{margin:auto;max-width:100%;max-height:100%;object-fit:contain;cursor:zoom-in}
+.rcs.z img{max-width:none;max-height:none;width:240%;cursor:zoom-out}
+.rcx{position:absolute;top:calc(env(safe-area-inset-top,0px) + 12px);right:12px;display:grid;place-items:center;width:44px;height:44px;padding:0;border:0;border-radius:50%;background:rgba(255,255,255,.18);color:#fff;font-size:18px;font-weight:800}
+.rch{position:absolute;left:0;right:0;bottom:calc(env(safe-area-inset-bottom,0px) + 14px);text-align:center;color:rgba(255,255,255,.7);font-size:12.5px;font-weight:600;pointer-events:none}
 </style>
 </head>
 <body>
@@ -1252,7 +1260,7 @@ try{r=await fetch(BASE+path,{method:o.method||(body?"POST":"GET"),headers:h,body
 catch(e){throw{code:"net",message:"Internet yoki server bilan aloqa yo'q"}}finally{clearTimeout(t)}
 if(!r.ok||!j||j.ok===false)throw{code:(j&&j.error)||"http",message:(j&&j.message)||"Xatolik yuz berdi",data:j};
 return j}
-const P={star:0,prem:{},uc:[],cty:[]};let NK=1;   /* Raqam serveri: 1 | 2 | 3 */   /* narxlar openSheet()da /api/prices dan to'ldiriladi */
+const P={star:0,prem:{},uc:[],cty:[]};let NK=1;   /* Raqam: server avtomatik tanlanadi (1-server, u bo'lmasa 2-server); foydalanuvchiga ko'rsatilmaydi */   /* narxlar openSheet()da /api/prices dan to'ldiriladi */
 const SV={stars:{n:"Stars",s:"50 tadan",u:1},premium:{n:"Premium",s:"3, 6, 12 oy",u:1},raqam:{n:"Raqam",s:"SMS kod"},uc:{n:"PUBG UC",s:"ID orqali"}};
 const IC={
 stars:'<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.4l2.9 6.2 6.7.8-5 4.6 1.3 6.7-5.9-3.4-5.9 3.4 1.3-6.7-5-4.6 6.7-.8z"/></svg>',
@@ -1275,7 +1283,7 @@ if(path.indexOf("/api/prices")==0){const k=path.split("k=")[1]||"";
 if(k=="number"||k=="ready")return{ok:true,countries:DP.cty.map(c=>({f:c[0],n:c[1],p:c[2],c:c[3]}))};
 if(k=="uc")return{ok:true,uc:DP.uc.map(x=>({uc:x[0],p:x[1],id:x[2]}))};
 return{ok:true,star:DP.star,premium:DP.prem,min_stars:50}}
-if(path=="/api/uc/check")return{ok:true,found:true,nickname:"Demo_Player",match:b.username?String(b.username).toLowerCase()=="demo_player":null};if(path=="/api/buy"){const k=b.kind,price=b.price,id=Date.now()%1e6;if(price>DEMO.bal)throw{code:"balance",message:"Balansingiz yetarli emas.",data:{}};
+if(path=="/api/buy"){const k=b.kind,price=b.price,id=Date.now()%1e6;if(price>DEMO.bal)throw{code:"balance",message:"Balansingiz yetarli emas.",data:{}};
 DEMO.bal-=price;const fast=k=="stars"||k=="premium",num=k=="number"?"+996 "+(500+Math.floor(Math.random()*400))+" 12 34 56":null,
 w=k=="stars"?fmt(b.amount)+" Stars":k=="premium"?"Premium, "+b.amount+" oy":k=="uc"?fmt(DP.uc.find(x=>x[2]==b.amount)[0])+" UC":"Raqam";
 DEMO.ords.unshift({t:k=="number"?"raqam":k,w,d:"Hozir",p:price,s:fast?"ok":"wait",id,to:fast?String(b.username||"").replace(/^@/,""):"",acc:k=="uc"?String(b.username||""):"",nick:k=="uc"?(b.nick||""):""});if(num)DEMO.num[id]=now;
@@ -1527,7 +1535,7 @@ const ago=t=>{const m=Math.max(0,Math.round((Date.now()/1e3-t)/60));return m<60?
 const ask=(m,f)=>{try{if(tg&&tg.showConfirm)return tg.showConfirm(m,o=>{if(o)f()})}catch(e){}if(confirm(m))f()};
 const RF_ASK="Pul balansga qaytariladi va raqam bekor qilinadi. Davom etamizmi?";   /* «Pulni qaytarish» tasodifan bosilmasin */
 IC.shield=sv('<path d="M12 3l7.5 3v5.5c0 4.6-3.1 8.3-7.5 9.5-4.4-1.2-7.5-4.9-7.5-9.5V6z"/><path d="M9 12l2.2 2.2L15.5 10"/>');
-const AD={tab:"ov",d:null,t:0,per:"revenue_today"},AT=[["ov","Umumiy"],["pay","To'lovlar"],["ord","Buyurtma"],["usr","Mijoz"]],
+const AD={tab:"ov",d:null,t:0,per:"revenue_today",fin:null,ap:null,fp:"today"},AT=[["ov","Umumiy"],["pay","To'lovlar"],["ord","Buyurtma"],["usr","Mijoz"]],ATO=[["fin","Moliya"],["ap","Avto-to'lov"],["svc","Xizmatlar"],["log","Jurnal"]],OWN=["fin","ap","svc","log"],AEP={fin:"/api/admin/profit",ap:"/api/admin/autopay",svc:"/api/admin/services",log:"/api/admin/log"},
 PER=[["revenue_today","Bugun","Bugungi daromad"],["revenue_week","Hafta","Haftalik daromad"],["revenue_month","Oy","Oylik daromad"],["revenue_total","Jami","Jami daromad"]];
 /* SmmUpper holati: low — balans chegaradan past; guard — avto-to'xtatish yoqiq; closed — do'kon haqiqatan yopiq (ikkalasi ham bo'lsa) */
 const admState=r=>{const lim=+r.provider_low||0,bal=r.provider,known=bal!=null,low=known&&lim>0&&bal<lim,guard=r.guard!==false;return{lim,bal,known,low,guard,closed:guard&&low,own:r.owner!==false}};
@@ -1544,19 +1552,20 @@ return admShop(r)+(pd?`<button type="button" class="ad-pend" data-go="pay"><b>${
 +(ks.length?`<section class="blk"><div class="sec"><b>Xizmatlar bo'yicha daromad</b></div><div class="pan sc"><div class="stk">${ks.map((k,i)=>`<i class="t-${k}" style="--i:${i};flex:${T[k].revenue} 1 0"></i>`).join("")}</div><div class="lgs">${ks.map(k=>`<div class="lg t-${k}"><span class="ico">${IC[k]}</span><div><b>${SV[k].n}</b><small>${Math.round(100*T[k].revenue/tot)}% · ${fmt(T[k].orders)} ta</small></div><span class="am">${fmt(T[k].revenue)} so'm</span></div>`).join("")}</div></div></section>`:"")};
 const admPay=r=>`<section class="blk" style="margin-top:0"><div class="sec"><b>Kutilayotgan to'ldirishlar</b><small>${r.pending.length} ta · ${fmt(r.pending.reduce((a,p)=>a+(+p.amount||0),0))} so'm</small></div><div class="pan">${r.pending.length?r.pending.map(p=>`<div class="apr" data-id="${p.id}" data-am="${p.amount}"><div><b>${esc(p.name)}</b><span class="amt">${fmt(p.amount)} so'm</span><small>${ago(p.created_at)} oldin</small></div><div class="apb"><button data-a="receipt">Chek</button><button class="ok" data-a="approve" aria-label="Tasdiqlash">✓</button><button class="no" data-a="reject" aria-label="Rad etish">✕</button></div></div>`).join(""):'<p class="hint" style="padding:14px 0">Tasdiq kutayotgan to\'lov yo\'q</p>'}</div><p class="hint">Oxirgi 24 soatda tasdiqlangan: ${fmt(r.topups_today)} so'm (${r.topups_today_n} ta)</p></section>`;
 const admSum=r=>{const c={};let m=0;r.recent.forEach(o=>{const k=ST[o.s]?o.s:"wait";c[k]=(c[k]||0)+1;if(k=="ok")m+=+o.p||0});return`<div class="ad-sm">${Object.keys(c).map(k=>`<span class="chip ${k}">${ST[k]} ${c[k]}</span>`).join("")}${m?`<em>${fmt(m)} so'm</em>`:""}</div>`};
-const admOrd=r=>`<section class="blk" style="margin-top:0"><div class="sec"><b>Oxirgi buyurtmalar</b><small>${r.recent.length} ta</small></div>${admSum(r)}<div class="pan">${r.recent.length?r.recent.map(o=>`<div class="ord t-${esc(o.t)}"><div class="ico">${IC[o.t]||IC.topup}</div><div><b>${esc(o.w)}</b><small>${esc(o.u)}, ${ago(o.at)} oldin</small></div><div class="r"><b>${fmt(o.p)} <span>so'm</span></b><span class="chip ${ST[o.s]?esc(o.s):"wait"}">${ST[o.s]||ST.wait}</span></div></div>`).join(""):'<p class="hint" style="padding:14px 0">Buyurtmalar yo\'q</p>'}</div></section>`;
+const admOrd=r=>`<section class="blk" style="margin-top:0"><div class="sec"><b>Oxirgi buyurtmalar</b><small>${r.recent.length} ta</small></div>${admSum(r)}<div class="pan">${r.recent.length?r.recent.map(o=>`<div class="ord t-${esc(o.t)}" data-oid="${o.id||""}" role="button" tabindex="0" style="cursor:pointer"><div class="ico">${IC[o.t]||IC.topup}</div><div><b>${esc(o.w)}</b><small>${esc(o.u)}, ${ago(o.at)} oldin</small></div><div class="r"><b>${fmt(o.p)} <span>so'm</span></b><span class="chip ${ST[o.s]?esc(o.s):"wait"}">${ST[o.s]||ST.wait}</span></div></div>`).join(""):'<p class="hint" style="padding:14px 0">Buyurtmalar yo\'q</p>'}</div></section>`;
 const admUsr=()=>`<section class="blk" style="margin-top:0"><div class="sec"><b>Foydalanuvchini topish</b></div><input class="in" id="aq" placeholder="ID yoki @username" autocomplete="off" autocapitalize="off"><button type="button" class="btn2" id="aqb">Topish</button><div id="aur"></div></section>`;
-function admDraw(){const r=AD.d,e=$("#adb");if(!r||!e)return;
-e.innerHTML=`<div class="ad-tb" role="tablist">${AT.map(x=>`<button type="button" role="tab" data-k="${x[0]}" aria-selected="${AD.tab==x[0]}"${AD.tab==x[0]?' class="on"':""}>${x[1]}${x[0]=="pay"&&r.pending.length?`<i>${r.pending.length}</i>`:""}</button>`).join("")}</div>`+({ov:admOv,pay:admPay,ord:admOrd,usr:admUsr}[AD.tab])(r);
+function admDraw(){const r=AD.d,e=$("#adb");if(!r||!e)return;if(OWN.includes(AD.tab)&&r.owner===false)AD.tab="ov";
+e.innerHTML=`<div class="ad-tb" role="tablist">${(r.owner===false?AT:AT.concat(ATO)).map(x=>`<button type="button" role="tab" data-k="${x[0]}" aria-selected="${AD.tab==x[0]}"${AD.tab==x[0]?' class="on"':""}>${x[1]}${x[0]=="pay"&&r.pending.length?`<i>${r.pending.length}</i>`:""}</button>`).join("")}</div>`+({ov:admOv,pay:admPay,ord:admOrd,usr:admUsr,fin:admFin,ap:admAp,svc:admSvc,log:admLog}[AD.tab]||admOv)(r);
 e.querySelectorAll(".ad-tb button").forEach(b=>b.onclick=()=>{if(AD.tab==b.dataset.k)return;hap();AD.tab=b.dataset.k;admDraw();window.scrollTo(0,0)});
 e.querySelectorAll("[data-go]").forEach(b=>b.onclick=()=>{hap();AD.tab=b.dataset.go;admDraw();window.scrollTo(0,0)});
 e.querySelectorAll("[data-p]").forEach(b=>b.onclick=()=>{const k=b.dataset.p;if(k==AD.per)return;hap();const o=AD.d[AD.per];AD.per=k;
 e.querySelectorAll("[data-p]").forEach(x=>x.setAttribute("aria-pressed",String(x.dataset.p==k)));$("#arl").textContent=PER.find(x=>x[0]==k)[2];countTo($("#arv"),o,AD.d[k],500)});
 const ag=$("#ag");if(ag)ag.onclick=()=>admGuard();
 e.querySelectorAll(".apr button").forEach(b=>b.onclick=()=>{const w=b.closest(".apr"),a=b.dataset.a,id=w.dataset.id;hap();
-if(a=="receipt")return call("/api/admin/receipt",{body:{id}}).then(()=>toast("Chek botga yuborildi"),x=>toast(x.message));
+if(a=="receipt")return admReceipt(id,+w.dataset.am,w.querySelector("b").textContent);
 ask((a=="approve"?"Tasdiqlansinmi: ":"Rad etilsinmi: ")+fmt(w.dataset.am)+" so'm?",async()=>{try{await call("/api/admin/topup",{body:{id,action:a}});toast(a=="approve"?"Tasdiqlandi":"Rad etildi")}catch(x){toast(x.message)}admLoad()})});
-const q=$("#aqb");if(q){q.onclick=admFind;$("#aq").onkeydown=ev=>{if(ev.key=="Enter")admFind()}}}
+e.querySelectorAll("[data-oid]").forEach(b=>{if(b.dataset.oid)b.onclick=()=>{hap();admOrder(b.dataset.oid)}});
+admBind(e);const q=$("#aqb");if(q){q.onclick=admFind;$("#aq").onkeydown=ev=>{if(ev.key=="Enter")admFind()}}}
 /* SmmUpper avto-to'xtatishni yoqish/o'chirish (server: /api/admin/shop). Do'kon holatini o'zgartiradigan bo'lsa — avval so'raydi. */
 function admGuard(){const r=AD.d,btn=$("#ag");if(!r||!btn||btn.disabled)return;const s=admState(r),want=!s.guard;hap();
 const run=async()=>{btn.disabled=true;try{const x=await call("/api/admin/shop",{body:{guard:want}});AD.d.guard=x.guard;AD.d.shop_open=x.shop_open;
@@ -1567,7 +1576,7 @@ if(want&&s.low)return ask("Balans chegaradan past — avto-to'xtatish yoqilsa, d
 run()}
 async function admLoad(){const rb=$("#ar"),bk=$("#ab");if(bk)bk.onclick=()=>{hap();go("me")};if(rb)rb.onclick=()=>{hap();admLoad()};if(AD.d)admDraw();
 if(rb)rb.classList.add("ld");
-try{AD.d=await call("/api/admin/stats");AD.t=Date.now();if(tab=="admin")admDraw()}
+try{AD.d=await call("/api/admin/stats");AD.t=Date.now();if(tab=="admin")admDraw();if(tab=="admin"&&OWN.includes(AD.tab))admTabLoad(true)}
 catch(x){if(gateErr(x))return;const e=$("#adb");if(e&&!AD.d)e.innerHTML=`<p class="hint err">${esc(x.message)}</p>`;else toast(x.message)}
 finally{const b=$("#ar");if(b)b.classList.remove("ld")}}
 /* Profil sahifasidagi "Admin paneli" kartasi: do'kon holati va kutilayotgan to'lovlar soni (so'rov 20 soniya keshlanadi) */
@@ -1575,6 +1584,21 @@ async function admPeek(){try{if(!AD.d||Date.now()-AD.t>20000){AD.d=await call("/
 if(tab!="me")return;const r=AD.d,s=admState(r),n=r.pending.length,sub=$("#adsub"),dt=$("#addot");
 if(sub)sub.textContent=(s.closed?"Do'kon yopiq":"Do'kon ochiq")+(n?", "+n+" ta to'lov kutmoqda":"");
 if(dt){dt.hidden=!(s.closed||n);dt.className="ad-dot"+(s.closed?" bad":"")}}catch(e){}}
+/* Buyurtma tafsiloti (admin): ustiga bosilganda — to'liq ma'lumot va "Pulni qaytarish" (faqat asosiy admin) */
+async function admOrder(id){let o;try{o=await call("/api/admin/order",{body:{id:+id}})}catch(x){if(gateErr(x))return;return toast(x.message)}
+const old=$("#aod");if(old)old.remove();const w=document.createElement("div");w.id="aod";
+w.style.cssText="position:fixed;inset:0;z-index:99;display:flex;align-items:flex-end;justify-content:center;background:rgba(0,0,0,.55)";
+const kv=(a,b)=>b===""||b==null?"":`<div class="kv"><span>${a}</span><b style="overflow-wrap:anywhere;text-align:right">${b}</b></div>`;
+const ex=Object.entries(o.extra||{}).map(([k,v])=>kv(esc(k),esc(v))).join("");
+const own=AD.d&&AD.d.owner!==false;
+w.innerHTML=`<div class="ad-u" style="width:100%;max-width:520px;margin:0;border-radius:24px 24px 0 0;max-height:85vh;overflow:auto"><h3>${esc(o.w)} #${o.id}</h3><small class="mut">${esc(ST[o.s]||ST.wait)}, ${ago(o.at)} oldin</small>`
++kv("Mijoz",esc(o.name||"—")+(o.username?" @"+esc(o.username):"")+" · "+o.uid)+kv("Narx",fmt(o.p)+" so'm")+(o.cost==null?"":kv("Tannarx",fmt(o.cost)+" so'm")+kv("Foyda",fmt(o.p-o.cost)+" so'm"))
++kv("Davlat",esc(o.country))+kv("Qabul qiluvchi",o.to?"@"+esc(o.to):"")+kv("Miqdor",esc(o.qty))+kv("SmmUpper ID",esc(o.ref))+ex
++(o.can&&own?'<button type="button" class="btn2" id="aor" style="margin-top:12px">Pulni qaytarish</button>':"")
++'<button type="button" class="btn2" id="aox" style="margin-top:8px">Yopish</button></div>';
+document.body.appendChild(w);const cl=()=>w.remove();$("#aox").onclick=()=>{hap();cl()};w.onclick=ev=>{if(ev.target===w)cl()};
+const rb=$("#aor");if(rb)rb.onclick=()=>{hap();ask(fmt(o.p)+" so'm mijoz balansiga qaytarilsinmi?",async()=>{rb.disabled=true;
+try{const r=await call("/api/admin/order/refund",{body:{id:o.id}});toast(fmt(r.amount)+" so'm qaytarildi");cl();admLoad()}catch(x){rb.disabled=false;if(gateErr(x))return;toast(x.message)}})}}
 async function admFind(){const q=$("#aq").value.trim(),o=$("#aur");if(!q)return;
 try{const u=await call("/api/admin/user",{body:{q}});
 o.innerHTML=`<div class="ad-u"><h3>${esc(u.name||"Foydalanuvchi")}${u.banned?'<span class="ban">bloklangan</span>':""}</h3><small class="mut">${u.username?"@"+esc(u.username)+", ":""}ID ${u.id}</small><div class="kv"><span>Balans</span><b id="abl">${fmt(u.balance)} so'm</b></div><div class="kv"><span>Buyurtmalar</span><b>${u.orders} ta</b></div><div class="kv"><span>Xarajat</span><b>${fmt(u.spent)} so'm</b></div><input class="in" id="aa" inputmode="numeric" placeholder="Summa" autocomplete="off" style="margin-top:10px"><div class="row two" style="margin-top:8px"><button type="button" class="btn2" data-s="1">Qo'shish</button><button type="button" class="btn2 dng" data-s="-1">Ayirish</button></div><button type="button" class="btn2${u.banned?"":" dng"}" id="abn" style="margin-top:8px;width:100%">${u.banned?"Blokdan chiqarish":"Bloklash"}</button></div>`;
@@ -1583,6 +1607,73 @@ const bn=$("#abn");bn.onclick=()=>{hap();ask(u.banned?"Blokdan chiqarilsinmi?":"
 o.querySelectorAll("[data-s]").forEach(b=>b.onclick=()=>{const v=+aa.value,sg=+b.dataset.s;if(!v)return toast("Summani kiriting");hap();
 ask(fmt(v)+" so'm "+(sg>0?"qo'shilsinmi?":"ayirilsinmi?"),async()=>{try{const r=await call("/api/admin/balance",{body:{id:u.id,amount:sg*v}});$("#abl").textContent=fmt(r.balance)+" so'm";aa.value="";toast("Bajarildi")}catch(x){toast(x.message)}})})}
 catch(x){if(gateErr(x))return;o.innerHTML="";toast(x.message)}}
+/* ===== Admin: Moliya (sof foyda), Avto-to'lov boshqaruvi, chek oynasi, Excel hisobot (faqat asosiy admin) ===== */
+const FP=[["today","Bugun"],["week","Hafta"],["month","Oy"],["total","Jami"]],TK=t=>t=="number"?"raqam":t,sgn=n=>(n<0?"−":"")+fmt(Math.abs(n)),
+APS={paid:["ok","To'langan"],pending:["wait","Kutilmoqda"],expired:["bad","Muddati o'tgan"],cancelled:["ref","Bekor"]};
+const admLoading=k=>AD[k+"E"]?`<p class="hint err">${esc(AD[k+"E"])} Yangilash tugmasini bosing.</p>`:'<p class="hint">Yuklanmoqda…</p>';
+const admFin=r=>{const F=AD.fin;if(!F)return admLoading("fin");const k=F[AD.fp]?AD.fp:"today",d=F[k],pl=FP.find(x=>x[0]==k)[1],
+kv=(l,v,c)=>`<div class="kv"><span>${l}</span><b${c?` class="${c}"`:""}>${v}</b></div>`,
+ks=Object.keys(d.by_type||{}).filter(t=>SV[TK(t)]).sort((a,b)=>d.by_type[b].profit-d.by_type[a].profit);
+return`<section class="hh ad-rev"><span class="hhi">${IC.topup}</span><div class="ad-pr">${FP.map(x=>`<button type="button" data-fp="${x[0]}" aria-pressed="${x[0]==k}">${x[1]}</button>`).join("")}</div><small>Sof foyda · ${pl}</small><div class="ad-big"><span>${sgn(d.profit)}</span> <em>so'm</em></div><div class="ad-hm"><div><small>Marja</small><b>${d.margin}%</b></div><div><small>Buyurtma</small><b>${fmt(d.orders-d.no_cost)}</b></div><div><small>Keshbek</small><b>${fmt(d.referral)}</b></div></div></section>`
++`<section class="blk"><div class="sec"><b>Hisob-kitob</b><small>${pl}</small></div><div class="pan">${kv("Tushum",fmt(d.revenue)+" so'm")}${kv("SmmUpper xarajati","− "+fmt(d.cost)+" so'm")}${kv("Referal keshbek","− "+fmt(d.referral)+" so'm")}${kv("Sof foyda",sgn(d.profit)+" so'm",d.profit<0?"fn-bad":"fn-ok")}</div>${d.no_cost?`<p class="hint">${fmt(d.no_cost)} ta buyurtmada (${fmt(d.rev_no_cost)} so'm) tannarx yozilmagan, shuning uchun foydaga kiritilmagan. Bular tannarx hisobi qo'shilishidan oldingi buyurtmalar; yangilari avtomatik hisoblanadi.</p>`:""}</section>`
++(ks.length?`<section class="blk"><div class="sec"><b>Xizmatlar bo'yicha foyda</b><small>${pl}</small></div><div class="pan sc"><div class="lgs">${ks.map(t=>{const q=TK(t),x=d.by_type[t];return`<div class="lg t-${q}"><span class="ico">${IC[q]}</span><div><b>${SV[q].n}</b><small>${fmt(x.orders)} ta</small></div><span class="am">${sgn(x.profit)} so'm</span></div>`}).join("")}</div></div></section>`:"")
++`<section class="blk"><div class="sec"><b>Excel hisobot</b><small>.xlsx</small></div><div class="row two">${[["users","Mijozlar"],["orders","Buyurtmalar"],["topups","Chek to'lovlari"],["payments","Avto-to'lovlar"]].map(x=>`<button type="button" class="btn2 ghost" data-x="${x[0]}">${x[1]}</button>`).join("")}</div><p class="hint">Fayl bot chatiga yuboriladi (oxirgi 50 000 tagacha qator).</p></section>`};
+const admAp=r=>{const A=AD.ap;if(!A)return admLoading("ap");
+const st=!A.enabled?"warn":A.state=="connected"?"on":A.state=="error"?"off":"warn",
+msg=A.error||(A.ready?"Foydalanuvchilarga avto-to'lov ko'rsatiladi.":"Hozir foydalanuvchilarga chek yuborish usuli ko'rsatiladi. Avto-to'lov uchun: yoqilgan + userbot ulangan + kamida 1 ta faol karta kerak."),
+T=(l,v,t,c)=>`<div class="ad-t${c?" "+c:""}"><small>${l}</small><b>${v}</b><span>${t}</span></div>`;
+return`<section class="ad-shop ${st}"><div class="ad-sh"><span class="ad-orb" aria-hidden="true"><i></i></span><div><b>${A.enabled?"Avto-to'lov yoqilgan":"Avto-to'lov o'chirilgan"}</b><small>Userbot: ${esc(A.state_label)}</small></div><div class="ad-bl"><b>${fmt(A.today.count)}</b> <small>ta / 24 soat</small></div></div><p class="ad-msg" role="status">${esc(msg)}</p><button type="button" class="ad-sw" id="apt" role="switch" aria-checked="${A.enabled}"><span class="lk">Avto-to'lov<small>${A.enabled?"Yoqiq: karta orqali to'lov avtomatik aniqlanadi":"O'chiq: faqat chek yuborish usuli ishlaydi"}</small></span><span class="sw2"><i></i></span></button></section>`
++`<div class="ad-g">${T("24 soat",fmt(A.today.sum),"so'm, "+A.today.count+" ta")}${T("Kutilmoqda",fmt(A.today.pending),"ta to'lov",A.today.pending?"wn":"")}${T("Oxirgi kirim",A.last_event_min==null?"—":fmt(A.last_event_min),A.last_event_min==null?"hali yo'q":"daqiqa oldin")}${T("To'lov muddati",A.ttl+" daqiqa","foydalanuvchi to'lashi uchun","w3")}</div>`
++(A.late.length?`<section class="blk"><div class="sec"><b>Kechikkan to'lovlar</b><small>${A.late.length} ta</small></div><div class="pan">${A.late.map(p=>`<div class="apx"><div><b>${esc(p.name)}</b><span class="amt">${fmt(p.amount)} so'm</span><small>so'rov #${p.id}, ${ago(p.at)} oldin</small></div><div class="apb"><button type="button" class="ok" data-fo="${p.id}" data-am="${p.amount}" data-nm="${esc(p.name)}">Balansga o'tkazish</button></div></div>`).join("")}</div><p class="hint">Muddati o'tgan yoki boshqa kartaga tushgan to'lov. Pul haqiqatan hisobingizga tushgan bo'lsagina o'tkazing.</p></section>`:"")
++`<section class="blk"><div class="sec"><b>Kartalar</b><small>${A.cards.length}/${A.max_cards}</small></div><div class="pan">${A.cards.length?A.cards.map(c=>`<div class="apx"><div><b>${esc(c.num)}</b><small>${esc(c.holder||"Egasi ko'rsatilmagan")}, ${c.active?"faol":"o'chirilgan"}</small></div><div class="apb"><button type="button" data-ct="${c.id}">${c.active?"To'xtatish":"Yoqish"}</button><button type="button" class="no" data-cd="${c.id}" data-l4="${esc(c.last4)}" aria-label="Kartani o'chirish">✕</button></div></div>`).join(""):'<p class="hint" style="padding:14px 0">Karta qo\'shilmagan</p>'}</div>${A.cards.length<A.max_cards?`<input class="in" id="acn" inputmode="numeric" placeholder="Karta raqami (16 ta raqam)" autocomplete="off" style="margin-top:12px"><input class="in" id="ach" placeholder="Karta egasi (ixtiyoriy)" autocomplete="off" maxlength="60" style="margin-top:8px"><button type="button" class="btn2" id="aca" style="margin-top:8px">Karta qo'shish</button>`:""}<p class="hint">Karta @HUMOcardbot yoki @CardXabarBot ga (userbot akkauntida) ulangan bo'lishi kerak, aks holda to'lov avtomatik aniqlanmaydi. Foydalanuvchilarga shu raqam ko'rsatiladi, shuning uchun diqqat bilan kiriting.</p></section>`
++(A.recent.length?`<section class="blk"><div class="sec"><b>So'nggi avto-to'lovlar</b></div><div class="pan">${A.recent.map(p=>{const s=APS[p.status]||APS.pending;return`<div class="kv"><span>${esc(p.name)}<br><small class="mut">${ago(p.at)} oldin</small></span><b>${fmt(p.amount)} so'm <span class="chip ${s[0]}">${s[1]}</span></b></div>`}).join("")}</div></section>`:"")};
+/* Xizmatlar (yoqish/o'chirish + ustama) va Admin jurnali — faqat asosiy admin */
+const admSvc=r=>{const S=AD.svc;if(!S)return admLoading("svc");
+return`<section class="blk" style="margin-top:0"><div class="sec"><b>Xizmatlar</b><small>${S.items.filter(x=>x.on).length}/${S.items.length} ta yoqiq</small></div>`
++S.items.map(x=>`<div class="pan" style="margin-top:10px;padding-bottom:14px"><button type="button" class="ad-sw" data-xs="${esc(x.k)}" role="switch" aria-checked="${x.on}" style="margin-top:10px"><span class="lk">${esc(x.name)}<small>${x.on?"Yoqiq: sotuvda":"O'chiq: xarid qilib bo'lmaydi"}</small></span><span class="sw2"><i></i></span></button><div style="display:flex;align-items:center;gap:8px;margin-top:10px"><input class="in" type="text" inputmode="decimal" data-xm="${esc(x.k)}" value="${esc(String(x.markup))}" maxlength="7" aria-label="${esc(x.name)} ustamasi, foizda"><b>%</b><button type="button" class="btn2 ghost" data-xv="${esc(x.k)}" style="width:auto;flex:none;margin-top:0;height:48px;padding:0 18px">Saqlash</button></div><p class="hint" style="text-align:left;margin-top:6px">${x.own?"Ustama: shu xizmat uchun alohida":"Ustama: umumiy ("+esc(String(S.general))+"%)"}</p></div>`).join("")
++`<p class="hint">O'chirilgan xizmat Mini App va botda sotilmaydi, qolganlari ishlayveradi. Ustama SmmUpper narxiga qo'shiladi va yangi narx darrov kuchga kiradi.</p></section>`};
+const LGA={topup_approve:"To'lov tasdiqlandi",topup_reject:"To'lov rad etildi",topup_amount_edit:"To'lov summasi o'zgartirildi",balance_change:"Balans o'zgartirildi",balance_adjust:"Balans o'zgartirildi",ban:"Bloklash / blokdan chiqarish",shop_guard:"SmmUpper himoyasi",autopay_toggle:"Avto-to'lov yoqildi/o'chirildi",autopay_force:"Kechikkan to'lov o'tkazildi",autopay_card_add:"Karta qo'shildi",card_change:"Karta o'zgartirildi",export:"Hisobot yuklandi",apikey_change:"API kalit o'zgartirildi",admin_add:"Admin qo'shildi",admin_remove:"Admin olib tashlandi",service_set:"Xizmat sozlamasi",welcome_photo:"Salomlashuv rasmi",support_contact:"Yordam kontakti",news_url:"Yangiliklar havolasi"};
+const admLog=r=>{const L=AD.log;if(!L)return admLoading("log");
+return`<section class="blk" style="margin-top:0"><div class="sec"><b>Admin amallari jurnali</b><small>${L.items.length} ta</small></div><div class="pan">${L.items.length?L.items.map(x=>`<div class="kv"><span>${esc(x.an)}<br><small class="mut">${esc(LGA[x.act]||x.act)}${x.tn?" → "+esc(x.tn):""}${x.note?", "+esc(x.note):""}</small></span><b>${x.am==null?"":fmt(x.am)+" so'm<br>"}<small class="mut">${ago(x.at)} oldin</small></b></div>`).join(""):'<p class="hint" style="padding:14px 0">Jurnal bo\'sh</p>'}</div></section>`};
+/* Moliya / Avto-to'lov ma'lumotini kerak bo'lganda yuklaydi (xato bo'lsa — takror-takror urinmaydi, "Yangilash" tugmasi qayta uradi) */
+async function admTabLoad(force){const k=AD.tab;if(!OWN.includes(k)||AD[k+"L"])return;if(force)AD[k+"E"]=0;if(!force&&AD[k]&&Date.now()-(AD[k+"t"]||0)<15000)return;AD[k+"L"]=1;
+try{AD[k]=await call(AEP[k]);AD[k+"t"]=Date.now();AD[k+"E"]=0}catch(x){if(gateErr(x)){AD[k+"L"]=0;return}AD[k+"E"]=x.message||"Xatolik yuz berdi."}
+AD[k+"L"]=0;if(tab=="admin"&&AD.tab==k)admDraw()}
+function admBind(e){const bar=e.querySelector(".ad-tb"),on=bar&&bar.querySelector(".on");if(on)bar.scrollLeft=on.offsetLeft-(bar.clientWidth-on.offsetWidth)/2;
+if(OWN.includes(AD.tab)&&!AD[AD.tab]&&!AD[AD.tab+"E"])admTabLoad();
+e.querySelectorAll("[data-fp]").forEach(b=>b.onclick=()=>{const k=b.dataset.fp;if(k==AD.fp)return;hap();AD.fp=k;admDraw()});
+e.querySelectorAll("[data-x]").forEach(b=>b.onclick=()=>admExport(b));
+e.querySelectorAll("[data-xs]").forEach(b=>b.onclick=()=>{hap();const k=b.dataset.xs,on=b.getAttribute("aria-checked")!="true",run=async()=>{b.disabled=true;try{AD.svc=await call("/api/admin/services",{body:{k,on}});AD.svct=Date.now();toast(on?"Xizmat yoqildi":"Xizmat o'chirildi")}catch(x){if(gateErr(x))return;toast(x.message)}admDraw()};on?run():ask("Xizmat o'chirilsinmi? Foydalanuvchilar uni xarid qila olmaydi (qolgan xizmatlar ishlayveradi).",run)});
+e.querySelectorAll("[data-xv]").forEach(b=>b.onclick=()=>{hap();const k=b.dataset.xv,i=e.querySelector('[data-xm="'+k+'"]'),v=i.value.trim().replace(",",".");if(v===""||isNaN(+v)||+v<0||+v>1000)return toast("Ustamani 0 dan 1000 gacha raqam bilan kiriting (masalan: 12.5)");ask("Ustama "+(+v)+"% qilib saqlansinmi?",async()=>{b.disabled=true;try{AD.svc=await call("/api/admin/services",{body:{k,markup:+v}});AD.svct=Date.now();toast("Saqlandi")}catch(x){if(gateErr(x))return;toast(x.message)}admDraw()})});
+const t=$("#apt");if(t)t.onclick=()=>{hap();const on=!AD.ap.enabled,run=async()=>{t.disabled=true;try{await call("/api/admin/autopay/toggle",{body:{on}});toast(on?"Avto-to'lov yoqildi":"Avto-to'lov o'chirildi")}catch(x){if(gateErr(x))return;toast(x.message)}admTabLoad(true)};on?run():ask("Avto-to'lov o'chirilsinmi? Foydalanuvchilarga faqat chek yuborish usuli ko'rsatiladi.",run)};
+e.querySelectorAll("[data-ct]").forEach(b=>b.onclick=()=>{hap();admCard({action:"toggle",id:+b.dataset.ct})});
+e.querySelectorAll("[data-cd]").forEach(b=>b.onclick=()=>{hap();ask("…"+b.dataset.l4+" kartasi o'chirilsinmi?",()=>admCard({action:"delete",id:+b.dataset.cd}))});
+const n=$("#acn");if(n){n.oninput=()=>{const d=n.value.replace(/\D/g,"").slice(0,16);n.value=d.replace(/(\d{4})(?=\d)/g,"$1 ")};
+$("#aca").onclick=()=>{const num=n.value.replace(/\D/g,"");if(num.length!=16)return toast("Karta raqami 16 ta raqam bo'lishi kerak");hap();ask("Karta qo'shilsinmi: …"+num.slice(-4)+"? Foydalanuvchilarga shu karta ko'rsatiladi.",()=>admCard({action:"add",number:num,holder:$("#ach").value.trim()}))}}
+e.querySelectorAll("[data-fo]").forEach(b=>b.onclick=()=>{hap();ask(fmt(+b.dataset.am)+" so'm "+b.dataset.nm+" balansiga o'tkazilsinmi?",async()=>{try{await call("/api/admin/autopay/force",{body:{id:+b.dataset.fo}});toast("Balansga o'tkazildi")}catch(x){if(gateErr(x))return;toast(x.message)}admTabLoad(true)})})}
+async function admCard(body,force){try{await call("/api/admin/autopay/card",{body:force?Object.assign({},body,{force:true}):body});toast(body.action=="add"?"Karta qo'shildi":body.action=="delete"?"Karta o'chirildi":"Saqlandi")}
+catch(x){if(gateErr(x))return;if(x.code=="luhn"&&!force)return ask("Karta raqami tekshiruvdan o'tmadi, xato terilgan bo'lishi mumkin. Aniq to'g'ri bo'lsa, davom eting. Qo'shilsinmi?",()=>admCard(body,true));toast(x.message)}admTabLoad(true)}
+async function admExport(b){if(b.disabled)return;hap();const l=b.textContent;b.disabled=true;b.textContent="Tayyorlanmoqda…";
+try{const x=await call("/api/admin/export",{body:{kind:b.dataset.x},timeout:60000});toast("Fayl botga yuborildi ("+fmt(x.rows)+" qator)")}catch(x){if(!gateErr(x))toast(x.message)}
+b.disabled=false;b.textContent=l}
+/* Chek oynasi: rasm Mini App ichida (bosilsa kattalashadi), summani to'g'rilab tasdiqlash (faqat asosiy admin) */
+function rcZoom(u){const z=document.createElement("div");z.className="rcz";z.innerHTML=`<div class="rcs"><img src="${u}" alt="Chek rasmi"></div><button type="button" class="rcx" aria-label="Yopish">✕</button><span class="rch">Kattalashtirish uchun rasmga bosing</span>`;
+document.body.appendChild(z);const s=z.querySelector(".rcs");z.querySelector("img").onclick=()=>s.classList.toggle("z");z.querySelector(".rcx").onclick=()=>z.remove()}
+async function admReceipt(id,am,nm){hap();if(AD.rcu){URL.revokeObjectURL(AD.rcu);AD.rcu=null}
+const own=!(AD.d&&AD.d.owner===false),s=$("#sh");s.className="sh t-topup";
+s.innerHTML=`<div class="grab"></div><div class="hd"><div class="ico">${IC.topup}</div><h2>Chek #${esc(id)}</h2></div><div class="rci" id="rci"><span class="rcl">Chek yuklanmoqda…</span></div><section class="pan" style="margin-top:12px"><div class="kv"><span>Mijoz</span><b>${esc(nm)}</b></div><div class="kv"><span>Mijoz yozgan summa</span><b>${fmt(am)} so'm</b></div></section>${own?`<label for="rca">Tasdiqlanadigan summa (so'm)</label><input class="in" id="rca" inputmode="numeric" autocomplete="off" value="${am}"><p class="hint">Mijoz summani xato yozgan bo'lsa, chekdagi haqiqiy summani kiriting.</p>`:""}<div class="row two" style="margin-top:12px"><button type="button" class="btn2" id="rcok">Tasdiqlash</button><button type="button" class="btn2 dng" id="rcno">Rad etish</button></div><button type="button" class="btn2 ghost" id="rcb">Botga yuborish</button><button type="button" class="btn2 ghost" id="rcc">Yopish</button>`;
+const close=()=>{if(AD.rcu){URL.revokeObjectURL(AD.rcu);AD.rcu=null}show(false)},ra=$("#rca");
+if(ra)ra.oninput=()=>{ra.value=ra.value.replace(/\D/g,"").slice(0,9)};
+$("#rcc").onclick=close;
+$("#rcb").onclick=()=>{hap();call("/api/admin/receipt",{body:{id:+id}}).then(()=>toast("Chek botga yuborildi"),x=>toast(x.message))};
+$("#rcok").onclick=()=>{let v=am;if(own){v=+String(ra.value).replace(/\D/g,"");if(!v)return toast("Summani kiriting")}hap();
+ask((v!=am?"Summa "+fmt(am)+" dan "+fmt(v)+" so'mga o'zgartirilib, ":"")+"tasdiqlansinmi: "+fmt(v)+" so'm?",async()=>{try{await call("/api/admin/topup",{body:{id:+id,action:"approve",amount:own&&v!=am?v:undefined}});toast("Tasdiqlandi");close()}catch(x){if(gateErr(x))return;toast(x.message)}admLoad()})};
+$("#rcno").onclick=()=>{hap();ask("Rad etilsinmi: "+fmt(am)+" so'm?",async()=>{try{await call("/api/admin/topup",{body:{id:+id,action:"reject"}});toast("Rad etildi");close()}catch(x){if(gateErr(x))return;toast(x.message)}admLoad()})};
+show(true);
+try{const r=await fetch(BASE+"/api/admin/receipt/image",{method:"POST",headers:{"X-Init-Data":INIT,"Content-Type":"application/json"},body:JSON.stringify({id:+id}),cache:"no-store"});
+if(!r.ok){let m="Chek rasmi ochilmadi.";try{m=(await r.json()).message||m}catch(e){}throw new Error(m)}
+const u=URL.createObjectURL(await r.blob()),bx=$("#rci");if(!bx||!$("#rcok")){URL.revokeObjectURL(u);return}AD.rcu=u;bx.innerHTML=`<img src="${u}" alt="Chek rasmi">`;bx.querySelector("img").onclick=()=>rcZoom(u)}
+catch(e){const bx=$("#rci");if(bx)bx.innerHTML=`<span class="rcl">${esc(e.message||"Chek rasmi ochilmadi.")}<br>«Botga yuborish» tugmasi chekni bot chatiga yuboradi.</span>`}}
 function home(){go("home")}
 function show(v){if(!v&&BUSY){toast("Xarid bajarilmoqda — biroz kuting…");return}if(!v)tpStop();if(v)[...$("#sh").children].forEach((c,i)=>c.style.setProperty("--k",i));$("#ov").classList.toggle("on",v);$("#sh").classList.toggle("on",v)}
 $("#ov").onclick=()=>show(false);
@@ -1595,9 +1686,10 @@ const UK=t=>t=="uc"?"nb_uc":"nb_un";
 const getUn=t=>{try{const a=JSON.parse(localStorage.getItem(UK(t))||"[]");return Array.isArray(a)?a.filter(x=>typeof x=="string").slice(0,6):[]}catch(e){return[]}};
 const saveUn=(t,u)=>{if(!u||t=="raqam")return;try{localStorage.setItem(UK(t),JSON.stringify([u,...getUn(t).filter(x=>x!=u)].slice(0,6)))}catch(e){}};
 const chipsHTML=t=>{const a=getUn(t);return a.length?`<div class="uch">${a.map(x=>`<button type="button" class="uchip" data-v="${esc(x)}">${t=="uc"?"":"@"}${esc(x)}</button>`).join("")}</div>`:""};
-async function openSheet(t,nk){if(ME&&ME.shop_open===false)return toast("Xizmat vaqtincha mavjud emas. Birozdan keyin qayta urinib ko'ring yoki admin bilan bog'laning");
-try{const r=await call("/api/prices?"+(t=="raqam"&&nk?"server="+nk+"&":"")+"k="+(t=="raqam"?"number":t));
-if(r.countries){if(!r.countries.length)return toast(nk?"Server "+nk+" da hozircha davlatlar yo'q":"Hozircha davlatlar mavjud emas");NK=r.server||nk||1;P.cty=r.countries.map(c=>[c.f||"🌐",c.n,c.p,c.c]).sort((x,y)=>x[2]-y[2]||String(x[1]).localeCompare(String(y[1])))}
+async function openSheet(t){if(ME&&ME.shop_open===false)return toast("Xizmat vaqtincha mavjud emas. Birozdan keyin qayta urinib ko'ring yoki admin bilan bog'laning");
+if(ME&&Array.isArray(ME.svc_off)&&ME.svc_off.includes(t=="raqam"?"number":t))return toast("Bu xizmat vaqtincha o'chirilgan. Birozdan keyin qayta urinib ko'ring.");
+try{const r=await call("/api/prices?k="+(t=="raqam"?"number":t));
+if(r.countries){if(!r.countries.length)return toast("Hozircha davlatlar mavjud emas");NK=r.server||1;P.cty=r.countries.map(c=>[c.f||"🌐",c.n,c.p,c.c]).sort((x,y)=>x[2]-y[2]||String(x[1]).localeCompare(String(y[1])))}
 else if(r.uc){if(!r.uc.length)return toast("Hozircha UC tariflari yo'q");P.uc=r.uc.map(x=>[x.uc,x.p,x.id])}
 else{P.star=r.star;P.prem={3:r.premium["3"],6:r.premium["6"],12:r.premium["12"]}}}catch(e){if(gateErr(e))return;return toast(e.message)}
 cur={t,u:"",a:null};const s=$("#sh");s.className="sh buy nofoot t-"+t;const h=SV[t];
@@ -1608,11 +1700,10 @@ if(h.u&&t!="uc")b+=chipsHTML(t);
 if(t=="stars")b+=`<label>Miqdor (eng kami 50)</label><div class="row">${[50,100,250,500,1000,2500].map(n=>`<button class="opt" data-a="${n}"><b>${fmt(n)}</b><small>${fmt(n*P.star)} so'm</small></button>`).join("")}</div><input class="in" id="n" inputmode="numeric" placeholder="Boshqa miqdor" style="margin-top:8px">`;
 if(t=="premium"){const pm=[3,6,12],pp=pm.map(m=>(P.prem[m]||0)/m),bi=pp.indexOf(Math.min(...pp)),sv=pp[0]>0?Math.round(100*(1-pp[bi]/pp[0])):0;
 b+=`<label>Muddat</label><div class="row">${pm.map((m,i)=>`<button class="opt mo" data-a="${m}">${i==bi&&bi>0&&sv>=1?`<i class="bdg">-${sv}%</i>`:""}<b>${m} oy</b><small>${fmt(P.prem[m])} so'm</small></button>`).join("")}</div>`}
-if(t=="uc")b+=`<label>PUBG Mobile ID</label><div class="ig" style="--pl:44px"><i>ID</i><input class="in" id="u" inputmode="numeric" placeholder="5123456789" autocomplete="off"></div>${chipsHTML("uc")}<label>PUBG nik (username)</label><input class="in" id="un" placeholder="Akkauntdagi nik" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="32"><button type="button" class="btn2 ghost ckb" id="ck" disabled>Akkauntni tekshirish</button><div class="ckr" id="ckr" role="status" aria-live="polite"></div><label>Tarif</label><div class="row two">${P.uc.map(x=>`<button class="opt uc" data-a="${x[0]}"><b>${fmt(x[0])} <span>UC</span></b><small>${fmt(x[1])} so'm</small></button>`).join("")}</div>`;
-if(t=="raqam")b+=`<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px">${[1,2,3].map(n=>`<button type="button" class="btn2${NK==n?"":" ghost"}" data-nk="${n}">Server ${n}</button>`).join("")}</div><label>Davlat — arzonidan boshlab</label><div class="row two">${P.cty.map((c,i)=>`<button class="opt cty" data-a="${i}"><span class="fl">${c[0]}</span><span class="cn"><b>${esc(c[1])}</b><small>${fmt(c[2])} so'm${P.cty.length>5&&i<5?"<em>Arzon</em>":""}</small></span></button>`).join("")}</div>`;
+if(t=="uc")b+=`<label>PUBG Mobile ID</label><div class="ig" style="--pl:44px"><i>ID</i><input class="in" id="u" inputmode="numeric" placeholder="5123456789" autocomplete="off"></div>${chipsHTML("uc")}<label>Tarif</label><div class="row two">${P.uc.map(x=>`<button class="opt uc" data-a="${x[0]}"><b>${fmt(x[0])} <span>UC</span></b><small>${fmt(x[1])} so'm</small></button>`).join("")}</div>`;
+if(t=="raqam")b+=`<label>Davlat — arzonidan boshlab</label><div class="row two">${P.cty.map((c,i)=>`<button class="opt cty" data-a="${i}"><span class="fl">${c[0]}</span><span class="cn"><b>${esc(c[1])}</b><small>${fmt(c[2])} so'm${P.cty.length>5&&i<5?"<em>Arzon</em>":""}</small></span></button>`).join("")}</div>`;
 b+=`</div><div class="sfoot" hidden><button type="button" class="hold" id="hold" aria-describedby="hint"><i></i><span id="hl"></span><b class="hp" id="hp"></b></button><p class="hint" id="hint"></p></div>`;
 s.innerHTML=b;show(true);bindSheet();
-s.querySelectorAll("[data-nk]").forEach(x=>x.onclick=()=>{if(+x.dataset.nk==NK)return;hap();openSheet("raqam",+x.dataset.nk)});
 s.querySelectorAll(".uchip").forEach(c=>c.onclick=()=>{hap();const u=$("#u");if(u){u.value=c.dataset.v;u.dispatchEvent(new Event("input"))}});
 }
 const price=()=>{const{t,a}=cur;if(a==null)return 0;return t=="stars"?Math.round(a*P.star):t=="premium"?P.prem[a]:t=="uc"?P.uc.find(x=>x[0]==a)[1]:P.cty[a][2]};
@@ -1620,7 +1711,7 @@ const idok=()=>{const{t,a,u}=cur;return t=="raqam"?a!=null:t=="uc"?/^\d{6,12}$/.
 function err(){const{t,a,u}=cur;
 if(a==null||(t=="stars"&&(a<50||a>1000000)))return t=="stars"&&a!=null?(a<50?"Eng kami 50 ta":"Eng ko'pi 1 000 000 ta"):(t=="raqam"?"Davlatni tanlang":t=="uc"?"Tarifni tanlang":t=="premium"?"Muddatni tanlang":"Miqdorni tanlang");
 if(SV[t].u&&!/^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(u)&&t!="uc")return "Username kiriting";
-if(t=="uc"&&!/^\d{6,12}$/.test(u))return "PUBG ID kiriting (6–12 xona)";if(t=="uc"&&cur.chk&&cur.chk.found===false)return "Bunday PUBG ID topilmadi";return ""}
+if(t=="uc"&&!/^\d{6,12}$/.test(u))return "PUBG ID kiriting (6–12 xona)";return ""}
 function upd(){const e=err(),p=price(),h=$("#hold");
 {const f=$(".sfoot");if(f){const on=cur.t=="raqam"?cur.a!=null:(cur.a!=null||!!cur.u||idok());
 if(on&&f.hidden){f.hidden=false;f.classList.remove("pop");void f.offsetWidth;f.classList.add("pop")}else if(!on)f.hidden=true;$("#sh").classList.toggle("nofoot",!on)}}
@@ -1630,24 +1721,11 @@ $("#hl").textContent=low?"Balans yetarli emas":"Sotib olish";
 $("#hp").textContent=!e&&p?fmt(p)+" so'm":"";
 $("#hint").innerHTML=low?'<a id="tp" role="button" tabindex="0">Balansni to\'ldirish</a>':(e?esc(e):(document.documentElement.classList.contains("kb")?"Tasdiqlash uchun Enter yoki Space ni 1 soniya bosib turing":"Tasdiqlash uchun tugmani 1 soniya bosib turing"));
 if(low)$("#tp").onclick=()=>topup()}
-const ckOK=()=>/^\d{6,12}$/.test(cur.u||"");
-function ckBtn(){const b=$("#ck");if(b)b.disabled=!ckOK()}
-function ckClear(){const r=$("#ckr");if(r){r.className="ckr";r.textContent=""}ckBtn()}
-function ckBind(){const b=$("#ck"),n=$("#un");if(!b)return;ckBtn();
-if(n)n.oninput=()=>{cur.nick=n.value.replace(/\s+/g," ").trim();if(cur.chk&&cur.chk.found!==false){cur.chk=null;ckClear();upd()}};
-b.onclick=async()=>{hap();const r=$("#ckr");b.disabled=true;b.textContent="Tekshirilmoqda…";r.className="ckr";r.textContent="";
-try{const x=await call("/api/uc/check",{body:{account_id:cur.u,username:cur.nick||""},timeout:15000});cur.chk=x;
-if(x.found===false){r.className="ckr bad";r.textContent="Bunday PUBG ID topilmadi. ID ni qayta tekshiring."}
-else if(x.found&&x.match===false){r.className="ckr warn";r.innerHTML="Nik mos kelmadi. Akkauntdagi nik: <b>"+esc(x.nickname)+"</b>"}
-else if(x.found){r.className="ckr ok";r.innerHTML="Akkaunt topildi: <b>"+esc(x.nickname)+"</b>"}
-else{r.className="ckr";r.textContent="Avtomatik tekshiruv hozir mavjud emas. ID va nikni o'zingiz qayta tekshiring."}}
-catch(e){if(gateErr(e))return;r.className="ckr bad";r.textContent=e.message||"Tekshirib bo'lmadi"}
-b.textContent="Akkauntni tekshirish";ckBtn();upd()}}
 function bindSheet(){const s=$("#sh");
 s.querySelectorAll(".opt").forEach(b=>b.onclick=()=>{hap();s.querySelectorAll(".opt").forEach(x=>x.classList.remove("sel"));b.classList.add("sel");cur.a=+b.dataset.a;cur.tok=null;const n=$("#n");if(n)n.value="";upd();if(cur.t=="raqam")try{b.scrollIntoView({block:"nearest"})}catch(e){}});
-const u=$("#u");if(u)u.oninput=()=>{if(cur.t=="uc")u.value=u.value.replace(/\D/g,"");cur.u=u.value.replace(/^@/,"").trim();cur.tok=null;cur.chk=null;ckClear();upd()};
+const u=$("#u");if(u)u.oninput=()=>{if(cur.t=="uc")u.value=u.value.replace(/\D/g,"");cur.u=u.value.replace(/^@/,"").trim();cur.tok=null;upd()};
 const n=$("#n");if(n)n.oninput=()=>{s.querySelectorAll(".opt").forEach(x=>x.classList.remove("sel"));const v=n.value.replace(/\D/g,"").slice(0,7);if(v!==n.value)n.value=v;cur.a=v?+v:null;cur.tok=null;upd()};
-ckBind();holdBind($("#hold"));upd()}
+holdBind($("#hold"));upd()}
 
 function holdBind(h){const f=h.querySelector("i");let t0=0,raf=0,done=false,kd=false,arm=0;
 const stop=short=>{cancelAnimationFrame(raf);raf=0;if(!done){if(short&&t0&&!h.disabled)toast("Tugmani 1 soniya bosib turing");f.style.transition="transform .25s";f.style.transform="scaleX(0)"}t0=0};
@@ -1667,7 +1745,7 @@ const desc=()=>{const{t,a,u}=cur;return t=="stars"?fmt(a)+" Stars → @"+u:t=="p
 async function pay(){hap();const snap={...cur},{t}=snap,w=desc(),h=$("#hold");let p=price(),st="wait",nb=null,rr;
 h.disabled=true;$("#hl").textContent="Bajarilmoqda…";$("#hp").textContent="";
 const tok=cur.tok||(cur.tok=uuid());BUSY=1;   /* bitta xarid = bitta token: tarmoq uzilib qayta yuborilsa, server ikkinchi marta yechmaydi */
-try{rr=await call("/api/buy",{body:{token:tok,kind:t=="raqam"?"number":t,username:cur.u,nick:t=="uc"?(cur.nick||""):"",amount:t=="raqam"?P.cty[cur.a][3]:t=="uc"?P.uc.find(x=>x[0]==cur.a)[2]:cur.a,price:p,server:t=="raqam"?NK:0},timeout:60000});BUSY=0;cur.tok=null;p=rr.price||p;nb=rr.balance;if(t=="stars"||t=="premium")st=rr.status=="ok"?"ok":"wait"}
+try{rr=await call("/api/buy",{body:{token:tok,kind:t=="raqam"?"number":t,username:cur.u,amount:t=="raqam"?P.cty[cur.a][3]:t=="uc"?P.uc.find(x=>x[0]==cur.a)[2]:cur.a,price:p,server:t=="raqam"?NK:0},timeout:60000});BUSY=0;cur.tok=null;p=rr.price||p;nb=rr.balance;if(t=="stars"||t=="premium")st=rr.status=="ok"?"ok":"wait"}
 catch(e){BUSY=0;if(gateErr(e))return;if(e.code=="price_changed"){cur.tok=null;toast("Narx o'zgardi, qayta oching");return show(false)}
 const hf=h.querySelector("i");if(hf){hf.style.transition="none";hf.style.transform="scaleX(0)"}
 if(e.data&&e.data.balance!=null){bal=e.data.balance;if(ME)ME.balance=bal}
